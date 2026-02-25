@@ -45,21 +45,21 @@ python frontends/benchmarks/deepresearch_bench/scripts/download_drb_dataset.py
 
 ### Judge model and API key
 
-The RACE evaluator uses an LLM judge to score reports. The default config (`config_deep_research_bench.yml`) is set up to use **OpenAI GPT-5** as the judge.
+The RACE evaluator uses an LLM judge to score reports. The default config (`config_deep_research_bench.yml`) is set up to use **Gemini 2.5 Pro** as the judge.
 
 1. **Choose a judge model** – Use a capable model for consistent scoring, e.g.:
+   - **Gemini** – Gemini 2.5 Pro or Flash (via `GEMINI_API_KEY`)
    - **OpenAI** – GPT-4o, GPT-5 (via `OPENAI_API_KEY`)
-   - **Gemini** – Gemini 2.5 Pro or Flash
 
-2. **Obtain an API key** for the provider you chose (OpenAI or Gemini).
+2. **Obtain an API key** for the provider you chose (Gemini or OpenAI).
 
 3. **Set the key** in `deploy/.env` (recommended) or export it:
    ```bash
-   # For OpenAI judge (default in config_deep_research_bench.yml)
-   OPENAI_API_KEY=your_openai_key
-
-   # For Gemini judge (if you switch the config to use a Gemini LLM)
+   # For Gemini judge (default in config_deep_research_bench.yml)
    GEMINI_API_KEY=your_gemini_key
+
+   # For OpenAI judge (if you switch the config to use an OpenAI LLM)
+   OPENAI_API_KEY=your_openai_key
    ```
 
 4. **Use a different judge in the config** – Update `llms:` in the config and set `eval.evaluators.race.llm_name` to that LLM name. Ensure the corresponding API key is set.
@@ -90,7 +90,7 @@ Results are written to `frontends/benchmarks/deepresearch_bench/results` (or the
 
 ### RACE Evaluator
 
-Compares generated reports against reference articles using an LLM judge (default: **OpenAI GPT-5** via `OPENAI_API_KEY`; can be swapped for Gemini or any other supported model).
+Compares generated reports against reference articles using an LLM judge (default: **Gemini 2.5 Pro** via `GEMINI_API_KEY`; can be swapped for OpenAI or any other supported model).
 
 **Configuration:**
 
@@ -247,4 +247,4 @@ The following configs target specific model or workflow variants. For standard u
 
 | Config | Description |
 |--------|-------------|
-| `configs/config_deep_research_bench.yml` | Default: Nemotron for agent, OpenAI GPT-5 for RACE judge. Use this for the main quickstart. |
+| `configs/config_deep_research_bench.yml` | Default: Nemotron for agent, Gemini 2.5 Pro for RACE judge. Use this for the main quickstart. |
