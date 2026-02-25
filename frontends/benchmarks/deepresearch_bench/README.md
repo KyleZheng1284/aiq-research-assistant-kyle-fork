@@ -33,51 +33,13 @@ uv pip install -e ./frontends/benchmarks/deepresearch_bench
 
 ## Dataset Setup
 
-The dataset files are not included in the repository. Follow the steps below before running evaluation.
+The dataset files are not included in the repository. We have included a script to retrieve them from the [Deep Research Bench Github Repository](https://github.com/Ayanami0730/deep_research_bench/tree/main) and format them for the NeMo Agent Toolkit evaluator.
 
-**If using the notebook** (`1_Deep_Researcher_Web_Search.ipynb`): the data setup cell handles steps 1–3 automatically.
+To download the dataset files, run the following script:
 
-**If setting up manually:**
-
-1. Create the data directory:
-   ```bash
-   mkdir -p frontends/benchmarks/deepresearch_bench/data
-   ```
-
-2. Download `criteria.jsonl` from the [DeepResearch Bench GitHub repository](https://github.com/Ayanami0730/deep_research_bench):
-   ```bash
-   curl -o frontends/benchmarks/deepresearch_bench/data/criteria.jsonl \
-     https://raw.githubusercontent.com/Ayanami0730/deep_research_bench/main/data/criteria_data/criteria.jsonl
-   ```
-
-3. Build `drb_full_dataset.json` from the benchmark questions. The DRB repo's `query.jsonl` uses a `prompt` field — this must be renamed to `question` to match the AIQ config's `question_key`:
-   ```bash
-   curl -s https://raw.githubusercontent.com/Ayanami0730/deep_research_bench/main/data/prompt_data/query.jsonl \
-     | python3 -c "
-   import sys, json
-   records = [{'id': e['id'], 'question': e['prompt'], 'expected_output': ''} for e in (json.loads(l) for l in sys.stdin if l.strip())]
-   print(json.dumps(records, ensure_ascii=False, indent=2))
-   " > frontends/benchmarks/deepresearch_bench/data/drb_full_dataset.json
-   ```
-
-   > **Note on `expected_output`:** The RACE evaluator compares each generated report against a reference research article stored in the `expected_output` field. These reference articles are **not publicly available** due to copyright restrictions. The steps above leave `expected_output` empty, which means RACE scores will not be computed until you supply reference articles. To enable full RACE evaluation, populate `expected_output` for each entry in `drb_full_dataset.json` with a corresponding reference research article.
-
-**Expected dataset format** (`drb_full_dataset.json`):
-```json
-[
-  {
-    "id": 1,
-    "question": "Research task prompt text...",
-    "expected_output": "Reference research article text (required for RACE scoring)..."
-  },
-  ...
-]
+```bash
+python frontends/benchmarks/deepresearch_bench/scripts/download_drb_dataset.py
 ```
-
-The config maps these fields via:
-- `question_key: question` → research task input
-- `answer_key: expected_output` → reference article for RACE comparison
-- `generated_answer_key: generated_answer` → agent-generated report (populated at eval time)
 
 ## Prerequisites
 
