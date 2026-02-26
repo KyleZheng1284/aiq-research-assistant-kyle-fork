@@ -31,7 +31,7 @@ describe('File Upload Configuration', () => {
     test('uses default accepted types when env var not set', () => {
       const config = buildFileUploadConfig()
 
-      expect(config.acceptedTypes).toBe('.pdf,.md,.docx,.html,.txt')
+      expect(config.acceptedTypes).toBe('.pdf,.docx,.txt,.md')
     })
 
     test('uses default max size when env var not set', () => {
