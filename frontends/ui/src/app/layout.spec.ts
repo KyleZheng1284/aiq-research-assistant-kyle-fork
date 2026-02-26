@@ -60,13 +60,13 @@ describe('File Upload Configuration', () => {
       expect(config.acceptedMimeTypes).toContain('application/pdf')
       expect(config.acceptedMimeTypes).toContain('text/markdown')
       expect(config.acceptedMimeTypes).toContain('text/x-markdown')
-      expect(config.acceptedMimeTypes).toContain('text/html')
       expect(config.acceptedMimeTypes).toContain('text/plain')
       expect(
         config.acceptedMimeTypes.includes(
           'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         )
       ).toBe(true)
+      expect(config.acceptedMimeTypes).not.toContain('text/html')
     })
   })
 

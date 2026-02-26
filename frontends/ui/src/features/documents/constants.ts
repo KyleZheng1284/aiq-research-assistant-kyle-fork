@@ -28,7 +28,6 @@ export const DEFAULT_ACCEPTED_MIME_TYPES = [
   'text/plain',
   'text/markdown',
   'text/x-markdown',
-  'text/html',
 ]
 
 // Legacy exports for backward compatibility (use AppConfig where possible)

@@ -12,6 +12,7 @@ const EXTENSION_TO_MIME: Record<string, string[]> = {
   '.pdf': ['application/pdf'],
   '.md': ['text/markdown', 'text/x-markdown'],
   '.docx': ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+  '.pptx': ['application/vnd.openxmlformats-officedocument.presentationml.presentation'],
   '.html': ['text/html'],
   '.txt': ['text/plain'],
   '.csv': ['text/csv'],
