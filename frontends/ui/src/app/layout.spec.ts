@@ -82,6 +82,18 @@ describe('File Upload Configuration', () => {
       expect(config.acceptedMimeTypes).not.toContain('application/pdf')
     })
 
+    test('FILE_UPLOAD_ACCEPTED_TYPES with .pptx resolves correct MIME type', () => {
+      process.env.FILE_UPLOAD_ACCEPTED_TYPES = '.pdf,.docx,.pptx,.txt,.md'
+
+      const config = buildFileUploadConfig()
+
+      expect(config.acceptedTypes).toBe('.pdf,.docx,.pptx,.txt,.md')
+      expect(config.acceptedMimeTypes).toContain(
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+      )
+      expect(config.acceptedMimeTypes).toContain('application/pdf')
+    })
+
     test('FILE_UPLOAD_MAX_SIZE_MB overrides default max size', () => {
       process.env.FILE_UPLOAD_MAX_SIZE_MB = '50'
 
