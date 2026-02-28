@@ -140,7 +140,6 @@ jobs:
             ./frontends/benchmarks/intent_classifier \
             ./sources/tavily_web_search \
             ./sources/google_scholar_paper_search \
-            ./sources/eci
           do
             if [ -d "$pkg" ]; then
               uv pip install -e "$pkg"
