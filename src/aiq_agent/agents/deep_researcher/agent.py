@@ -288,18 +288,28 @@ class DeepResearcherAgent:
             from aiq_agent.common.citation_verification import _CITATION_LINE_RE
             from aiq_agent.common.citation_verification import _REFERENCE_SECTION_RE
             from aiq_agent.common.citation_verification import _URL_IN_LINE_RE
+            from aiq_agent.common.citation_verification import _is_knowledge_citation
 
             ref_match = _REFERENCE_SECTION_RE.search(content)
             if ref_match:
                 ref_section = content[ref_match.start() :]
                 has_any_valid = False
+                registry = self.source_registry_middleware.registry
                 for line_match in _CITATION_LINE_RE.finditer(ref_section):
-                    url_match = _URL_IN_LINE_RE.search(line_match.group(2))
+                    ref_text = line_match.group(2).strip()
+                    # Check URL citations
+                    url_match = _URL_IN_LINE_RE.search(ref_text)
                     if url_match:
                         url = url_match.group(0).rstrip(".,;)")
-                        if self.source_registry_middleware.registry.has_url(url):
+                        if registry.has_url(url):
                             has_any_valid = True
                             break
+                        continue
+                    # Check knowledge-layer citation keys
+                    is_kl, citation_key = _is_knowledge_citation(ref_text)
+                    if is_kl and citation_key and registry.has_citation_key(citation_key):
+                        has_any_valid = True
+                        break
                 if not has_any_valid:
                     return False, "no_valid_citations"
 

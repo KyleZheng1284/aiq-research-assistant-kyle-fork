@@ -745,6 +745,15 @@ def sanitize_report(report_text: str) -> ReportSanitizationResult:
 
     sanitized_report = cleaned_body + ref_section
 
+    # --- Strip leaked tool-call XML fragments ---
+    # LLMs sometimes output raw tool-call syntax as text
+    sanitized_report = re.sub(
+        r"</?(parameter|function|tool_call|tool_use|invoke|antml:[\w]+)[\s>].*",
+        "",
+        sanitized_report,
+        flags=re.DOTALL,
+    )
+
     # --- Trim everything after the last citation in the Sources section ---
     # The LLM often appends meta-commentary after the references (e.g.,
     # "All citations refer to...", "This report meets..."). Rather than
