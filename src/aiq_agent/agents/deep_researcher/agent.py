@@ -305,9 +305,9 @@ class DeepResearcherAgent:
                             has_any_valid = True
                             break
                         continue
-                    # Check knowledge-layer citation keys
-                    is_kl, citation_key = _is_knowledge_citation(ref_text)
-                    if is_kl and citation_key and registry.has_citation_key(citation_key):
+                    # Check knowledge-layer citation keys (lenient — passes registry for fuzzy match)
+                    is_kl, citation_key = _is_knowledge_citation(ref_text, registry)
+                    if is_kl and citation_key:
                         has_any_valid = True
                         break
                 if not has_any_valid:

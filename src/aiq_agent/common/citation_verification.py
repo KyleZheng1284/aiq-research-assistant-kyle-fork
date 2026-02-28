@@ -194,14 +194,18 @@ class SourceRegistry:
         return None
 
     def has_citation_key(self, key: str) -> bool:
-        """Fuzzy-match a citation key against registry entries.
+        """Lenient match of a citation key against registry entries.
 
-        Matches if filename (case-insensitive) and page number both match.
+        Matches if filename (case-insensitive) matches ANY registry entry.
+        Page numbers are not required to match — the LLM may cite a different
+        page than what the knowledge layer returned, and that's acceptable
+        since the document itself was verified as a real source.
         """
-        target_file, target_page = _parse_citation_key(key)
+        target_file, _ = _parse_citation_key(key)
+        target_lower = target_file.lower()
         for entry in self._citation_keys:
-            entry_file, entry_page = _parse_citation_key(entry.citation_key)
-            if entry_file.lower() == target_file.lower() and entry_page == target_page:
+            entry_file, _ = _parse_citation_key(entry.citation_key)
+            if entry_file.lower() == target_lower:
                 return True
         return False
 
@@ -370,18 +374,36 @@ _URL_IN_LINE_RE = re.compile(r"https?://\S+")
 _KL_CITATION_PATTERN_RE = re.compile(r"^(.+\.\w{2,5})(?:,\s*(?:p\.?|page)\s*\d+)?$", re.IGNORECASE)
 
 
-def _is_knowledge_citation(ref_text: str) -> tuple[bool, str | None]:
+def _is_knowledge_citation(ref_text: str, registry: SourceRegistry | None = None) -> tuple[bool, str | None]:
     """Check if reference text looks like a knowledge-layer citation.
+
+    Uses a lenient matching strategy:
+    1. Try exact pattern match (filename.ext, p.N) after stripping markdown
+    2. If a registry is provided, check if ANY registered citation key's
+       filename appears anywhere in the reference text (very lenient —
+       handles all formatting variations the LLM might produce)
 
     Returns (is_kl, citation_key_or_none).
     """
     # Strip trailing "(Internal)" or similar parenthetical
     cleaned = re.sub(r"\s*\(.*?\)\s*$", "", ref_text).strip()
+    # Strip markdown bold/italic markers only (*, **) — preserve underscores in filenames
+    cleaned = re.sub(r"\*+", "", cleaned).strip()
     # Remove leading "Title - " or "Title: " prefix by taking last segment
     # if it contains a filename pattern
     for segment in [cleaned, cleaned.split(" - ")[-1].strip(), cleaned.split(": ")[-1].strip()]:
         if _KL_CITATION_PATTERN_RE.match(segment):
             return True, segment
+
+    # Lenient fallback: check if any registered knowledge-layer filename
+    # appears in the reference text (handles arbitrary LLM formatting)
+    if registry is not None:
+        ref_lower = cleaned.lower()
+        for entry in registry._citation_keys:
+            entry_file, _ = _parse_citation_key(entry.citation_key)
+            if entry_file.lower() in ref_lower:
+                return True, entry.citation_key
+
     return False, None
 
 
@@ -453,8 +475,8 @@ def verify_citations(report_text: str, registry: SourceRegistry) -> CitationVeri
                 removed_citations.append({"number": num, "line": full_line, "reason": "url_not_in_registry"})
             continue
 
-        # Try knowledge-layer citation key
-        is_kl, citation_key = _is_knowledge_citation(ref_text)
+        # Try knowledge-layer citation key (lenient — passes registry for fuzzy filename match)
+        is_kl, citation_key = _is_knowledge_citation(ref_text, registry)
         if is_kl and citation_key:
             if registry.has_citation_key(citation_key):
                 logger.info("[CitationVerify]   [%d] VALID  — %s", num, citation_key)

@@ -140,7 +140,12 @@ class TestSourceRegistry:
         registry.add(SourceEntry(citation_key="report.pdf"))
         assert registry.has_citation_key("report.pdf")
 
-    def test_has_citation_key_mismatch(self, registry):
+    def test_has_citation_key_different_page_matches(self, registry):
+        """Same file, different page — still matches (lenient)."""
+        registry.add(SourceEntry(citation_key="report.pdf, p.15"))
+        assert registry.has_citation_key("report.pdf, p.5")
+
+    def test_has_citation_key_different_file_no_match(self, registry):
         registry.add(SourceEntry(citation_key="report.pdf, p.15"))
         assert not registry.has_citation_key("other.pdf, p.15")
 
@@ -474,6 +479,13 @@ class TestVerifyCitations:
         report = "Finding [1].\n\n**References:**\n- [1] report.pdf, p.15 (Internal)"
         result = verify_citations(report, registry)
         assert len(result.valid_citations) == 1
+
+    def test_knowledge_citation_with_markdown_italics(self, registry):
+        """LLM wraps citation in markdown italics *filename.pdf*."""
+        report = "Finding [1].\n\n**References**\n- [1] *report.pdf*, p.15"
+        result = verify_citations(report, registry)
+        assert len(result.valid_citations) == 1
+        assert len(result.removed_citations) == 0
 
     def test_garbled_url_repaired_to_canonical(self):
         """LLM truncated a URL — verify_citations repairs it to the full canonical URL."""
