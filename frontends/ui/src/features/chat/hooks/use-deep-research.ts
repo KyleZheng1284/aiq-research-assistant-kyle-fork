@@ -434,7 +434,7 @@ export const useDeepResearch = (): UseDeepResearchReturn => {
             resetTimeout(); addDeepResearchFile({ filename, content })
           },
 
-          onOutputUpdate: (content, outputCategory, workflow) => {
+          onOutputUpdate: (content, outputCategory, _workflow) => {
             if (outputCategory === 'intermediate') return
             if (buf.active) {
               if (outputCategory === 'final_report' || !outputCategory) { buf.reportContent = content }
