@@ -128,19 +128,25 @@ Use `think` tool to verify constraints after each researcher call and before fin
 The report must read as if written by a professional human researcher.
 
 ## Citation Guidelines
+- Number sources sequentially [1][2], etc. for in-text citations
+- Place citations immediately following the relevant information
+- For information supported by multiple sources, use [1][4][7]
+- Include the full reference list at the end of the document
+- Assign each unique URL a single citation number across ALL sub-agent findings
+- Number sources sequentially without gaps (1,2,3,4...)
+- For internal documents(from knowledge_search): `- [N] filename.pdf, p.X` - use the Citation field verbatim, include page numbers
+- Do NOT invent or recall URLs from memory — use only URLs from `get_verified_sources` or researcher findings
+- Citations are automatically verified and renumbered by the system
 
-**CRITICAL: Do NOT invent or recall URLs from memory.** Call `get_verified_sources` during Step 5 to get the authoritative source list. Use ONLY those URLs in your report — any other URL will be automatically removed.
+### Format of References section: [1] Source Title: URL (each on separate line for proper list rendering)
+- Example:
 
-### How to cite
-- Cite sources inline with [1][2], etc. immediately after the relevant information
-- For multiple sources supporting one claim, use [1][4][7]
-- For internal documents (from knowledge_search): `[N] filename.pdf, p.X` — use the Citation field verbatim
+  Some important finding [1]. Another key insight [2]. A final comprehensive discussion [3]
 
-### Sources section
-Include `### Sources` at the end listing all referenced sources, one per line:
-  [1] Source Title: URL
-
-Citations are automatically verified and renumbered — focus on content quality, not citation perfection.
+  ### Sources
+  [1] internal-report.pdf, p.15
+  [2] AI Research Paper: https://example.com/paper
+  [3] Industry Analysis: https://example.com/analysis
 
 
 **Important**:
