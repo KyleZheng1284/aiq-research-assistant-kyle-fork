@@ -229,12 +229,30 @@ class ShallowResearcherAgent:
 
         tool_node = ToolNode(self.tools)
 
+        _internal_tools = {
+            "think",
+            "get_verified_sources",
+            "write_todos",
+            "write_file",
+            "read_file",
+            "grep",
+            "ls",
+            "task",
+            "submit_final_report",
+        }
+
         async def tool_node_with_source_capture(state: ShallowResearchAgentState) -> dict[str, Any]:
-            """Execute tools and capture source URLs/citations for verification."""
+            """Execute tools and capture source URLs/citations for verification.
+
+            Internal tools (think, write_file, etc.) are skipped to prevent
+            LLM-hallucinated URLs from polluting the registry.
+            """
             result = await tool_node.ainvoke(state)
             for msg in result.get("messages", []):
                 if isinstance(msg, ToolMessage) and msg.content:
                     tool_name = getattr(msg, "name", "") or ""
+                    if tool_name in _internal_tools:
+                        continue
                     sources = extract_sources_from_tool_result(tool_name, str(msg.content))
                     for source in sources:
                         self.source_registry.add(source)
