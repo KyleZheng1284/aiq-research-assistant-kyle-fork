@@ -20,8 +20,12 @@ from unittest.mock import MagicMock
 
 import pytest
 from langchain_core.messages import AIMessage
+from langchain_core.messages import ToolMessage
 
+from aiq_agent.agents.deep_researcher.custom_middleware import SourceRegistryMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ToolNameSanitizationMiddleware
+from aiq_agent.common.source_metadata import SourceRef
+from aiq_agent.common.source_metadata import encode_source_metadata
 
 
 class TestToolNameSanitizationMiddleware:
@@ -115,3 +119,179 @@ class TestToolNameSanitizationMiddleware:
 
         assert result.result[0].content == "Just text, no tools"
         assert not result.result[0].tool_calls
+
+
+class TestSourceRegistryMiddleware:
+    """Tests for SourceRegistryMiddleware allowlist + structured metadata."""
+
+    @pytest.fixture
+    def source_tools(self):
+        return {"advanced_web_search_tool", "knowledge_search", "paper_search_tool"}
+
+    @pytest.fixture
+    def middleware(self, source_tools):
+        return SourceRegistryMiddleware(source_tool_names=source_tools)
+
+    def _make_request(self, tool_name: str):
+        req = MagicMock()
+        req.tool_call = {"name": tool_name}
+        return req
+
+    def _make_tool_result(self, content: str):
+        return ToolMessage(content=content, tool_call_id="tc1")
+
+    # -- Structured metadata path --
+
+    @pytest.mark.asyncio
+    async def test_structured_metadata_captured(self, middleware):
+        """Structured metadata is extracted and used instead of regex."""
+        refs = [SourceRef(url="https://arxiv.org/abs/2401.00001", title="My Paper")]
+        content = encode_source_metadata("Some search result text", refs)
+        handler = AsyncMock(return_value=self._make_tool_result(content))
+        request = self._make_request("advanced_web_search_tool")
+
+        await middleware.awrap_tool_call(request, handler)
+
+        sources = middleware.registry.all_sources()
+        assert len(sources) == 1
+        assert sources[0].url == "https://arxiv.org/abs/2401.00001"
+        assert sources[0].title == "My Paper"
+        assert sources[0].source_type == "structured"
+
+    @pytest.mark.asyncio
+    async def test_structured_metadata_stripped_from_content(self, middleware):
+        """Metadata block is stripped so the LLM never sees it."""
+        refs = [SourceRef(url="https://example.com")]
+        content = encode_source_metadata("Clean content for LLM", refs)
+        handler = AsyncMock(return_value=self._make_tool_result(content))
+        request = self._make_request("advanced_web_search_tool")
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert "TOOL_SOURCE_METADATA" not in result.content
+        assert result.content == "Clean content for LLM"
+
+    @pytest.mark.asyncio
+    async def test_structured_citation_key_captured(self, middleware):
+        """Knowledge layer citation keys are captured via structured metadata."""
+        refs = [SourceRef(citation_key="report.pdf, p.5", title="report.pdf")]
+        content = encode_source_metadata("Knowledge result", refs)
+        handler = AsyncMock(return_value=self._make_tool_result(content))
+        request = self._make_request("knowledge_search")
+
+        await middleware.awrap_tool_call(request, handler)
+
+        sources = middleware.registry.all_sources()
+        assert len(sources) == 1
+        assert sources[0].citation_key == "report.pdf, p.5"
+
+    @pytest.mark.asyncio
+    async def test_multiple_structured_refs(self, middleware):
+        """Multiple structured refs from a single tool call."""
+        refs = [
+            SourceRef(url="https://a.com", title="A"),
+            SourceRef(url="https://b.com", title="B"),
+        ]
+        content = encode_source_metadata("results", refs)
+        handler = AsyncMock(return_value=self._make_tool_result(content))
+        request = self._make_request("advanced_web_search_tool")
+
+        await middleware.awrap_tool_call(request, handler)
+
+        urls = {s.url for s in middleware.registry.all_sources()}
+        assert urls == {"https://a.com", "https://b.com"}
+
+    # -- Regex fallback path --
+
+    @pytest.mark.asyncio
+    async def test_regex_fallback_when_no_metadata(self, middleware):
+        """Without metadata block, falls back to regex extraction."""
+        content = "Result from https://arxiv.org/abs/2401.00001"
+        handler = AsyncMock(return_value=self._make_tool_result(content))
+        request = self._make_request("advanced_web_search_tool")
+
+        await middleware.awrap_tool_call(request, handler)
+
+        sources = middleware.registry.all_sources()
+        assert len(sources) == 1
+        assert sources[0].url == "https://arxiv.org/abs/2401.00001"
+        assert sources[0].source_type != "structured"
+
+    # -- Allowlist filtering --
+
+    @pytest.mark.asyncio
+    async def test_think_tool_ignored_even_with_metadata(self, middleware):
+        """Internal tools are filtered out before metadata is checked."""
+        refs = [SourceRef(url="https://hallucinated.com")]
+        content = encode_source_metadata("thinking...", refs)
+        handler = AsyncMock(return_value=self._make_tool_result(content))
+        request = self._make_request("think")
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert len(middleware.registry.all_sources()) == 0
+        # Metadata is NOT stripped for non-source tools (they skip entirely)
+        assert "TOOL_SOURCE_METADATA" in result.content
+
+    @pytest.mark.asyncio
+    async def test_unknown_tool_ignored(self, middleware):
+        """Tools not in the allowlist are ignored."""
+        content = "https://unknown.com/data"
+        handler = AsyncMock(return_value=self._make_tool_result(content))
+        request = self._make_request("some_random_tool")
+
+        await middleware.awrap_tool_call(request, handler)
+
+        assert len(middleware.registry.all_sources()) == 0
+
+    @pytest.mark.asyncio
+    async def test_mixed_structured_and_regex(self, middleware):
+        """One tool with metadata, another without -- both captured correctly."""
+        refs = [SourceRef(url="https://structured.com", title="Structured")]
+        structured_content = encode_source_metadata("structured result", refs)
+        regex_content = "Result from https://regex-extracted.com/page"
+
+        h1 = AsyncMock(return_value=self._make_tool_result(structured_content))
+        h2 = AsyncMock(return_value=self._make_tool_result(regex_content))
+
+        await middleware.awrap_tool_call(self._make_request("advanced_web_search_tool"), h1)
+        await middleware.awrap_tool_call(self._make_request("paper_search_tool"), h2)
+
+        urls = {s.url for s in middleware.registry.all_sources()}
+        assert "https://structured.com" in urls
+        assert "https://regex-extracted.com/page" in urls
+
+    @pytest.mark.asyncio
+    async def test_empty_content_skipped(self, middleware):
+        """Empty content is ignored gracefully."""
+        handler = AsyncMock(return_value=self._make_tool_result(""))
+        request = self._make_request("advanced_web_search_tool")
+
+        await middleware.awrap_tool_call(request, handler)
+
+        assert len(middleware.registry.all_sources()) == 0
+
+    @pytest.mark.asyncio
+    async def test_non_tool_message_passthrough(self, middleware):
+        """Non-ToolMessage results pass through without error."""
+        handler = AsyncMock(return_value=AIMessage(content="just an AI reply"))
+        request = self._make_request("advanced_web_search_tool")
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert isinstance(result, AIMessage)
+        assert len(middleware.registry.all_sources()) == 0
+
+    @pytest.mark.asyncio
+    async def test_default_empty_allowlist_captures_nothing(self):
+        """Middleware with no source_tool_names captures nothing."""
+        mw = SourceRegistryMiddleware()
+        refs = [SourceRef(url="https://should-not-be-captured.com")]
+        content = encode_source_metadata("content", refs)
+        handler = AsyncMock(return_value=ToolMessage(content=content, tool_call_id="tc1"))
+        request = MagicMock()
+        request.tool_call = {"name": "advanced_web_search_tool"}
+
+        await mw.awrap_tool_call(request, handler)
+
+        assert len(mw.registry.all_sources()) == 0

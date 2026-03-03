@@ -26,6 +26,7 @@ from langchain_core.messages import ToolMessage
 
 from aiq_agent.common import load_prompt
 from aiq_agent.common import render_prompt_template
+from aiq_agent.common.citation_verification import SourceEntry
 from aiq_agent.common.citation_verification import SourceRegistry
 from aiq_agent.common.citation_verification import extract_sources_from_tool_result
 
@@ -223,7 +224,14 @@ class SourceRegistryMiddleware(AgentMiddleware):
         self._source_tool_names = source_tool_names or set()
 
     async def awrap_tool_call(self, request, handler):
-        """Capture sources from tool results after execution."""
+        """Capture sources from tool results after execution.
+
+        Prefers structured metadata (encoded by tools via encode_source_metadata)
+        over regex extraction.  Strips the metadata block from the content so
+        the LLM never sees it.
+        """
+        from aiq_agent.common.source_metadata import extract_source_metadata
+
         result = await handler(request)
         if isinstance(result, ToolMessage) and result.content:
             tool_name = ""
@@ -231,16 +239,43 @@ class SourceRegistryMiddleware(AgentMiddleware):
                 tool_name = request.tool_call.get("name", "")
             if tool_name not in self._source_tool_names:
                 return result
-            sources = extract_sources_from_tool_result(tool_name, str(result.content))
-            for source in sources:
-                self.registry.add(source)
-            if sources:
+
+            content = str(result.content)
+            clean_content, refs = extract_source_metadata(content)
+
+            if refs:
+                for ref in refs:
+                    entry = SourceEntry(
+                        url=ref.url,
+                        title=ref.title,
+                        citation_key=ref.citation_key,
+                        source_type="structured",
+                        tool_name=tool_name,
+                    )
+                    self.registry.add(entry)
                 logger.info(
-                    "[CitationRegistry] Captured %d source(s) from %s: %s",
-                    len(sources),
+                    "[CitationRegistry] Captured %d structured source(s) from %s: %s",
+                    len(refs),
                     tool_name,
-                    [s.url or s.citation_key for s in sources],
+                    [r.url or r.citation_key for r in refs],
                 )
+                result = ToolMessage(
+                    content=clean_content,
+                    tool_call_id=result.tool_call_id,
+                    name=getattr(result, "name", None),
+                    id=result.id,
+                )
+            elif refs is None:
+                sources = extract_sources_from_tool_result(tool_name, content)
+                for source in sources:
+                    self.registry.add(source)
+                if sources:
+                    logger.info(
+                        "[CitationRegistry] Captured %d source(s) from %s via regex: %s",
+                        len(sources),
+                        tool_name,
+                        [s.url or s.citation_key for s in sources],
+                    )
         return result
 
     def get_source_list_text(self) -> str | None:

@@ -234,25 +234,60 @@ class ShallowResearcherAgent:
         async def tool_node_with_source_capture(state: ShallowResearchAgentState) -> dict[str, Any]:
             """Execute tools and capture source URLs/citations for verification.
 
-            Only config-defined source tools contribute to the registry;
-            internal tools are ignored automatically.
+            Prefers structured metadata over regex extraction.  Strips the
+            metadata block from the content so the LLM never sees it.
             """
+            from aiq_agent.common.citation_verification import SourceEntry
+            from aiq_agent.common.source_metadata import extract_source_metadata
+
             result = await tool_node.ainvoke(state)
+            new_messages = []
             for msg in result.get("messages", []):
                 if isinstance(msg, ToolMessage) and msg.content:
                     tool_name = getattr(msg, "name", "") or ""
                     if tool_name not in _source_tool_names:
+                        new_messages.append(msg)
                         continue
-                    sources = extract_sources_from_tool_result(tool_name, str(msg.content))
-                    for source in sources:
-                        self.source_registry.add(source)
-                    if sources:
+
+                    content = str(msg.content)
+                    clean_content, refs = extract_source_metadata(content)
+
+                    if refs:
+                        for ref in refs:
+                            self.source_registry.add(
+                                SourceEntry(
+                                    url=ref.url,
+                                    title=ref.title,
+                                    citation_key=ref.citation_key,
+                                    source_type="structured",
+                                    tool_name=tool_name,
+                                )
+                            )
                         logger.info(
-                            "[CitationRegistry] Captured %d source(s) from %s: %s",
-                            len(sources),
+                            "[CitationRegistry] Captured %d structured source(s) from %s: %s",
+                            len(refs),
                             tool_name,
-                            [s.url or s.citation_key for s in sources],
+                            [r.url or r.citation_key for r in refs],
                         )
+                        msg = ToolMessage(
+                            content=clean_content,
+                            tool_call_id=msg.tool_call_id,
+                            name=getattr(msg, "name", None),
+                            id=msg.id,
+                        )
+                    elif refs is None:
+                        sources = extract_sources_from_tool_result(tool_name, content)
+                        for source in sources:
+                            self.source_registry.add(source)
+                        if sources:
+                            logger.info(
+                                "[CitationRegistry] Captured %d source(s) from %s via regex: %s",
+                                len(sources),
+                                tool_name,
+                                [s.url or s.citation_key for s in sources],
+                            )
+                new_messages.append(msg)
+            result["messages"] = new_messages
             return result
 
         builder.add_node("agent", agent_node)

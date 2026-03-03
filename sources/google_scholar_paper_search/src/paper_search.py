@@ -175,7 +175,13 @@ class PaperSearchTool:
             )
             formatted_papers.append(paper_str)
 
-        return "\n\n".join(formatted_papers)
+        content = "\n\n".join(formatted_papers)
+
+        from aiq_agent.common.source_metadata import SourceRef
+        from aiq_agent.common.source_metadata import encode_source_metadata
+
+        refs = [SourceRef(url=p.get("link", ""), title=p.get("title", "")) for p in results if p.get("link")]
+        return encode_source_metadata(content, refs)
 
     async def search(
         self,

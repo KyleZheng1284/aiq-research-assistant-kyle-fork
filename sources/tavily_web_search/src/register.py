@@ -143,7 +143,16 @@ async def tavily_web_search(tool_config: TavilyWebSearchToolConfig, builder: Bui
                     ]
                 )
                 combined = answer_text + web_search_results
-                return combined if combined else "Search returned no results"
+                if not combined:
+                    return "Search returned no results"
+
+                from aiq_agent.common.source_metadata import SourceRef
+                from aiq_agent.common.source_metadata import encode_source_metadata
+
+                refs = [
+                    SourceRef(url=doc.get("url", ""), title=doc.get("title", "")) for doc in results if doc.get("url")
+                ]
+                return encode_source_metadata(combined, refs)
 
             except Exception as e:
                 if attempt == tool_config.max_retries - 1:

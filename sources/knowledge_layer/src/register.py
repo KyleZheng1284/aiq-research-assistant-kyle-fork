@@ -203,12 +203,18 @@ def _format_results(retrieval_result, query: str) -> str:
 
     lines = [f"Found {len(retrieval_result.chunks)} relevant document(s):\n"]
 
+    from aiq_agent.common.source_metadata import SourceRef
+
+    refs: list[SourceRef] = []
+
     for i, chunk in enumerate(retrieval_result.chunks, 1):
         # Build citation string: "filename, p.X" or just "filename"
         if chunk.page_number and chunk.page_number > 0:
             citation = f"{chunk.file_name}, p.{chunk.page_number}"
         else:
             citation = chunk.file_name
+
+        refs.append(SourceRef(citation_key=citation, title=chunk.file_name))
 
         # Header with source info
         lines.append(f"--- Result {i} ---")
@@ -227,7 +233,9 @@ def _format_results(retrieval_result, query: str) -> str:
         lines.append(content)
         lines.append("")
 
-    return "\n".join(lines)
+    from aiq_agent.common.source_metadata import encode_source_metadata
+
+    return encode_source_metadata("\n".join(lines), refs)
 
 
 @register_function(config_type=KnowledgeRetrievalConfig)
