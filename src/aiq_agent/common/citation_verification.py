@@ -183,7 +183,7 @@ class SourceRegistry:
         if len(candidates) == 1:
             return candidates[0].url
         if len(candidates) > 1:
-            logger.info(
+            logger.debug(
                 "[CitationVerify] Ambiguous URL prefix match for '%s' — %d candidates, rejecting",
                 url,
                 len(candidates),
@@ -465,10 +465,10 @@ def verify_citations(report_text: str, registry: SourceRegistry) -> CitationVeri
     # Early exit: nothing to validate against
     all_sources = registry.all_sources()
     if not all_sources:
-        logger.info("[CitationVerify] Skipping — registry is empty (no tool calls captured)")
+        logger.debug("[CitationVerify] Skipping — registry is empty (no tool calls captured)")
         return CitationVerificationResult(verified_report=report_text)
 
-    logger.info(
+    logger.debug(
         "[CitationVerify] Starting verification against %d registered source(s)",
         len(all_sources),
     )
@@ -500,13 +500,13 @@ def verify_citations(report_text: str, registry: SourceRegistry) -> CitationVeri
             canonical = registry.resolve_url(url)
             if canonical:
                 if canonical != url:
-                    logger.info("[CitationVerify]   [%d] VALID  — %s (repaired from: %s)", num, canonical, url)
+                    logger.debug("[CitationVerify]   [%d] VALID  — %s (repaired from: %s)", num, canonical, url)
                     url_replacements[url] = canonical
                 else:
-                    logger.info("[CitationVerify]   [%d] VALID  — %s", num, url)
+                    logger.debug("[CitationVerify]   [%d] VALID  — %s", num, url)
                 valid_citations.append({"number": num, "url": canonical, "citation_key": None, "line": full_line})
             else:
-                logger.info("[CitationVerify]   [%d] REMOVE — url_not_in_registry: %s", num, url)
+                logger.debug("[CitationVerify]   [%d] REMOVE — url_not_in_registry: %s", num, url)
                 removed_citations.append({"number": num, "line": full_line, "reason": "url_not_in_registry"})
             continue
 
@@ -514,15 +514,15 @@ def verify_citations(report_text: str, registry: SourceRegistry) -> CitationVeri
         is_kl, citation_key = _is_knowledge_citation(ref_text, registry)
         if is_kl and citation_key:
             if registry.has_citation_key(citation_key):
-                logger.info("[CitationVerify]   [%d] VALID  — %s", num, citation_key)
+                logger.debug("[CitationVerify]   [%d] VALID  — %s", num, citation_key)
                 valid_citations.append({"number": num, "url": None, "citation_key": citation_key, "line": full_line})
             else:
-                logger.info("[CitationVerify]   [%d] REMOVE — citation_key_not_in_registry: %s", num, citation_key)
+                logger.debug("[CitationVerify]   [%d] REMOVE — citation_key_not_in_registry: %s", num, citation_key)
                 removed_citations.append({"number": num, "line": full_line, "reason": "citation_key_not_in_registry"})
             continue
 
         # Neither URL nor recognizable citation key
-        logger.info("[CitationVerify]   [%d] REMOVE — unverifiable: %s", num, ref_text[:80])
+        logger.debug("[CitationVerify]   [%d] REMOVE — unverifiable: %s", num, ref_text[:80])
         removed_citations.append({"number": num, "line": full_line, "reason": "unverifiable"})
 
     # Apply URL replacements (garbled -> canonical) in the references section
@@ -531,7 +531,7 @@ def verify_citations(report_text: str, registry: SourceRegistry) -> CitationVeri
             ref_section = ref_section.replace(garbled, canonical)
 
     if not removed_citations:
-        logger.info("[CitationVerify] Result: all %d citation(s) valid — no changes", len(valid_citations))
+        logger.debug("[CitationVerify] Result: all %d citation(s) valid — no changes", len(valid_citations))
         verified = body + ref_section if url_replacements else report_text
         return CitationVerificationResult(
             verified_report=verified,
@@ -558,7 +558,7 @@ def verify_citations(report_text: str, registry: SourceRegistry) -> CitationVeri
     # this function and handles renumbering in a single pass.
     verified_report = cleaned_body + cleaned_ref_section
 
-    logger.info(
+    logger.debug(
         "[CitationVerify] Result: kept %d, removed %d",
         len(valid_citations),
         len(removed_citations),
@@ -685,9 +685,9 @@ def sanitize_report(report_text: str) -> ReportSanitizationResult:
     cleaned_body = re.sub(r"  +", " ", cleaned_body)
 
     if body_urls_replaced:
-        logger.info("[ReportSanitize] Replaced %d body URL(s) with citation numbers", body_urls_replaced)
+        logger.debug("[ReportSanitize] Replaced %d body URL(s) with citation numbers", body_urls_replaced)
     if body_urls_removed:
-        logger.info("[ReportSanitize] Removed %d unmatched URL(s) from report body", body_urls_removed)
+        logger.debug("[ReportSanitize] Removed %d unmatched URL(s) from report body", body_urls_removed)
 
     # --- Checks 2 & 3: Validate URLs in references section ---
     if ref_section:
@@ -755,19 +755,19 @@ def sanitize_report(report_text: str) -> ReportSanitizationResult:
                     cleaned_body = re.sub(rf"\[{num}\]", "", cleaned_body)
 
         if shortened_urls_removed:
-            logger.info(
+            logger.debug(
                 "[ReportSanitize] Removed %d shortened URL(s) from references: %s",
                 len(shortened_urls_removed),
                 shortened_urls_removed,
             )
         if truncated_urls_removed:
-            logger.info(
+            logger.debug(
                 "[ReportSanitize] Removed %d truncated/incomplete URL(s) from references: %s",
                 len(truncated_urls_removed),
                 truncated_urls_removed,
             )
         if unsafe_urls_removed:
-            logger.info(
+            logger.debug(
                 "[ReportSanitize] Removed %d unsafe URL(s) from references: %s",
                 len(unsafe_urls_removed),
                 unsafe_urls_removed,
