@@ -204,17 +204,23 @@ class SourceRegistryMiddleware(AgentMiddleware):
     """Intercepts tool call results to build a registry of actual sources.
 
     Two responsibilities:
-    1. awrap_tool_call: Capture URLs/citation keys from every tool result
+    1. awrap_tool_call: Capture URLs/citation keys from tool results
     2. awrap_model_call: Inject a consolidated source list into the LLM context
        so the orchestrator has a single, authoritative reference list when
        writing the final report (no manual reconciliation across subagent files)
+
+    Only tools whose names appear in ``source_tool_names`` contribute to the
+    registry.  This set is derived from the YAML config at construction time,
+    so user-added search tools are captured automatically and no internal-tool
+    blocklist needs to be maintained.
 
     The registry is also used by verify_citations() to strip fabricated,
     stale, or intermediate-artifact citations from the final report.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, source_tool_names: set[str] | None = None) -> None:
         self.registry = SourceRegistry()
+        self._source_tool_names = source_tool_names or set()
 
     async def awrap_tool_call(self, request, handler):
         """Capture sources from tool results after execution."""
@@ -223,6 +229,8 @@ class SourceRegistryMiddleware(AgentMiddleware):
             tool_name = ""
             if hasattr(request, "tool_call") and isinstance(request.tool_call, dict):
                 tool_name = request.tool_call.get("name", "")
+            if tool_name not in self._source_tool_names:
+                return result
             sources = extract_sources_from_tool_result(tool_name, str(result.content))
             for source in sources:
                 self.registry.add(source)

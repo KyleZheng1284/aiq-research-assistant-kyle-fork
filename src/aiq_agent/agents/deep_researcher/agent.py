@@ -125,7 +125,9 @@ class DeepResearcherAgent:
         for t in self.tools:
             self.tools_info.append({"name": t.name, "description": t.description})
 
-        self.source_registry_middleware = SourceRegistryMiddleware()
+        self.source_registry_middleware = SourceRegistryMiddleware(
+            source_tool_names={t.name for t in self.tools},
+        )
 
         # Create a tool that gives the orchestrator access to verified sources
         registry_middleware = self.source_registry_middleware

@@ -229,12 +229,20 @@ class ShallowResearcherAgent:
 
         tool_node = ToolNode(self.tools)
 
+        _source_tool_names = {t.name for t in self.tools}
+
         async def tool_node_with_source_capture(state: ShallowResearchAgentState) -> dict[str, Any]:
-            """Execute tools and capture source URLs/citations for verification."""
+            """Execute tools and capture source URLs/citations for verification.
+
+            Only config-defined source tools contribute to the registry;
+            internal tools are ignored automatically.
+            """
             result = await tool_node.ainvoke(state)
             for msg in result.get("messages", []):
                 if isinstance(msg, ToolMessage) and msg.content:
                     tool_name = getattr(msg, "name", "") or ""
+                    if tool_name not in _source_tool_names:
+                        continue
                     sources = extract_sources_from_tool_result(tool_name, str(msg.content))
                     for source in sources:
                         self.source_registry.add(source)
