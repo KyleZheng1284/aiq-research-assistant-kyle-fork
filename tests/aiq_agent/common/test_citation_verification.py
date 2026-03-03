@@ -394,7 +394,8 @@ class TestVerifyCitations:
         # [1] stays as [1]
         assert "[1]" in result.verified_report
 
-    def test_renumbering_after_removal(self, registry):
+    def test_removal_leaves_gaps_for_sanitize(self, registry):
+        """verify_citations removes invalid refs but does NOT renumber — gaps are left for sanitize_report."""
         report = (
             "A [1]. B [2]. C [3].\n\n"
             "## Sources\n"
@@ -403,10 +404,10 @@ class TestVerifyCitations:
             "[3] Article 2: https://valid.com/article2"
         )
         result = verify_citations(report, registry)
-        assert result.renumber_map == {1: 1, 3: 2}
         assert "A [1]" in result.verified_report
-        assert "C [2]" in result.verified_report
-        assert "[3]" not in result.verified_report
+        assert "[2]" not in result.verified_report
+        # [3] is NOT renumbered — gaps are closed by sanitize_report()
+        assert "C [3]" in result.verified_report
 
     def test_knowledge_layer_citation_validated(self, registry):
         report = "Internal finding [1].\n\n## Sources\n[1] report.pdf, p.15"
@@ -435,8 +436,8 @@ class TestVerifyCitations:
             "[3] Article 2: https://valid.com/article2"
         )
         result = verify_citations(report, registry)
-        # [2] removed, [3] renumbered to [2]
-        assert "Finding [1][2]." in result.verified_report
+        # [2] removed, [3] stays (renumbering deferred to sanitize_report)
+        assert "Finding [1][3]." in result.verified_report
 
     def test_references_with_dashes(self, registry):
         """Shallow researcher uses '- [N] Title - URL' format."""
@@ -515,7 +516,8 @@ class TestVerifyCitations:
 class TestSanitizeReport:
     """Tests for deterministic report sanitization."""
 
-    def test_bare_urls_stripped_from_body(self):
+    def test_body_url_not_in_refs_stripped(self):
+        """Bare body URL with no matching reference is removed."""
         report = (
             "NVIDIA is great (see https://nvidia.com/gpus for details) [1].\n\n"
             "## Sources\n"
@@ -526,17 +528,33 @@ class TestSanitizeReport:
         # URL in references preserved
         assert "https://nvidia.com/article" in result.sanitized_report
         assert result.body_urls_removed == 1
+        assert result.body_urls_replaced == 0
 
-    def test_markdown_links_preserved_in_body(self):
-        """Markdown hyperlinks [text](url) should NOT be stripped from body."""
+    def test_body_url_matching_ref_replaced_with_citation(self):
+        """Bare body URL matching a reference is replaced with [N]."""
+        report = (
+            "Visit https://arxiv.org/abs/1706.03762 for the paper [1].\n\n"
+            "## Sources\n"
+            "[1] Paper: https://arxiv.org/abs/1706.03762"
+        )
+        result = sanitize_report(report)
+        # Body URL replaced with citation number
+        assert "Visit [1] for the paper [1]" in result.sanitized_report
+        # Reference section URL preserved
+        assert "[1] Paper: https://arxiv.org/abs/1706.03762" in result.sanitized_report
+        assert result.body_urls_replaced == 1
+        assert result.body_urls_removed == 0
+
+    def test_markdown_links_collapsed_to_text_in_body(self):
+        """Markdown hyperlinks [text](url) should be collapsed to display text."""
         report = (
             "Read the [NVIDIA docs](https://nvidia.com/docs/guide) for details [1].\n\n"
             "## Sources\n"
             "[1] Article: https://example.com/article"
         )
         result = sanitize_report(report)
-        assert "[NVIDIA docs](https://nvidia.com/docs/guide)" in result.sanitized_report
-        assert result.body_urls_removed == 0
+        assert "NVIDIA docs" in result.sanitized_report
+        assert "https://nvidia.com/docs/guide" not in result.sanitized_report
 
     def test_body_without_urls_unchanged(self):
         report = (
@@ -625,6 +643,38 @@ class TestSanitizeReport:
         assert "arxiv.org/abs/1706.03762" in result.sanitized_report
         assert len(result.truncated_urls_removed) == 0
 
+    def test_renumbering_closes_gaps_from_verify(self):
+        """sanitize_report renumbers to close gaps left by verify_citations."""
+        # Simulate output of verify_citations that removed [2]: gaps [1], [3]
+        report = (
+            "A [1]. C [3].\n\n"
+            "## Sources\n"
+            "[1] Article 1: https://valid.com/article1\n"
+            "[3] Article 2: https://valid.com/article2"
+        )
+        result = sanitize_report(report)
+        assert "A [1]" in result.sanitized_report
+        assert "C [2]" in result.sanitized_report
+        assert "[3]" not in result.sanitized_report
+
+    def test_full_pipeline_verify_then_sanitize(self):
+        """End-to-end: verify removes invalid, sanitize renumbers and cleans."""
+        registry = SourceRegistry()
+        registry.add(SourceEntry(url="https://valid.com/article1", source_type="tavily"))
+        registry.add(SourceEntry(url="https://valid.com/article2", source_type="tavily"))
+        report = (
+            "A [1]. B [2]. C [3].\n\n"
+            "## Sources\n"
+            "[1] Article 1: https://valid.com/article1\n"
+            "[2] Fake: https://fake.com\n"
+            "[3] Article 2: https://valid.com/article2"
+        )
+        verified = verify_citations(report, registry).verified_report
+        sanitized = sanitize_report(verified).sanitized_report
+        assert "A [1]" in sanitized
+        assert "C [2]" in sanitized
+        assert "[3]" not in sanitized
+
     def test_mixed_issues(self):
         """Body URL + shortened reference + valid references."""
         report = (
@@ -637,5 +687,20 @@ class TestSanitizeReport:
         assert "https://nvidia.com" not in result.sanitized_report
         assert "arxiv.org/abs/paper" in result.sanitized_report
         assert "bit.ly" not in result.sanitized_report
+        # nvidia.com/gpus doesn't match any reference → removed
         assert result.body_urls_removed == 1
         assert len(result.shortened_urls_removed) == 1
+
+    def test_mixed_body_urls_some_match_some_not(self):
+        """Body has two URLs: one matches a reference, one doesn't."""
+        report = (
+            "See https://arxiv.org/abs/paper and https://unknown.com for details [1].\n\n"
+            "## Sources\n"
+            "[1] Paper: https://arxiv.org/abs/paper"
+        )
+        result = sanitize_report(report)
+        # Matching URL replaced with [1], unknown URL stripped
+        assert "See [1] and for details [1]" in result.sanitized_report
+        assert "https://unknown.com" not in result.sanitized_report
+        assert result.body_urls_replaced == 1
+        assert result.body_urls_removed == 1

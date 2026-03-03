@@ -65,7 +65,6 @@ class CitationVerificationResult:
     verified_report: str
     removed_citations: list[dict] = field(default_factory=list)
     valid_citations: list[dict] = field(default_factory=list)
-    renumber_map: dict[int, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +406,40 @@ def _is_knowledge_citation(ref_text: str, registry: SourceRegistry | None = None
     return False, None
 
 
+def _renumber_citations(body: str, ref_section: str) -> tuple[str, str, dict[int, int]]:
+    """Renumber [N] citations sequentially, closing any gaps.
+
+    Scans the references section for citation numbers, builds a mapping
+    from old to new sequential numbers, and applies it to both body and
+    references via collision-safe placeholders.
+
+    Returns:
+        (body, ref_section, renumber_map) where renumber_map maps every
+        old citation number to its new sequential number.
+    """
+    remaining = sorted(int(m.group(1)) for m in _CITATION_LINE_RE.finditer(ref_section))
+    renumber_map: dict[int, int] = {old: new for new, old in enumerate(remaining, 1)}
+
+    # Nothing to do if already sequential
+    if all(old == new for old, new in renumber_map.items()):
+        return body, ref_section, renumber_map
+
+    # Apply renumbering via placeholders (descending order avoids [1] matching inside [10])
+    for old_num in sorted(renumber_map, reverse=True):
+        new_num = renumber_map[old_num]
+        if old_num != new_num:
+            placeholder = f"__CITE_{new_num}__"
+            body = body.replace(f"[{old_num}]", placeholder)
+            ref_section = ref_section.replace(f"[{old_num}]", placeholder)
+
+    for new_num in sorted(renumber_map.values()):
+        placeholder = f"__CITE_{new_num}__"
+        body = body.replace(placeholder, f"[{new_num}]")
+        ref_section = ref_section.replace(placeholder, f"[{new_num}]")
+
+    return body, ref_section, renumber_map
+
+
 def verify_citations(report_text: str, registry: SourceRegistry) -> CitationVerificationResult:
     """Verify citations in a report against the source registry.
 
@@ -415,7 +448,9 @@ def verify_citations(report_text: str, registry: SourceRegistry) -> CitationVeri
     2. Parse each [N] reference line
     3. Validate URL or citation_key against registry
     4. Remove invalid references and orphaned inline citations
-    5. Renumber remaining citations sequentially
+
+    Renumbering is NOT done here — it is deferred to sanitize_report()
+    which always runs after this function and handles it in a single pass.
 
     Args:
         report_text: The full report text with citations.
@@ -497,18 +532,11 @@ def verify_citations(report_text: str, registry: SourceRegistry) -> CitationVeri
 
     if not removed_citations:
         logger.info("[CitationVerify] Result: all %d citation(s) valid — no changes", len(valid_citations))
-        # Still need to return with URL repairs applied
         verified = body + ref_section if url_replacements else report_text
         return CitationVerificationResult(
             verified_report=verified,
             valid_citations=valid_citations,
-            renumber_map={c["number"]: c["number"] for c in valid_citations},
         )
-
-    # Build renumber map
-    renumber_map: dict[int, int] = {}
-    for new_num, citation in enumerate(valid_citations, 1):
-        renumber_map[citation["number"]] = new_num
 
     removed_numbers = {c["number"] for c in removed_citations}
 
@@ -526,37 +554,20 @@ def verify_citations(report_text: str, registry: SourceRegistry) -> CitationVeri
     for num in removed_numbers:
         cleaned_body = re.sub(rf"\[{num}\]", "", cleaned_body)
 
-    # Renumber: apply in descending order to avoid collision
-    # (replacing [10] before [1] prevents [1] in "[10]" from being matched)
-    for old_num in sorted(renumber_map.keys(), reverse=True):
-        new_num = renumber_map[old_num]
-        if old_num != new_num:
-            # Use a temporary placeholder to avoid collisions
-            placeholder = f"__CITE_{new_num}__"
-            cleaned_body = cleaned_body.replace(f"[{old_num}]", placeholder)
-            cleaned_ref_section = cleaned_ref_section.replace(f"[{old_num}]", placeholder)
-
-    # Replace placeholders with final numbers
-    for new_num in sorted(renumber_map.values()):
-        placeholder = f"__CITE_{new_num}__"
-        cleaned_body = cleaned_body.replace(placeholder, f"[{new_num}]")
-        cleaned_ref_section = cleaned_ref_section.replace(placeholder, f"[{new_num}]")
-
+    # Note: renumbering is deferred to sanitize_report() which always runs after
+    # this function and handles renumbering in a single pass.
     verified_report = cleaned_body + cleaned_ref_section
 
-    if removed_citations:
-        logger.info(
-            "[CitationVerify] Result: kept %d, removed %d — renumber map: %s",
-            len(valid_citations),
-            len(removed_citations),
-            renumber_map,
-        )
+    logger.info(
+        "[CitationVerify] Result: kept %d, removed %d",
+        len(valid_citations),
+        len(removed_citations),
+    )
 
     return CitationVerificationResult(
         verified_report=verified_report,
         removed_citations=removed_citations,
         valid_citations=valid_citations,
-        renumber_map=renumber_map,
     )
 
 
@@ -594,6 +605,10 @@ _IP_ADDRESS_RE = re.compile(r"^https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
 _SUSPICIOUS_SCHEMES_RE = re.compile(r"^(?:javascript|data|vbscript|file):", re.IGNORECASE)
 _BARE_URL_RE = re.compile(r"https?://[^\s<>\"',\]]+")
 
+# Body URL patterns (used by sanitize_report)
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(\s*\w+://[^\s)]+\)")
+_BODY_URL_RE = re.compile(r"\w+://[^\s<>\"',\]]+")
+
 
 @dataclass
 class ReportSanitizationResult:
@@ -601,6 +616,7 @@ class ReportSanitizationResult:
 
     sanitized_report: str
     body_urls_removed: int
+    body_urls_replaced: int
     shortened_urls_removed: list[str]
     truncated_urls_removed: list[str]
     unsafe_urls_removed: list[str]
@@ -609,9 +625,9 @@ class ReportSanitizationResult:
 def sanitize_report(report_text: str) -> ReportSanitizationResult:
     """Deterministic sanitization of a research report.
 
-    Four checks:
-    1. Strip bare URLs from report body — only [N] citations allowed,
-       URLs belong exclusively in the References section.
+    Checks:
+    1. Strip body URLs — collapse markdown links to display text, replace
+       bare URLs that match a reference with ``[N]``, remove the rest.
     2. Remove shortened/obfuscated URLs from References — all URLs must
        be fully expanded (no bit.ly, t.co, etc.).
     3. Remove truncated/garbled URLs — URLs ending in '...' or with no
@@ -625,6 +641,7 @@ def sanitize_report(report_text: str) -> ReportSanitizationResult:
         ReportSanitizationResult with cleaned report and audit trail.
     """
     body_urls_removed = 0
+    body_urls_replaced = 0
     shortened_urls_removed: list[str] = []
     truncated_urls_removed: list[str] = []
     unsafe_urls_removed: list[str] = []
@@ -638,34 +655,39 @@ def sanitize_report(report_text: str) -> ReportSanitizationResult:
         body = report_text
         ref_section = ""
 
-    # --- Check 1: Strip bare URLs from body (preserving markdown links) ---
-    # Markdown links [text](url) should be kept; only bare URLs are stripped
-    _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(https?://[^\s)]+\)")
+    # --- Check 1: Strip body URLs ---
+    # Build URL → citation number map from references so matching body
+    # URLs are replaced with [N] instead of being deleted entirely.
+    url_to_citation: dict[str, int] = {}
+    if ref_section:
+        for m in _CITATION_LINE_RE.finditer(ref_section):
+            num = int(m.group(1))
+            url_m = _BARE_URL_RE.search(m.group(2))
+            if url_m:
+                url_to_citation[_normalize_url(url_m.group(0).rstrip(".,;)"))] = num
 
     def _replace_body_url(match: re.Match) -> str:
-        nonlocal body_urls_removed
+        nonlocal body_urls_removed, body_urls_replaced
+        url = match.group(0).rstrip(".,;)")
+        normalized = _normalize_url(url)
+        if normalized in url_to_citation:
+            body_urls_replaced += 1
+            return f"[{url_to_citation[normalized]}]"
         body_urls_removed += 1
         return ""
 
-    # Temporarily protect markdown link URLs from stripping
-    md_placeholders: list[str] = []
-
-    def _protect_md_link(match: re.Match) -> str:
-        placeholder = f"__MD_LINK_{len(md_placeholders)}__"
-        md_placeholders.append(match.group(0))
-        return placeholder
-
-    protected_body = _MD_LINK_RE.sub(_protect_md_link, body)
-    cleaned_body = _BARE_URL_RE.sub(_replace_body_url, protected_body)
-    # Restore markdown links
-    for i, original in enumerate(md_placeholders):
-        cleaned_body = cleaned_body.replace(f"__MD_LINK_{i}__", original)
-    # Clean up any leftover empty parentheses from removed bare URLs
+    # Collapse markdown links to display text
+    cleaned_body = _MD_LINK_RE.sub(r"\1", body)
+    # Replace matching bare URLs with [N], strip the rest
+    cleaned_body = _BODY_URL_RE.sub(_replace_body_url, cleaned_body)
+    # Clean up leftover empty parentheses and extra spaces
     cleaned_body = re.sub(r"\(\s*\)", "", cleaned_body)
     cleaned_body = re.sub(r"  +", " ", cleaned_body)
 
+    if body_urls_replaced:
+        logger.info("[ReportSanitize] Replaced %d body URL(s) with citation numbers", body_urls_replaced)
     if body_urls_removed:
-        logger.info("[ReportSanitize] Removed %d bare URL(s) from report body", body_urls_removed)
+        logger.info("[ReportSanitize] Removed %d unmatched URL(s) from report body", body_urls_removed)
 
     # --- Checks 2 & 3: Validate URLs in references section ---
     if ref_section:
@@ -727,24 +749,10 @@ def sanitize_report(report_text: str) -> ReportSanitizationResult:
             cleaned_ref_lines = [line for i, line in enumerate(ref_lines) if i not in lines_to_remove]
             ref_section = "\n".join(cleaned_ref_lines)
 
-            # Strip orphaned inline [N] from body and renumber
+            # Strip orphaned inline [N] from body
             if removed_numbers:
                 for num in removed_numbers:
                     cleaned_body = re.sub(rf"\[{num}\]", "", cleaned_body)
-
-                # Renumber remaining citations sequentially
-                remaining = sorted([int(m.group(1)) for m in _CITATION_LINE_RE.finditer(ref_section)])
-                renumber = {old: new for new, old in enumerate(remaining, 1) if old != new}
-                if renumber:
-                    for old_num in sorted(renumber.keys(), reverse=True):
-                        new_num = renumber[old_num]
-                        placeholder = f"__SANITIZE_CITE_{new_num}__"
-                        cleaned_body = cleaned_body.replace(f"[{old_num}]", placeholder)
-                        ref_section = ref_section.replace(f"[{old_num}]", placeholder)
-                    for new_num in sorted(renumber.values()):
-                        placeholder = f"__SANITIZE_CITE_{new_num}__"
-                        cleaned_body = cleaned_body.replace(placeholder, f"[{new_num}]")
-                        ref_section = ref_section.replace(placeholder, f"[{new_num}]")
 
         if shortened_urls_removed:
             logger.info(
@@ -764,6 +772,10 @@ def sanitize_report(report_text: str) -> ReportSanitizationResult:
                 len(unsafe_urls_removed),
                 unsafe_urls_removed,
             )
+
+    # Renumber citations to close any gaps (from verify_citations and/or sanitize removals)
+    if ref_section:
+        cleaned_body, ref_section, _ = _renumber_citations(cleaned_body, ref_section)
 
     sanitized_report = cleaned_body + ref_section
 
@@ -790,6 +802,7 @@ def sanitize_report(report_text: str) -> ReportSanitizationResult:
     return ReportSanitizationResult(
         sanitized_report=sanitized_report,
         body_urls_removed=body_urls_removed,
+        body_urls_replaced=body_urls_replaced,
         shortened_urls_removed=shortened_urls_removed,
         truncated_urls_removed=truncated_urls_removed,
         unsafe_urls_removed=unsafe_urls_removed,
