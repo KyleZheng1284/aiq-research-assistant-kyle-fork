@@ -17,10 +17,12 @@
 
 import logging
 import os
+from typing import Any
 
 from pydantic import AliasChoices
 from pydantic import Field
 from pydantic import SecretStr
+from pydantic import field_validator
 
 from nat.builder.builder import Builder
 from nat.builder.function_info import FunctionInfo
@@ -53,8 +55,18 @@ class PaperSearchToolConfig(FunctionBaseConfig, name="paper_search"):
     )
     serper_api_key: SecretStr | None = Field(
         default=None,
-        description="The API key for Serper (Google Scholar)",
+        description="The API key for Serper (Google Scholar). "
+        "Falls back to SERPER_API_KEY environment variable when not provided.",
     )
+
+    @field_validator("serper_api_key", mode="before")
+    @classmethod
+    def _normalize_empty_key(cls, v: Any) -> Any:
+        """Treat empty or whitespace-only strings as None so the register
+        function falls through to the ``os.environ`` lookup."""
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
 
 @register_function(config_type=PaperSearchToolConfig)

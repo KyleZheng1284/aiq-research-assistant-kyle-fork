@@ -854,6 +854,20 @@ class TestEmptySourceRegistryError:
         with pytest.raises(EmptySourceRegistryError):
             raise EmptySourceRegistryError("test")
 
+    def test_unavailable_tools_default_empty(self):
+        err = EmptySourceRegistryError()
+        assert err.unavailable_tools == []
+
+    def test_unavailable_tools_preserved(self):
+        details = [
+            {"tool_name": "tavily_web_search", "missing_key": "TAVILY_API_KEY", "description": ""},
+            {"tool_name": "paper_search", "missing_key": "SERPER_API_KEY", "description": ""},
+        ]
+        err = EmptySourceRegistryError("shallow research", unavailable_tools=details)
+        assert len(err.unavailable_tools) == 2
+        assert err.unavailable_tools[0]["missing_key"] == "TAVILY_API_KEY"
+        assert err.agent_type == "shallow research"
+
 
 # ---------------------------------------------------------------------------
 # Session Registry

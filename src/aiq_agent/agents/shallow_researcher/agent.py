@@ -312,7 +312,10 @@ class ShallowResearcherAgent:
                     )
                     content = verification.verified_report
                 else:
-                    raise EmptySourceRegistryError("shallow research")
+                    from aiq_agent.common.tool_validation import get_unavailable_tool_details
+
+                    unavailable = get_unavailable_tool_details(self.tools)
+                    raise EmptySourceRegistryError("shallow research", unavailable_tools=unavailable)
 
                 # Step 2: sanitize report (strip body URLs, shortened URLs, unsafe URLs)
                 sanitization = sanitize_report(content)

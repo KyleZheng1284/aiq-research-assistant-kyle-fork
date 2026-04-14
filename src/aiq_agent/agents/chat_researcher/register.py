@@ -221,26 +221,23 @@ async def chat_deepresearcher_agent(config: ChatDeepResearcherConfig, builder: B
         excluded = set(deep_research_config.exclude_tools)
         deep_research_tools = [t for t in deep_research_tools if getattr(t, "name", "") not in excluded]
 
-    # Create a validation function to check if deep research tools are available
     def validate_deep_research_tools(data_sources: list[str] | None) -> tuple[bool, str]:
-        """
-        Validate that at least one deep research tool is available.
+        """Validate that at least one deep research tool is available.
 
         Returns:
             Tuple of (is_valid, error_message). If is_valid is False, error_message contains the reason.
         """
-        from aiq_agent.common import format_tool_unavailability_error
         from aiq_agent.common import validate_tool_availability
+        from aiq_agent.common.tool_validation import format_configuration_error_message
+        from aiq_agent.common.tool_validation import get_unavailable_tool_details
 
         selected_tools = filter_tools_by_sources(deep_research_tools, data_sources)
 
-        is_valid, _, unavailable_tools = validate_tool_availability(
-            selected_tools, research_type="deep research", enable_logging=False
-        )
+        is_valid, _, _ = validate_tool_availability(selected_tools, research_type="deep research", enable_logging=False)
 
         if not is_valid:
-            error_msg = format_tool_unavailability_error("deep research", unavailable_tools)
-            return False, error_msg
+            details = get_unavailable_tool_details(selected_tools)
+            return False, format_configuration_error_message(details)
 
         return True, ""
 

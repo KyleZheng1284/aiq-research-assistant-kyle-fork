@@ -56,7 +56,9 @@ from .llm_provider import LLMRole
 from .message_utils import get_latest_user_query
 from .prompt_utils import load_prompt
 from .prompt_utils import render_prompt_template
-from .tool_validation import format_tool_unavailability_error
+from .tool_validation import GENERIC_EMPTY_SOURCES_MESSAGE
+from .tool_validation import format_configuration_error_message
+from .tool_validation import get_unavailable_tool_details
 from .tool_validation import validate_tool_availability
 
 logger = logging.getLogger(__name__)
@@ -75,7 +77,9 @@ __all__ = [
     "extract_messages_and_sources",
     "filter_tools_by_sources",
     "format_data_source_tools",
-    "format_tool_unavailability_error",
+    "GENERIC_EMPTY_SOURCES_MESSAGE",
+    "format_configuration_error_message",
+    "get_unavailable_tool_details",
     "get_all_tool_refs",
     "get_checkpointer",
     "get_or_create_session_registry",

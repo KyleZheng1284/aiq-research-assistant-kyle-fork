@@ -1,0 +1,75 @@
+
+general:
+  telemetry:
+    logging:
+      console:
+        _type: console
+        level: INFO
+  use_uvloop: true
+
+llms:
+  nemotron_llm:
+    _type: nim
+    model_name: nvidia/nemotron-3-nano-30b-a3b
+    base_url: "https://integrate.api.nvidia.com/v1"
+    temperature: 1.0
+    top_p: 1.0
+    max_tokens: 128000
+    max_retries: 10
+    timeout: 600
+    chat_template_kwargs:
+      enable_thinking: true
+
+  # Update this section with the name of the judge model you chose
+  judge_llm:
+    _type: openai
+    model_name: "gemini-2.5-pro"
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    api_key: ${GEMINI_API_KEY}
+    timeout: 600
+    max_retries: 10
+    temperature: 0.1
+
+functions:
+  paper_search_tool:
+    _type: paper_search
+    max_results: 5
+
+  advanced_web_search_tool:
+    _type: tavily_web_search
+    max_results: 2
+    advanced_search: true
+
+  deep_research_agent:
+    _type: deep_research_agent
+    orchestrator_llm: nemotron_llm
+    max_loops: 2
+    tools:
+      - paper_search_tool
+      - advanced_web_search_tool
+
+workflow:
+  _type: deep_research_workflow
+
+eval:
+  general:
+    workflow_alias: "aiq-deepresearcher"
+    output_dir: docs/notebooks/results
+    max_concurrency: 1 # update for higher concurrency
+    dataset:
+      _type: json
+      file_path: frontends/benchmarks/deepresearch_bench/data/drb_full_dataset.json
+      structure:
+        question_key: question
+        answer_key: expected_output
+        generated_answer_key: generated_answer
+      # filter:
+      #   allowlist:
+      #     field: # run sample of 16, for english only set 51-100, for all comment out the filter
+      #       id: [88, 80, 84, 90, 59, 51, 94, 96, 91, 99, 93, 86, 67, 100, 72, 76]
+
+  evaluators:
+    race:
+      _type: drb_race_evaluator
+      llm_name: judge_llm
+      criteria_file: frontends/benchmarks/deepresearch_bench/data/criteria.jsonl

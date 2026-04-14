@@ -16,9 +16,11 @@
 import asyncio
 import logging
 import os
+from typing import Any
 
 from pydantic import Field
 from pydantic import SecretStr
+from pydantic import field_validator
 
 from nat.builder.builder import Builder
 from nat.builder.function_info import FunctionInfo
@@ -39,7 +41,21 @@ class TavilyWebSearchToolConfig(FunctionBaseConfig, name="tavily_web_search"):
 
     include_answer: str = Field(default="advanced", description="Whether to include answers in the search results")
     max_results: int = Field(default=3, description="Maximum number of search results to return")
-    api_key: SecretStr | None = Field(default=None, description="The API key for the Tavily service")
+    api_key: SecretStr | None = Field(
+        default=None,
+        description="The API key for the Tavily service. "
+        "Falls back to TAVILY_API_KEY environment variable when not provided.",
+    )
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def _normalize_empty_key(cls, v: Any) -> Any:
+        """Treat empty or whitespace-only strings as None so the register
+        function falls through to the ``os.environ`` lookup."""
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
     max_retries: int = Field(default=3, description="Maximum number of retries for the search request")
     advanced_search: bool = Field(default=False, description="Whether to use advanced search")
     max_content_length: int | None = Field(

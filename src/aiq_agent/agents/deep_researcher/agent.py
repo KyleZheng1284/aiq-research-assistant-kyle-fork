@@ -495,7 +495,10 @@ class DeepResearcherAgent:
                     )
                 final_message = verification.verified_report
             else:
-                raise EmptySourceRegistryError("deep research")
+                from aiq_agent.common.tool_validation import get_unavailable_tool_details
+
+                unavailable = get_unavailable_tool_details(self.tools)
+                raise EmptySourceRegistryError("deep research", unavailable_tools=unavailable)
 
             # Post-process: sanitize report (strip body URLs, shortened URLs, unsafe URLs)
             sanitization = sanitize_report(final_message)

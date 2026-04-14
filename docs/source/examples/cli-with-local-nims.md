@@ -125,7 +125,6 @@ functions:
   paper_search_tool:
     _type: paper_search
     max_results: 5
-    serper_api_key: ${SERPER_API_KEY}
 
   intent_classifier:
     _type: intent_classifier

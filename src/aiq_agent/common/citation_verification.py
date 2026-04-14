@@ -71,10 +71,20 @@ class CitationVerificationResult:
 
 
 class EmptySourceRegistryError(Exception):
-    """Raised when no sources were captured during research."""
+    """Raised when no sources were captured during research.
 
-    def __init__(self, agent_type: str = "research") -> None:
+    Carries optional ``unavailable_tools`` context so that callers higher
+    in the stack can distinguish *configuration* failures (missing API keys)
+    from *transient* failures (tools ran but returned nothing).
+    """
+
+    def __init__(
+        self,
+        agent_type: str = "research",
+        unavailable_tools: list[dict[str, str]] | None = None,
+    ) -> None:
         self.agent_type = agent_type
+        self.unavailable_tools = unavailable_tools or []
         super().__init__(
             f"Research failed: no sources were captured during {agent_type}. "
             "All tool calls may have failed or returned no results. "

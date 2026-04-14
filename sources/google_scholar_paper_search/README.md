@@ -42,8 +42,9 @@ functions:
     _type: paper_search
     max_results: 10
     timeout: 30
-    serper_api_key: ${SERPER_API_KEY}
 ```
+
+Requires `SERPER_API_KEY` to be set in the environment or `deploy/.env`.
 
 #### Configuration Options
 
@@ -51,7 +52,6 @@ functions:
 |-----------|------|---------|-------------|
 | `max_results` | integer | 10 | Maximum number of search results to return (capped at 50) |
 | `timeout` | integer | 30 | Timeout in seconds for search requests |
-| `serper_api_key` | string | None | Serper API key (can also be set through the `SERPER_API_KEY` environment variable) |
 
 ### Adding as a Tool to an Agent
 
@@ -62,7 +62,6 @@ functions:
   paper_search_tool:
     _type: paper_search
     max_results: 5
-    serper_api_key: ${SERPER_API_KEY}
 
   my_research_agent:
     _type: shallow_research_agent
@@ -88,7 +87,6 @@ functions:
   paper_search_tool:
     _type: paper_search
     max_results: 10
-    serper_api_key: ${SERPER_API_KEY}
 
   web_search_tool:
     _type: tavily_internet_search
@@ -125,8 +123,7 @@ The paper search function accepts the following arguments when called by an agen
 
 If you see an error about the API key not being found:
 
-- Verify the `SERPER_API_KEY` environment variable is set correctly
-- Alternatively, ensure the `serper_api_key` is specified in the configuration file
+- Verify the `SERPER_API_KEY` environment variable is set in your environment or `deploy/.env`
 
 **Request timeout**
 
@@ -157,7 +154,6 @@ functions:
   # paper_search_tool:
   #   _type: paper_search
   #   max_results: 5
-  #   serper_api_key: ${SERPER_API_KEY}
 ```
 
 Also remove it from any agents that use it:

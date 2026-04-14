@@ -162,14 +162,14 @@ functions:
   paper_search_tool:
     _type: paper_search
     max_results: 5
-    serper_api_key: ${SERPER_API_KEY}
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `max_results` | `int` | `10` | Maximum number of paper results. |
-| `serper_api_key` | `str` | `None` | Serper API key. Falls back to `SERPER_API_KEY` environment variable. |
 | `timeout` | `int` | `30` | Timeout in seconds for search requests. |
+
+Requires `SERPER_API_KEY` to be set in the environment or `deploy/.env`.
 
 ### `knowledge_retrieval`
 
@@ -417,7 +417,6 @@ functions:
   paper_search_tool:                   # Academic paper search
     _type: paper_search
     max_results: 5
-    serper_api_key: ${SERPER_API_KEY}
 
   intent_classifier:                   # Classifies queries, routes depth
     _type: intent_classifier

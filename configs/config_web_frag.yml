@@ -151,7 +151,6 @@ functions:
   # paper_search_tool:
   #   _type: paper_search
   #   max_results: 5
-  #   serper_api_key: ${SERPER_API_KEY}
 
   # =========================================================================
   # Agents — inherit all registry tools; use exclude_tools to specialize

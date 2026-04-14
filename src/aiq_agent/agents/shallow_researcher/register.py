@@ -106,22 +106,16 @@ async def shallow_research_agent(config: ShallowResearchAgentConfig, builder: Bu
             elif data_sources is not None and not selected_tools:
                 logger.warning("Shallow research received data_sources with no matching tools")
 
-            # Validate tool availability before starting shallow research
-            # At least one tool must be available
-            # This prevents the agent from trying to reason about unavailable tools
-            # Check selected_tools directly - they already reflect data_sources filtering
-            from aiq_agent.common import format_tool_unavailability_error
             from aiq_agent.common import validate_tool_availability
+            from aiq_agent.common.tool_validation import format_configuration_error_message
+            from aiq_agent.common.tool_validation import get_unavailable_tool_details
 
-            is_valid, _, unavailable_tools = validate_tool_availability(
-                selected_tools, research_type="shallow research"
-            )
+            is_valid, _, _ = validate_tool_availability(selected_tools, research_type="shallow research")
 
-            # Fail if no tools are available
             if not is_valid:
-                error_msg = format_tool_unavailability_error("shallow research", unavailable_tools)
+                details = get_unavailable_tool_details(selected_tools)
+                error_msg = format_configuration_error_message(details)
 
-                # Return error state with error message - this prevents the agent from running
                 from langchain_core.messages import AIMessage
 
                 error_state = ShallowResearchAgentState(messages=state.messages + [AIMessage(content=error_msg)])

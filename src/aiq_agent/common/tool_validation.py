@@ -16,9 +16,18 @@
 """Tool validation utilities for checking tool availability."""
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_API_KEY_PATTERN = re.compile(r"missing\s+([A-Z][A-Z0-9_]*(?:_KEY|_TOKEN|_SECRET))", re.IGNORECASE)
+
+GENERIC_EMPTY_SOURCES_MESSAGE = (
+    "The search tools did not return any results for this question. "
+    "This may be due to a temporary issue or the question may need to be rephrased. "
+    "Please try again."
+)
 
 
 def validate_tool_availability(
@@ -73,26 +82,77 @@ def validate_tool_availability(
     return available_tools_count > 0, available_tools_count, unavailable_tools
 
 
-def format_tool_unavailability_error(
-    research_type: str,
-    unavailable_tools: list[str],
-) -> str:
-    """
-    Format an error message for unavailable tools.
+def get_unavailable_tool_details(tools: list[Any]) -> list[dict[str, str]]:
+    """Extract structured details about unavailable (stub) tools.
+
+    Inspects tool descriptions for "unavailable"/"missing" markers set at
+    registration time and extracts the specific API key name when present.
 
     Args:
-        research_type: Type of research (e.g., "shallow research", "deep research")
-        unavailable_tools: List of unavailable tool names with reasons
+        tools: List of tools to inspect.
 
     Returns:
-        Formatted error message string
+        List of dicts with keys ``tool_name``, ``missing_key`` (empty string
+        if not extractable), and ``description``.
     """
-    unavailable_info = ""
-    if unavailable_tools:
-        unavailable_info = f"\nUnavailable tools: {', '.join(unavailable_tools)}.\n"
+    details: list[dict[str, str]] = []
+    for tool in tools:
+        tool_desc = getattr(tool, "description", "") or ""
+        desc_lower = tool_desc.lower()
+        if "unavailable" not in desc_lower and "missing" not in desc_lower:
+            continue
 
-    error_msg = (
-        f"Cannot start {research_type}: No tools are available."
-        f" At least one tool must be configured and available.{unavailable_info}\n"
+        tool_name = getattr(tool, "name", "unknown")
+        match = _API_KEY_PATTERN.search(tool_desc)
+        missing_key = match.group(1) if match else ""
+
+        details.append(
+            {
+                "tool_name": tool_name,
+                "missing_key": missing_key,
+                "description": tool_desc,
+            }
+        )
+    return details
+
+
+def format_configuration_error_message(
+    unavailable_details: list[dict[str, str]],
+) -> str:
+    """Format a user-facing error for research failures caused by missing configuration.
+
+    Produces an actionable message that tells the user exactly which API keys
+    are missing and how to fix the problem, instead of a generic "try again".
+
+    Args:
+        unavailable_details: Output of :func:`get_unavailable_tool_details`.
+
+    Returns:
+        User-friendly error message string.
+    """
+    if not unavailable_details:
+        return GENERIC_EMPTY_SOURCES_MESSAGE
+
+    has_missing_keys = any(d.get("missing_key") for d in unavailable_details)
+
+    if has_missing_keys:
+        key_lines = []
+        for detail in unavailable_details:
+            if detail.get("missing_key"):
+                key_lines.append(f"  - {detail['missing_key']} (required by {detail['tool_name']})")
+            else:
+                key_lines.append(f"  - {detail['tool_name']} (configuration error)")
+
+        return (
+            "Research could not be completed because required search tools are "
+            "unavailable due to missing configuration.\n\n"
+            "Missing API keys:\n" + "\n".join(key_lines) + "\n\n"
+            "Please set these in deploy/.env and restart the application."
+        )
+
+    tool_names = [d["tool_name"] for d in unavailable_details]
+    return (
+        "Research could not be completed because the following search tools "
+        "are unavailable:\n" + "\n".join(f"  - {name}" for name in tool_names) + "\n\n"
+        "Please check your configuration and restart the application."
     )
-    return error_msg
