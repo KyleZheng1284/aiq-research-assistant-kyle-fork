@@ -87,11 +87,11 @@ functions:
         tools:
           - web_search_tool
           - advanced_web_search_tool
-      - id: paper_search
-        name: "Academic Papers"
-        description: "Search academic papers and scientific publications."
-        tools:
-          - paper_search_tool
+      # - id: paper_search
+      #   name: "Academic Papers"
+      #   description: "Search academic papers and scientific publications."
+      #   tools:
+      #     - paper_search_tool
 
   web_search_tool:
     _type: tavily_web_search
@@ -105,13 +105,13 @@ functions:
 
   # Paper Search (optional - requires SERPER_API_KEY in environment or .env)
   # Uncomment the block below to enable academic paper search.
-  paper_search_tool:
-    _type: paper_search
-    max_results: 5
+  # paper_search_tool:
+  #   _type: paper_search
+  #   max_results: 5
 
   # =========================================================================
   # Agents — inherit all registry tools; use exclude_tools to specialize
-  # =========================================================================SE
+  # =========================================================================
   intent_classifier:
     _type: intent_classifier
     llm: nemotron_llm_intent
