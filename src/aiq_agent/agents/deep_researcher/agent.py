@@ -497,14 +497,15 @@ class DeepResearcherAgent:
             else:
                 from aiq_agent.common.tool_validation import validate_tool_availability
 
-                is_valid, _, unavailable = validate_tool_availability(
+                _, available_count, unavailable = validate_tool_availability(
                     self.tools,
                     research_type="deep research",
                     enable_logging=False,
                 )
                 raise EmptySourceRegistryError(
                     "deep research",
-                    unavailable_tools=unavailable if not is_valid else None,
+                    unavailable_tools=unavailable,
+                    available_count=available_count,
                 )
 
             # Post-process: sanitize report (strip body URLs, shortened URLs, unsafe URLs)

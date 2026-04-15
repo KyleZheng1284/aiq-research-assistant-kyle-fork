@@ -57,6 +57,7 @@ from .message_utils import get_latest_user_query
 from .prompt_utils import load_prompt
 from .prompt_utils import render_prompt_template
 from .tool_validation import format_tool_unavailability_error
+from .tool_validation import format_user_facing_tool_error
 from .tool_validation import validate_tool_availability
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ __all__ = [
     "filter_tools_by_sources",
     "format_data_source_tools",
     "format_tool_unavailability_error",
+    "format_user_facing_tool_error",
     "get_all_tool_refs",
     "get_checkpointer",
     "get_or_create_session_registry",

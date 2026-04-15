@@ -205,9 +205,13 @@ class ChatResearcherAgent:
             except EmptySourceRegistryError as exc:
                 logger.warning("Shallow research produced no verifiable sources")
                 if exc.unavailable_tools:
-                    from aiq_agent.common.tool_validation import format_tool_unavailability_error
+                    from aiq_agent.common.tool_validation import format_user_facing_tool_error
 
-                    err_msg = format_tool_unavailability_error("shallow research", exc.unavailable_tools)
+                    err_msg = format_user_facing_tool_error(
+                        "shallow research",
+                        exc.unavailable_tools,
+                        exc.available_count,
+                    )
                 else:
                     err_msg = (
                         "The search tools did not return any results for this question. "
@@ -292,9 +296,13 @@ class ChatResearcherAgent:
             except EmptySourceRegistryError as exc:
                 logger.warning("Deep research produced no verifiable sources")
                 if exc.unavailable_tools:
-                    from aiq_agent.common.tool_validation import format_tool_unavailability_error
+                    from aiq_agent.common.tool_validation import format_user_facing_tool_error
 
-                    err_msg = format_tool_unavailability_error("deep research", exc.unavailable_tools)
+                    err_msg = format_user_facing_tool_error(
+                        "deep research",
+                        exc.unavailable_tools,
+                        exc.available_count,
+                    )
                 else:
                     err_msg = (
                         "The search tools did not return any results for this question. "

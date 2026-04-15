@@ -77,9 +77,11 @@ class EmptySourceRegistryError(Exception):
         self,
         agent_type: str = "research",
         unavailable_tools: list[str] | None = None,
+        available_count: int = 0,
     ) -> None:
         self.agent_type = agent_type
         self.unavailable_tools = unavailable_tools or []
+        self.available_count = available_count
         super().__init__(
             f"Research failed: no sources were captured during {agent_type}. "
             "All tool calls may have failed or returned no results. "

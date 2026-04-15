@@ -76,6 +76,18 @@ async def deep_research_agent(config: DeepResearchAgentConfig, builder: Builder)
         excluded = set(config.exclude_tools)
         tools = [t for t in tools if getattr(t, "name", "") not in excluded]
 
+    from aiq_agent.common import validate_tool_availability
+
+    is_valid, available_count, unavailable = validate_tool_availability(
+        tools,
+        research_type="deep research",
+    )
+    if not is_valid:
+        logger.warning(
+            "Startup check: no tools available for deep research. "
+            "All queries will fail until at least one tool is properly configured.",
+        )
+
     llm = await builder.get_llm(config.orchestrator_llm, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
 
     provider = LLMProvider()
@@ -121,14 +133,14 @@ async def deep_research_agent(config: DeepResearchAgentConfig, builder: Builder)
             # At least one tool must be available
             # This prevents the agent from trying to reason about unavailable tools
             # Check selected_tools directly - they already reflect data_sources filtering
-            from aiq_agent.common import format_tool_unavailability_error
+            from aiq_agent.common import format_user_facing_tool_error
             from aiq_agent.common import validate_tool_availability
 
             is_valid, _, unavailable_tools = validate_tool_availability(selected_tools, research_type="deep research")
 
             # Fail if no tools are available
             if not is_valid:
-                error_msg = format_tool_unavailability_error("deep research", unavailable_tools)
+                error_msg = format_user_facing_tool_error("deep research", unavailable_tools)
 
                 # Return error state with error message - this prevents the agent from running
                 from langchain_core.messages import AIMessage
