@@ -419,7 +419,8 @@ class PlanPersistenceMiddleware(AgentMiddleware):
     exists, since the LLM ``write_file`` tool refuses to overwrite while
     ``upload_files`` overwrites in place.
 
-    Persistence failures are logged and never propagate into the agent loop.
+    Persistence failures propagate so the planner task fails before the
+    orchestrator reads a missing or stale ``/shared/plan.json``.
     """
 
     def __init__(self, backend: object, *, path: str = "/shared/plan.json") -> None:
@@ -453,32 +454,25 @@ class PlanPersistenceMiddleware(AgentMiddleware):
         responses = self.backend.upload_files([(self.path, content)])
         errors = [f"{response.path}: {response.error}" for response in responses if getattr(response, "error", None)]
         if errors:
-            logger.warning("Failed to persist plan to %s: %s", self.path, "; ".join(errors))
+            msg = f"Failed to persist plan to {self.path}: {'; '.join(errors)}"
+            logger.error(msg)
+            raise RuntimeError(msg)
 
     async def awrap_model_call(self, request, handler):
         """Persist the structured plan as soon as the model emits it."""
         response = await handler(request)
         plan = getattr(response, "structured_response", None)
         if plan is not None:
-            try:
-                self._persist_plan(plan)
-            except Exception:
-                logger.warning("Plan persistence (model_call) failed", exc_info=True)
+            await asyncio.to_thread(self._persist_plan, plan)
         return response
 
     def after_agent(self, state, runtime):
         """Persist the plan after a synchronous planner run completes."""
-        try:
-            self._persist_plan(self._plan_from_state(state))
-        except Exception:
-            logger.warning("Plan persistence to %s failed", self.path, exc_info=True)
+        self._persist_plan(self._plan_from_state(state))
 
     async def aafter_agent(self, state, runtime):
         """Persist the plan after an asynchronous planner run completes."""
-        try:
-            self._persist_plan(self._plan_from_state(state))
-        except Exception:
-            logger.warning("Plan persistence to %s failed", self.path, exc_info=True)
+        await asyncio.to_thread(self._persist_plan, self._plan_from_state(state))
 
 
 class ToolResultPruningMiddleware(AgentMiddleware):

@@ -132,7 +132,7 @@ functions:
     orchestrator_llm: gpt_oss_llm
     source_router_llm: nemotron_super_llm
     researcher_llm: nemotron_super_llm
-    planner_llm: gpt_oss_llm
+    planner_llm: nemotron_super_llm
     writer_llm: gpt_oss_llm
     exclude_tools:
       - web_search_tool

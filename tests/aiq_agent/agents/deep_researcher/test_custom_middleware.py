@@ -521,8 +521,8 @@ class TestPlanPersistenceMiddleware:
         assert json.loads(backend.uploads[0][1].decode("utf-8")) == {"title": "Plan"}
 
     @pytest.mark.asyncio
-    async def test_backend_failure_does_not_propagate(self):
-        """Upload errors are swallowed so the agent loop is never interrupted."""
+    async def test_backend_failure_propagates(self):
+        """Upload failures abort the planner task with the backend error."""
 
         class _BoomBackend:
             def upload_files(self, files):
@@ -530,4 +530,18 @@ class TestPlanPersistenceMiddleware:
 
         mw = PlanPersistenceMiddleware(backend=_BoomBackend())
 
-        await mw.aafter_agent({"structured_response": {"title": "Plan"}}, runtime=None)
+        with pytest.raises(RuntimeError, match="boom"):
+            await mw.aafter_agent({"structured_response": {"title": "Plan"}}, runtime=None)
+
+    @pytest.mark.asyncio
+    async def test_upload_error_response_propagates(self):
+        """Non-empty upload error responses abort the planner task."""
+
+        class _ErrorBackend:
+            def upload_files(self, files):
+                return [SimpleNamespace(path="/shared/plan.json", error="disk full")]
+
+        mw = PlanPersistenceMiddleware(backend=_ErrorBackend())
+
+        with pytest.raises(RuntimeError, match="disk full"):
+            await mw.aafter_agent({"structured_response": {"title": "Plan"}}, runtime=None)
