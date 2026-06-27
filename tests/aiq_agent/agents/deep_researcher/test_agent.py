@@ -482,8 +482,9 @@ class TestDeepResearcherAgent:
             assert "answer_strategy" in planner_prompt
             assert "Dynamic Discovery Budget" in planner_prompt
             assert "Do not turn planning into full evidence gathering" in planner_prompt
-            assert "Do not call `write_todos`" in planner_prompt
-            assert "Todo tracking is owned by the orchestrator" in planner_prompt
+            # write_todos is suppressed for the planner at the middleware level
+            # (TodoSuppressionMiddleware), so the prompt no longer mentions it at all.
+            assert "write_todos" not in planner_prompt
             assert "configured batch concurrency of 6" in planner_prompt
             assert "Thorough evidence gathering is essential" not in planner_prompt
             assert "Table of Contents" not in planner_prompt
