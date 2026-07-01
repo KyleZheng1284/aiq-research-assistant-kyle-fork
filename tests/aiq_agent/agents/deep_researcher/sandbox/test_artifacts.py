@@ -40,14 +40,18 @@ class _FakeBackend:
 
     def __init__(self, files: dict[str, bytes]) -> None:
         self.files = files
+        self.execute_calls: list[str] = []
+        self.download_calls: list[list[str]] = []
 
     def download_files(self, paths: list[str]) -> list[Any]:
+        self.download_calls.append(list(paths))
         return [
             SimpleNamespace(path=p, content=self.files.get(p), error=None if p in self.files else "not found")
             for p in paths
         ]
 
     def execute(self, command: str, *, timeout: int | None = None) -> Any:
+        self.execute_calls.append(command)
         return SimpleNamespace(output="\n".join(self.files), exit_code=0)
 
 
@@ -118,8 +122,12 @@ class TestHarvest:
         assert captured[0].mime_type == "image/png"
         assert captured[0].kind == ArtifactKind.IMAGE
         assert store.list("job-1")[0].filename == "chart.png"
-        assert emitted and emitted[0]["type"] == "artifact"
-        assert "content" not in emitted[0]  # bytes never in the event payload
+        assert emitted and emitted[0]["type"] == "artifact.update"
+        assert emitted[0]["name"] == "chart.png"
+        assert emitted[0]["data"]["type"] == "file"
+        assert emitted[0]["data"]["artifact_id"] == captured[0].artifact_id
+        assert emitted[0]["data"]["content_url"].endswith(f"/{captured[0].artifact_id}/content")
+        assert "content" not in emitted[0]["data"]  # bytes and URL-as-text never enter the payload
 
     def test_rejects_path_traversal(self, tmp_path: Any) -> None:
         store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
@@ -160,8 +168,21 @@ class TestHarvest:
         files = {f"{_ARTIFACT_DIR}/manifest.json": _manifest_bytes(png_path), png_path: _PNG}
         manager, _ = _make_manager(store, files)
         manager.final_harvest()
+        first_downloads = list(manager.backend.download_calls)
         manager.final_harvest()  # same bytes again
         assert len(store.list("job-1")) == 1
+        assert manager.backend.download_calls == first_downloads
+
+    def test_checkpoint_harvest_uses_manifest_without_directory_scan(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        png_path = f"{_ARTIFACT_DIR}/chart.png"
+        files = {f"{_ARTIFACT_DIR}/manifest.json": _manifest_bytes(png_path), png_path: _PNG}
+        manager, _ = _make_manager(store, files)
+
+        captured = manager.harvest_after_execute()
+
+        assert [artifact.filename for artifact in captured] == ["chart.png"]
+        assert manager.backend.execute_calls == []
 
     def test_scan_fallback_without_manifest(self, tmp_path: Any) -> None:
         store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")

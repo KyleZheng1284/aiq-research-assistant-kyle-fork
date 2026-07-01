@@ -110,6 +110,7 @@ export type {
   ToolStartEvent,
   ToolEndEvent,
   TodoItem,
+  FileArtifactUpdate,
   ArtifactUpdateEvent,
   DeepResearchEvent,
   DeepResearchCallbacks,

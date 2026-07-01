@@ -23,6 +23,7 @@ from deepagents.middleware.filesystem import _check_fs_permission
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.tools import tool
 
+from aiq_agent.agents.deep_researcher.custom_middleware import ArtifactHarvestMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRegistryMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ToolNameSanitizationMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ToolVisibilityMiddleware
@@ -148,6 +149,28 @@ def test_middleware_set_adds_orchestrator_batch_tool_name():
     assert registry in middleware_set.researcher
     assert registry in middleware_set.writer
     assert tool_set.writer_tools != tool_set.researcher_tools
+
+
+def test_middleware_set_wires_artifact_checkpoint_when_manager_present():
+    """Artifact harvesting is attached to every execute-capable middleware stack."""
+    registry = SourceRegistryMiddleware(source_tool_names={web_search_tool.name})
+    tool_set = build_deep_research_tool_set(
+        [web_search_tool],
+        source_registry_middleware=registry,
+        max_concurrent_source_tool_calls=2,
+        max_source_tool_batch_size=3,
+    )
+    manager = MagicMock()
+
+    middleware_set = build_deep_research_middleware_set(
+        tool_set=tool_set,
+        source_registry_middleware=registry,
+        artifact_manager=manager,
+    )
+
+    for middleware in (middleware_set.researcher, middleware_set.planner, middleware_set.writer):
+        checkpoint = next(item for item in middleware if isinstance(item, ArtifactHarvestMiddleware))
+        assert checkpoint.artifact_manager is manager
 
 
 def test_subagents_route_tools_and_writer_skills():

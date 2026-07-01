@@ -41,7 +41,10 @@ runtime (`.../job/{job_id}/artifacts`), which is also auth-scoped to the job.
   caps (`AIQ_MAX_SANDBOXES_PER_PRINCIPAL` / `AIQ_MAX_SANDBOXES_GLOBAL`, default-off) bound
   concurrency and cost.
 - Custom client-supplied job IDs must not be reused for a new job.
-- The runtime closes provider sessions on success, failure, cancellation, and timeout.
+- Manifest checkpoints preserve completed artifacts after successful sandbox commands. The
+  terminal finalizer harvests once before cleanup on success/failure; cancellation harvests
+  only when the provider is idle and otherwise terminates immediately.
+- Job status becomes terminal only after artifact and cleanup events are flushed.
 - Per-job OpenShell mode requires `delete_on_exit: true`. A persistent shared sandbox is
   possible only through the explicit debug attachment settings.
 

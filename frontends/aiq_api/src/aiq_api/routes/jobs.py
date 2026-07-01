@@ -758,7 +758,7 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
         "/v1/jobs/async/job/{job_id}/cancel",
         tags=["async jobs"],
         summary="Cancel a running job",
-        description="Request cancellation of a running job. The job status will be set to INTERRUPTED.",
+        description="Request cancellation. The worker publishes INTERRUPTED after terminal cleanup completes.",
         responses={
             400: {"description": "Job is not in RUNNING state"},
             404: {"description": "Job not found"},
@@ -772,8 +772,6 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
         if job.status != JobStatus.RUNNING.value:
             raise HTTPException(400, f"Job not running: {job_id} (status: {job.status})")
 
-        await job_store.update_status(job_id, JobStatus.INTERRUPTED, error="cancelled by user")
-
         event_store = EventStore(db_url, job_id)
         event_store.store(
             {
@@ -784,9 +782,14 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
 
         task_cancelled = await _cancel_dask_task(scheduler_address, job_id)
 
-        logger.info("Cancel requested for job %s: status updated, task_cancelled=%s", job_id, task_cancelled)
+        logger.info("Cancel requested for job %s: task_cancelled=%s", job_id, task_cancelled)
 
-        return {"job_id": job_id, "status": JobStatus.INTERRUPTED.value, "task_cancelled": task_cancelled}
+        return {
+            "job_id": job_id,
+            "status": job.status,
+            "cancellation_requested": True,
+            "task_cancelled": task_cancelled,
+        }
 
     @app.get(
         "/v1/jobs/async/job/{job_id}/state",

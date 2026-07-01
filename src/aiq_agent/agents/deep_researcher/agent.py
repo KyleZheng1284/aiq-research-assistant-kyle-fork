@@ -138,6 +138,7 @@ class DeepResearcherAgent:
         self.middleware_set = build_deep_research_middleware_set(
             tool_set=self.tool_set,
             source_registry_middleware=self.source_registry_middleware,
+            artifact_manager=self.deepagents_runtime.artifact_manager,
         )
 
         self.source_tool_names = self.tool_set.source_tool_names

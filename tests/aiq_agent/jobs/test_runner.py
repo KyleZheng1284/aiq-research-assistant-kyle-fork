@@ -609,6 +609,37 @@ class TestEventStore:
         assert len(events) == 1
         assert events[0]["type"] == "test.event"
 
+    def test_artifact_update_survives_event_store_round_trip(self, tmp_path):
+        """Generated-file metadata remains reconstructable after durable storage."""
+        from aiq_agent.agents.deep_researcher.sandbox.artifacts import Artifact
+        from aiq_agent.agents.deep_researcher.sandbox.artifacts import ArtifactKind
+        from aiq_api.jobs.event_store import EventStore
+
+        db_url = f"sqlite:///{tmp_path / 'test.db'}"
+        content_url = "/v1/jobs/async/job/job-1/artifacts/artifact-1/content"
+        artifact = Artifact(
+            artifact_id="artifact-1",
+            job_id="job-1",
+            kind=ArtifactKind.IMAGE,
+            mime_type="image/png",
+            filename="chart.png",
+            sandbox_path="/sandbox/job-1/aiq-artifacts/chart.png",
+            storage_uri="db://artifacts/artifact-1",
+            sha256="a" * 64,
+            size_bytes=128,
+            inline=True,
+        )
+
+        EventStore(db_url, "job-1").store(artifact.to_sse_payload(content_url))
+
+        event = EventStore.get_events(db_url, "job-1")[0]
+        assert event["type"] == "artifact.update"
+        assert event["name"] == "chart.png"
+        assert event["data"]["type"] == "file"
+        assert event["data"]["content_url"] == content_url
+        assert "content" not in event["data"]
+        assert event["data"]["artifact_id"] == "artifact-1"
+
     def test_get_events_empty(self, tmp_path):
         """Test get_events returns empty list for unknown job."""
         from aiq_api.jobs.event_store import EventStore

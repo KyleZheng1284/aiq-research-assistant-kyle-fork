@@ -580,7 +580,14 @@ async def run_agent_job(
                     # Signal event stream completion
                     event_stream.on_complete()
 
-                    # Flush any buffered events before updating status
+                    # Finalize before SUCCESS so clients cannot stop streaming before
+                    # artifact and cleanup events are durable.
+                    await asyncio.to_thread(
+                        _teardown_sandbox,
+                        sandbox_runtime,
+                        job_id=job_id,
+                        interrupted=False,
+                    )
                     if hasattr(event_store, "flush"):
                         event_store.flush()
 
@@ -596,17 +603,10 @@ async def run_agent_job(
     except asyncio.CancelledError:
         logger.info("Job %s cancelled", job_id)
         interrupted = True
-        if job_store:
-            try:
-                job = await job_store.get_job(job_id)
-                if job and job.status != JobStatus.INTERRUPTED.value:
-                    await job_store.update_status(job_id, JobStatus.INTERRUPTED, error="cancelled by user")
-            except (ConnectionError, TimeoutError, RuntimeError):
-                pass
-
         if event_store is None:
             event_store = BatchingEventStore(EventStore(db_url, job_id))
 
+        await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=True)
         event_store.store(
             {
                 "type": "job.cancelled",
@@ -616,14 +616,20 @@ async def run_agent_job(
         if hasattr(event_store, "flush"):
             event_store.flush()
 
+        if job_store:
+            try:
+                job = await job_store.get_job(job_id)
+                if job and job.status != JobStatus.INTERRUPTED.value:
+                    await job_store.update_status(job_id, JobStatus.INTERRUPTED, error="cancelled by user")
+            except (ConnectionError, TimeoutError, RuntimeError):
+                pass
+
     except Exception as e:
         logger.exception("Job %s failed: %s", job_id, type(e).__name__)
-        if job_store:
-            await job_store.update_status(job_id, JobStatus.FAILURE, error=str(e))
-
         if event_store is None:
             event_store = BatchingEventStore(EventStore(db_url, job_id))
 
+        await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=False)
         event_store.store(
             {
                 "type": "job.error",
@@ -635,15 +641,15 @@ async def run_agent_job(
         )
         if hasattr(event_store, "flush"):
             event_store.flush()
+        if job_store:
+            await job_store.update_status(job_id, JobStatus.FAILURE, error=str(e))
 
     finally:
         # Ensure terminal-path events are not left in the batch buffer.
         await _flush_event_store(event_store, job_id=job_id)
         if cancellation_monitor:
             cancellation_monitor.stop()
-        # Release the sandbox off the event loop so the SDK session close never blocks the Dask
-        # worker. The single artifact harvest already ran in agent.run() before this point, so
-        # teardown only closes/terminates; interrupted jobs terminate() to preempt a live execute.
+        # Idempotent fallback for failures before a terminal branch finalized the runtime.
         await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=interrupted)
         await _flush_event_store(event_store, job_id=job_id)
         # Clean up job-scoped auth token

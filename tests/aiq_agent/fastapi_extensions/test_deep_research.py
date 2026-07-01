@@ -52,7 +52,10 @@ Test coverage:
         - Routes registered when infrastructure available
 """
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -246,6 +249,62 @@ class TestRegisterRoutes:
 
         assert mock_app.post.call_count >= 2
         assert mock_app.get.call_count >= 6
+
+    @pytest.mark.asyncio
+    async def test_cancel_request_remains_nonterminal_until_worker_finalizes(self):
+        """The API records intent; only the worker may publish INTERRUPTED."""
+        from aiq_api.routes.jobs import register_job_routes
+
+        routes: dict[str, object] = {}
+        mock_app = MagicMock()
+
+        def register(path: str, **_kwargs):
+            def decorator(fn):
+                routes[path] = fn
+                return fn
+
+            return decorator
+
+        mock_app.get.side_effect = register
+        mock_app.post.side_effect = register
+        mock_builder = MagicMock()
+        mock_builder.get_function_config.side_effect = KeyError("Not found")
+        job_store = MagicMock()
+        job_store.update_status = AsyncMock()
+        mock_worker = MagicMock()
+        mock_worker._dask_available = True
+        mock_worker._job_store = job_store
+        mock_worker._scheduler_address = "tcp://localhost:8786"
+        mock_worker._db_url = "sqlite:///./test.db"
+        mock_worker._config_file_path = "/path/to/config.yml"
+        mock_worker._log_level = 20
+        mock_worker._use_dask_threads = False
+        mock_worker._front_end_config = MagicMock(expiry_seconds=86400)
+        event_store = MagicMock()
+
+        with (
+            patch("aiq_api.routes.jobs.require_verified_principal", return_value=MagicMock()),
+            patch(
+                "aiq_api.jobs.access.authorize_job_access",
+                new=AsyncMock(return_value=SimpleNamespace(status="running")),
+            ),
+            patch("aiq_api.jobs.event_store.EventStore", return_value=event_store),
+            patch("aiq_api.routes.jobs._cancel_dask_task", new=AsyncMock(return_value=True)),
+        ):
+            await register_job_routes(mock_app, mock_builder, mock_worker)
+            cancel = routes["/v1/jobs/async/job/{job_id}/cancel"]
+            response = await cancel("job-1")  # type: ignore[operator]
+
+        job_store.update_status.assert_not_awaited()
+        event_store.store.assert_called_once_with(
+            {"type": "job.cancellation_requested", "data": {"reason": "cancelled by user"}}
+        )
+        assert response == {
+            "job_id": "job-1",
+            "status": "running",
+            "cancellation_requested": True,
+            "task_cancelled": True,
+        }
 
 
 class TestArtifactHelpers:

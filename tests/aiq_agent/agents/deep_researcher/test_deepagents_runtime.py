@@ -18,8 +18,10 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from threading import Event
 from threading import Thread
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -36,8 +38,10 @@ from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepAgentsRuntim
 from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepResearchSandboxConfig
 from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepResearchSkillsConfig
 from aiq_agent.agents.deep_researcher.deepagents_runtime import _create_sandbox_backend
+from aiq_agent.agents.deep_researcher.deepagents_runtime import _maybe_build_artifact_manager
 from aiq_agent.agents.deep_researcher.deepagents_runtime import discover_skill_collections
 from aiq_agent.agents.deep_researcher.deepagents_runtime import resolve_skill_collections
+from aiq_agent.agents.deep_researcher.sandbox.config import ArtifactCaptureConfig
 
 SYNTHESIS_SKILL_SOURCE = f"{BUILTIN_SKILL_SOURCE}synthesis/"
 
@@ -469,3 +473,74 @@ class TestDeepAgentsRuntimeCleanup:
         provider.close.assert_called_once_with()
         provider.terminate.assert_not_called()
         assert [event["data"]["status"] for event in events] == ["started", "failed"]  # type: ignore[index]
+
+    def test_normal_finalize_harvests_before_close(self) -> None:
+        provider = MagicMock()
+        provider.cleanup_succeeded = True
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig())
+        order: list[str] = []
+        runtime.artifact_manager = MagicMock()
+        runtime.artifact_manager.final_harvest.side_effect = lambda: order.append("harvest")
+        provider.close.side_effect = lambda: order.append("close")
+
+        runtime.finalize(interrupted=False)
+        runtime.finalize(interrupted=False)
+
+        assert order == ["harvest", "close"]
+
+    def test_final_harvest_logs_only_exception_type(self, caplog: pytest.LogCaptureFixture) -> None:
+        provider = MagicMock()
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig())
+        runtime.artifact_manager = MagicMock()
+        runtime.artifact_manager.final_harvest.side_effect = RuntimeError("credential=do-not-log")
+
+        with caplog.at_level(logging.WARNING):
+            runtime.final_harvest()
+
+        assert "RuntimeError" in caplog.text
+        assert "credential=do-not-log" not in caplog.text
+
+    @pytest.mark.parametrize(("lease_acquired", "expected"), [(True, ["harvest", "terminate"]), (False, ["terminate"])])
+    def test_interrupted_finalize_harvests_only_when_provider_is_idle(
+        self,
+        lease_acquired: bool,
+        expected: list[str],
+    ) -> None:
+        provider = MagicMock()
+        provider.cleanup_succeeded = True
+        provider.try_operation_lease.return_value = nullcontext(lease_acquired)
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig())
+        order: list[str] = []
+        runtime.artifact_manager = MagicMock()
+        runtime.artifact_manager.final_harvest.side_effect = lambda: order.append("harvest")
+        provider.terminate.side_effect = lambda: order.append("terminate")
+
+        runtime.finalize(interrupted=True)
+
+        assert order == expected
+
+    def test_enabled_capture_requires_durable_store_url(self) -> None:
+        provider = SimpleNamespace(
+            config=SimpleNamespace(artifact_capture=ArtifactCaptureConfig(enabled=True)),
+        )
+
+        with pytest.raises(ValueError, match="durable artifact_db_url"):
+            _maybe_build_artifact_manager(
+                provider=provider,
+                job_id="job-1",
+                artifact_dir="/sandbox/job-1/aiq-artifacts",
+                artifact_db_url=None,
+                artifact_emit=None,
+            )

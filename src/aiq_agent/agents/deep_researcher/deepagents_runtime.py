@@ -269,8 +269,8 @@ class DeepAgentsRuntime:
             return
         try:
             manager.final_harvest()
-        except Exception:  # noqa: BLE001 - harvest is best-effort on the terminal path
-            logger.warning("Final artifact harvest failed for job %s", self._job_id, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - harvest is best-effort on the terminal path
+            logger.warning("Final artifact harvest failed for job %s (%s)", self._job_id, type(exc).__name__)
 
     def close(self) -> None:
         """Release the sandbox provider on a normal terminal job path (idempotent)."""
@@ -285,7 +285,7 @@ class DeepAgentsRuntime:
             provider.terminate()
 
     def finalize(self, *, interrupted: bool) -> bool:
-        """Release the sandbox once and emit a truthful, sanitized cleanup outcome."""
+        """Harvest, release the sandbox once, and emit a truthful cleanup outcome."""
         with self._finalize_lock:
             if self._finalized:
                 assert self._finalize_result is not None
@@ -301,8 +301,10 @@ class DeepAgentsRuntime:
             self._emit_cleanup("started", interrupted=interrupted)
             try:
                 if interrupted:
+                    self._try_cancellation_harvest()
                     self.terminate()
                 else:
+                    self.final_harvest()
                     self.close()
             except Exception as exc:  # noqa: BLE001 - terminal cleanup cannot replace the job result
                 logger.warning("Sandbox cleanup failed for job %s (%s)", self._job_id, type(exc).__name__)
@@ -314,6 +316,20 @@ class DeepAgentsRuntime:
             self._finalize_result = succeeded
             self._finalized = True
             return succeeded
+
+    def _try_cancellation_harvest(self) -> bool:
+        """Harvest only when the sandbox is idle; never wait behind an active execute."""
+        if self.artifact_manager is None or self._sandbox_provider is None:
+            return False
+        lease = getattr(self._sandbox_provider, "try_operation_lease", None)
+        if not callable(lease):
+            return False
+        with lease() as acquired:
+            if not acquired:
+                logger.info("Skipping terminal harvest for busy cancelled sandbox job %s", self._job_id)
+                return False
+            self.final_harvest()
+            return True
 
     def _emit_cleanup(self, status: str, *, interrupted: bool) -> None:
         """Emit cleanup metadata without policy contents, environment, or error text."""
@@ -373,11 +389,16 @@ def _maybe_build_artifact_manager(
 
     Defaults to ``None`` (no harvesting) so adding the sandbox alone never requires a DB.
     """
-    if provider is None or artifact_db_url is None:
+    if provider is None:
         return None
     capture = getattr(getattr(provider, "config", None), "artifact_capture", None)
-    if capture is None or not getattr(capture, "enabled", False):
+    if not isinstance(capture, ArtifactCaptureConfig) or not capture.enabled:
         return None
+    if artifact_db_url is None:
+        raise ValueError(
+            "sandbox artifact_capture.enabled requires a durable artifact_db_url; "
+            "disable capture or invoke the agent through a host that supplies an artifact store"
+        )
     from .sandbox.artifacts import ArtifactManager
     from .sandbox.artifacts import SqlArtifactStore
 

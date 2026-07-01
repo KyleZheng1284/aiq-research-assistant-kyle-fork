@@ -937,7 +937,7 @@ describe('useDeepResearch', () => {
       await setupConnectedHook()
 
       act(() => {
-        mockClient?.callbacks.onFileUpdate?.('report.md', '# Report content')
+        mockClient?.callbacks.onFileUpdate?.({ filename: 'report.md', content: '# Report content' })
       })
 
       expect(mockAddDeepResearchFile).toHaveBeenCalledWith({
@@ -950,7 +950,7 @@ describe('useDeepResearch', () => {
       await setupConnectedHook()
 
       act(() => {
-        mockClient?.callbacks.onFileUpdate?.('report.md', '# Final report')
+        mockClient?.callbacks.onFileUpdate?.({ filename: 'report.md', content: '# Final report' })
       })
 
       expect(mockSetCurrentStatus).toHaveBeenCalledWith('writing')
@@ -960,7 +960,7 @@ describe('useDeepResearch', () => {
       await setupConnectedHook()
 
       act(() => {
-        mockClient?.callbacks.onFileUpdate?.('artifacts/report.md', '# Final report')
+        mockClient?.callbacks.onFileUpdate?.({ filename: 'artifacts/report.md', content: '# Final report' })
       })
 
       expect(mockSetCurrentStatus).toHaveBeenCalledWith('writing')
@@ -970,7 +970,7 @@ describe('useDeepResearch', () => {
       await setupConnectedHook()
 
       act(() => {
-        mockClient?.callbacks.onFileUpdate?.('notes.md', '# Some notes')
+        mockClient?.callbacks.onFileUpdate?.({ filename: 'notes.md', content: '# Some notes' })
       })
 
       expect(mockAddDeepResearchFile).toHaveBeenCalledWith({

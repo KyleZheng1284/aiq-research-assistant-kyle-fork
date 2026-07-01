@@ -12,6 +12,7 @@
  */
 
 import { apiConfig } from './config'
+import { artifactContentPath } from '@/shared/components/MarkdownRenderer/artifact-url'
 
 // ============================================================
 // Types
@@ -149,6 +150,18 @@ export interface TodoItem {
   status: 'pending' | 'in_progress' | 'completed' | 'cancelled'
 }
 
+/** File update emitted by artifact.update. Durable generated files carry metadata, not bytes. */
+export interface FileArtifactUpdate {
+  filename: string
+  content?: string
+  artifactId?: string
+  contentUrl?: string
+  mimeType?: string
+  sizeBytes?: number
+  sha256?: string
+  inline?: boolean
+}
+
 /** artifact.update event */
 export interface ArtifactUpdateEvent extends DeepResearchSSEEvent {
   event: 'artifact.update'
@@ -157,8 +170,9 @@ export interface ArtifactUpdateEvent extends DeepResearchSSEEvent {
     timestamp: string
     data: {
       type: ArtifactType
-      content: string | TodoItem[]
+      content?: string | TodoItem[]
       url?: string // For citation_source and citation_use types
+      content_url?: string
     }
     metadata?: {
       workflow?: string
@@ -208,7 +222,7 @@ export interface DeepResearchCallbacks {
   /** Called on artifact updates */
   onTodoUpdate?: (todos: TodoItem[], workflow?: string) => void
   onCitationUpdate?: (url: string, content: string, isCited?: boolean) => void
-  onFileUpdate?: (filename: string, content: string) => void
+  onFileUpdate?: (file: FileArtifactUpdate) => void
   onOutputUpdate?: (content: string, outputCategory?: string, workflow?: string) => void
   /** Called on job heartbeat (confirms job is alive during long operations) */
   onHeartbeat?: (uptimeSeconds: number) => void
@@ -485,10 +499,17 @@ export const createDeepResearchClient = (options: DeepResearchStreamOptions): De
       case 'artifact.update': {
         // artifact.update has nested structure: { id, timestamp, data: { type, content, url?, output_category? }, metadata?: { workflow } }
         const artifactWrapper = rawData as {
-          data?: { type: ArtifactType; content: string | TodoItem[]; url?: string; output_category?: string }
+          data?: {
+            type: ArtifactType
+            content?: string | TodoItem[]
+            url?: string
+            content_url?: string
+            output_category?: string
+          }
           type?: ArtifactType
           content?: string | TodoItem[]
           url?: string
+          content_url?: string
           output_category?: string
           metadata?: { workflow?: string }
         }
@@ -509,11 +530,27 @@ export const createDeepResearchClient = (options: DeepResearchStreamOptions): De
             callbacks.onCitationUpdate?.(artifactData.url || '', artifactData.content as string, true)
             break
           case 'file': {
-            // file artifacts are written during research — extract filename from path
+            // Generated artifacts carry durable metadata; legacy text-file events carry content.
             const raw = artifactData as Record<string, unknown>
             const filePath = (raw.file_path || raw.path || artifactData.url || 'unknown') as string
             const fileName = filePath.split('/').pop() || filePath
-            callbacks.onFileUpdate?.(fileName, artifactData.content as string)
+            const artifactId = typeof raw.artifact_id === 'string' ? raw.artifact_id : undefined
+            callbacks.onFileUpdate?.({
+              filename: fileName,
+              content: typeof artifactData.content === 'string' ? artifactData.content : undefined,
+              artifactId,
+              contentUrl: artifactId
+                ? artifactContentPath(jobId, artifactId)
+                : typeof raw.content_url === 'string'
+                  ? raw.content_url
+                  : typeof raw.url === 'string'
+                    ? raw.url
+                    : undefined,
+              mimeType: typeof raw.mime_type === 'string' ? raw.mime_type : undefined,
+              sizeBytes: typeof raw.size_bytes === 'number' ? raw.size_bytes : undefined,
+              sha256: typeof raw.sha256 === 'string' ? raw.sha256 : undefined,
+              inline: typeof raw.inline === 'boolean' ? raw.inline : undefined,
+            })
             break
           }
           case 'output':
@@ -747,7 +784,12 @@ export const getJobReport = async (
 export const cancelJob = async (
   jobId: string,
   authToken?: string
-): Promise<{ cancelled: boolean }> => {
+): Promise<{
+  job_id: string
+  status: DeepResearchJobStatus
+  cancellation_requested: boolean
+  task_cancelled: boolean
+}> => {
   const url = `${getDeepResearchBaseUrl()}/job/${jobId}/cancel`
   const headers: HeadersInit = {
     'Content-Type': 'application/json',

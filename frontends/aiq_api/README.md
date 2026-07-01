@@ -72,7 +72,7 @@ Base path: `/v1/jobs/async`
 | `/v1/jobs/async/job/{id}` | GET | Get job status |
 | `/v1/jobs/async/job/{id}/stream` | GET | SSE stream from beginning |
 | `/v1/jobs/async/job/{id}/stream/{last_event_id}` | GET | SSE stream from event ID |
-| `/v1/jobs/async/job/{id}/cancel` | POST | Cancel running job |
+| `/v1/jobs/async/job/{id}/cancel` | POST | Request cancellation; worker publishes `INTERRUPTED` after cleanup |
 | `/v1/jobs/async/job/{id}/state` | GET | Get current UI state |
 | `/v1/jobs/async/job/{id}/report` | GET | Get final report |
 
@@ -149,7 +149,7 @@ Events streamed during job execution:
 | `workflow.start` / `workflow.end` | Workflow lifecycle |
 | `llm.start` / `llm.chunk` / `llm.end` | LLM inference progress |
 | `tool.start` / `tool.end` | Tool invocations |
-| `artifact.update` | Todos, files, citations, output updates |
+| `artifact.update` | Todos, citations, output, and generated-file metadata (`content_url` for durable bytes) |
 | `job.error` | Error occurred |
 
 ## Configuration

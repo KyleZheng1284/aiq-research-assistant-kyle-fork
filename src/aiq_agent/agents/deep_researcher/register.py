@@ -220,6 +220,9 @@ async def deep_research_agent(config: DeepResearchAgentConfig, builder: Builder)
     verbose = is_verbose(config.verbose)
     callbacks = [VerboseTraceCallback()] if verbose else []
 
+    # A sandbox-enabled agent is request-scoped below. Keep the reusable template free of
+    # sandbox/store state so startup does not construct an unused artifact runtime.
+    template_skills = None if sandbox_config is not None else skills_config
     agent = DeepResearcherAgent(
         llm_provider=provider,
         tools=tools,
@@ -228,8 +231,8 @@ async def deep_research_agent(config: DeepResearchAgentConfig, builder: Builder)
         domain_catalog_path=config.domain_catalog_path,
         enable_source_router=config.enable_source_router,
         enable_citation_verification=config.enable_citation_verification,
-        skills=skills_config,
-        sandbox=sandbox_config,
+        skills=template_skills,
+        sandbox=None,
         max_research_concurrency=config.max_research_concurrency,
         max_concurrent_source_tool_calls=config.max_concurrent_source_tool_calls,
         max_source_tool_batch_size=config.max_source_tool_batch_size,
