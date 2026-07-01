@@ -81,6 +81,33 @@ Useful version examples:
 
 In the interactive version prompt, pressing Enter selects `0.0.72`.
 
+Deterministic live acceptance (no LLM or external research API involved):
+
+```bash
+.venv/bin/python scripts/smoke_openshell_isolation.py --gateway aiq-local
+```
+
+The probe fails unless the gateway service itself reports OpenShell `0.0.72`. It creates two
+jobs concurrently, proves they have distinct physical sandbox IDs and positive loaded policy
+revisions, cancels one, proves the other still executes, and then proves both were deleted.
+Success is four explicit lines:
+
+```text
+PASS gateway version: 0.0.72
+PASS distinct attested sandboxes: A=<name>@r<revision>, B=<name>@r<revision>
+PASS cancellation isolation: A deleted; B remained usable
+PASS terminal cleanup: both probe sandboxes deleted
+```
+
+On a non-production local host that intentionally uses the generated `best_effort` policy:
+
+```bash
+.venv/bin/python scripts/smoke_openshell_isolation.py \
+  --gateway aiq-local \
+  --policy configs/openshell/generated/aiq-openshell-policy.yaml \
+  --allow-best-effort-landlock
+```
+
 The setup installs the `openshell` SDK plus the official `langchain-nvidia-openshell`
 adapter (`OpenShellSandbox`), published on PyPI. The script installs it from PyPI by
 default; set `LANGCHAIN_NVIDIA_REPO` or pass `--langchain-nvidia` to use another
