@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Set up NVIDIA OpenShell for AI-Q with a named, policy-backed sandbox.
+# Set up NVIDIA OpenShell for AI-Q per-job policy-backed sandboxes.
 
 set -euo pipefail
 
@@ -48,6 +48,7 @@ SANDBOX_LOG_LEVEL="${AIQ_OPENSHELL_SANDBOX_LOG_LEVEL:-warn}"
 POLICY_PRESET="${AIQ_OPENSHELL_POLICY:-}"
 POLICY_ALLOWLIST="${AIQ_OPENSHELL_POLICY_ALLOWLIST:-${AIQ_OPENSHELL_POLICY_SERVICES:-}}"
 POLICY_FILE="${AIQ_OPENSHELL_POLICY_FILE:-$REPO_ROOT/configs/openshell/generated/aiq-openshell-policy.yaml}"
+LANDLOCK_COMPATIBILITY="${AIQ_OPENSHELL_LANDLOCK_COMPATIBILITY:-hard_requirement}"
 GATEWAY_NAME="${AIQ_OPENSHELL_GATEWAY_NAME:-aiq-local}"
 GATEWAY_PORT="${AIQ_OPENSHELL_GATEWAY_PORT:-8080}"
 DOCKER_BIN="${DOCKER_BIN:-}"
@@ -57,7 +58,7 @@ GATEWAY_ENDPOINT=""
 GATEWAY_DISABLE_TLS=false
 RESTART_GATEWAY=true
 BUILD_IMAGE=true
-CREATE_SANDBOX=true
+CREATE_SANDBOX=false
 LIST_OPENSHELL_VERSIONS=false
 
 SUPPORTED_SERVICES="github,pypi,nvidia,tavily,serper,huggingface,arxiv,semantic-scholar,npm"
@@ -76,7 +77,7 @@ Sets up OpenShell for AI-Q:
   6. Generates an initial OpenShell policy.
   7. Starts/verifies the OpenShell gateway.
   8. Builds the AI-Q sandbox image.
-  9. Creates a named policy-backed sandbox.
+  9. Leaves per-job sandbox creation to the AI-Q runtime.
 
 Options:
   --openshell-version VERSION   Exact OpenShell version, or "latest".
@@ -89,7 +90,9 @@ Options:
                                 Services: $SUPPORTED_SERVICES
   --policy-file PATH            Output policy file.
                                 Default: configs/openshell/generated/aiq-openshell-policy.yaml
-  --sandbox-name NAME           OpenShell sandbox name (default: aiq-openshell-demo).
+  --landlock-compatibility MODE hard_requirement (default) or best_effort (local demo only).
+  --create-shared-debug-sandbox Create one named shared sandbox for explicit debug attachment.
+  --sandbox-name NAME           Debug sandbox name (default: aiq-openshell-demo).
   --image-name NAME             Docker image tag (default: aiq-openshell-demo:latest).
   --sandbox-log-level LEVEL     In-container OpenShell log verbosity baked into the
                                 image via RUST_LOG (default: warn). Use "debug" to
@@ -102,7 +105,7 @@ Options:
   --gateway-bin PATH            OpenShell gateway launcher path.
   --no-restart-gateway          Reuse the active gateway instead of starting one.
   --skip-build                  Do not build the sandbox image.
-  --skip-sandbox                Do not create the named sandbox.
+  --skip-sandbox                Deprecated no-op; per-job creation is already the default.
   --list-policies               Print supported policy choices.
   --list-services               Print supported services for --allow.
   --list-openshell-versions     Print released OpenShell versions >= 0.0.72.
@@ -148,6 +151,14 @@ while [[ $# -gt 0 ]]; do
         --policy-file)
             POLICY_FILE="$2"
             shift 2
+            ;;
+        --landlock-compatibility)
+            LANDLOCK_COMPATIBILITY="$2"
+            shift 2
+            ;;
+        --create-shared-debug-sandbox)
+            CREATE_SANDBOX=true
+            shift
             ;;
         --sandbox-name)
             SANDBOX_NAME="$2"
@@ -864,6 +875,13 @@ resolve_policy() {
     if [[ "$POLICY_ALLOWLIST" == *offline* && "$POLICY_ALLOWLIST" != "offline" ]]; then
         fail "Use either offline or a service allowlist, not both: $POLICY_ALLOWLIST"
     fi
+    case "$LANDLOCK_COMPATIBILITY" in
+        hard_requirement|best_effort)
+            ;;
+        *)
+            fail "Unsupported Landlock compatibility '$LANDLOCK_COMPATIBILITY'; use hard_requirement or best_effort"
+            ;;
+    esac
 }
 
 validate_service() {
@@ -877,7 +895,7 @@ validate_service() {
 }
 
 emit_policy_header() {
-    cat >"$POLICY_FILE" <<'EOF'
+    cat >"$POLICY_FILE" <<EOF
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -901,12 +919,10 @@ filesystem_policy:
     - /tmp
     - /dev/null
 
-# best_effort lets the sandbox start on hosts without Landlock (e.g. Docker Desktop on
-# macOS), but on those hosts filesystem confinement is silently dropped. This is acceptable
-# only for the local single-operator demo; production must use `hard_requirement` so a
-# missing LSM fails closed instead of running unconfined.
+# hard_requirement is the production default: a missing Landlock LSM fails closed. Set
+# best_effort only for an explicit local demo that accepts loss of filesystem confinement.
 landlock:
-  compatibility: best_effort
+  compatibility: $LANDLOCK_COMPATIBILITY
 
 process:
   run_as_user: sandbox
@@ -991,6 +1007,7 @@ generate_policy() {
     echo "Policy file: $POLICY_FILE"
     echo "Policy: $POLICY_PRESET"
     echo "Allowed services: $POLICY_ALLOWLIST"
+    echo "Landlock compatibility: $LANDLOCK_COMPATIBILITY"
 }
 
 build_image() {
@@ -1042,7 +1059,7 @@ OpenShell is ready for AI-Q.
 
 Use these exports in shells where you run AI-Q:
 
-  export AIQ_OPENSHELL_SANDBOX_NAME="$SANDBOX_NAME"
+  export AIQ_OPENSHELL_IMAGE="$IMAGE_NAME"
   export AIQ_OPENSHELL_POLICY_FILE="$POLICY_FILE"
 
 Start CLI mode:
@@ -1055,7 +1072,7 @@ Start E2E mode:
 
 Useful cleanup:
 
-  $OPENSHELL_BIN sandbox delete "$SANDBOX_NAME"
+  $OPENSHELL_BIN sandbox list
   pkill -f openshell-gateway
 
 EOF

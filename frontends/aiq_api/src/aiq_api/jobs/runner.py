@@ -646,6 +646,8 @@ async def run_agent_job(
         # worker. The single artifact harvest already ran in agent.run() before this point, so
         # teardown only closes/terminates; interrupted jobs terminate() to preempt a live execute.
         await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=interrupted)
+        if event_store is not None and hasattr(event_store, "flush"):
+            event_store.flush()
         # Clean up job-scoped auth token
         if _auth_token_reset is not None:
             from ._auth_context import job_auth_token
@@ -661,6 +663,13 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
     off the event loop (``asyncio.to_thread``) so the SDK session close cannot block the worker.
     """
     if sandbox_runtime is None:
+        return
+    finalize = getattr(sandbox_runtime, "finalize", None)
+    if finalize is not None:
+        try:
+            finalize(interrupted=interrupted)
+        except Exception:  # noqa: BLE001 - cleanup must never replace the job result
+            logger.warning("Sandbox cleanup failed for job %s", job_id, exc_info=True)
         return
     teardown = getattr(sandbox_runtime, "terminate", None) if interrupted else None
     if teardown is None:
