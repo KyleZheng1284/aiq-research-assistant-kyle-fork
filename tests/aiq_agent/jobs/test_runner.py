@@ -2444,6 +2444,16 @@ class TestTerminalTeardown:
         # Must not raise when no sandbox runtime is present (non-sandbox agents).
         _teardown_sandbox(None, job_id="job-1", interrupted=False)
 
+    def test_runtime_finalizer_owns_cleanup_when_available(self):
+        from aiq_api.jobs.runner import _teardown_sandbox
+
+        runtime = MagicMock(spec=["finalize", "close", "terminate"])
+        _teardown_sandbox(runtime, job_id="job-1", interrupted=True)
+
+        runtime.finalize.assert_called_once_with(interrupted=True)
+        runtime.close.assert_not_called()
+        runtime.terminate.assert_not_called()
+
     def test_normal_path_calls_close(self):
         from aiq_api.jobs.runner import _teardown_sandbox
 

@@ -898,6 +898,8 @@ async def run_agent_job(
             cancellation_monitor.stop()
         # Idempotent fallback for failures before a terminal branch finalized the runtime.
         await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=interrupted)
+        if event_store is not None and hasattr(event_store, "flush"):
+            event_store.flush()
         # Clean up job-scoped auth token
         if _auth_token_reset is not None:
             from ._auth_context import job_auth_token
@@ -952,6 +954,13 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
     if sandbox_runtime is None:
         return
     _harvest_sandbox_artifacts(sandbox_runtime, job_id=job_id, interrupted=interrupted)
+    finalize = getattr(sandbox_runtime, "finalize", None)
+    if callable(finalize):
+        try:
+            finalize(interrupted=interrupted)
+        except Exception as exc:  # noqa: BLE001 - cleanup must never replace the job result
+            logger.warning("Sandbox cleanup failed for job %s exception=%s", job_id, exc.__class__.__name__)
+        return
     teardown = getattr(sandbox_runtime, "terminate", None) if interrupted else None
     if teardown is None:
         teardown = getattr(sandbox_runtime, "close", None)

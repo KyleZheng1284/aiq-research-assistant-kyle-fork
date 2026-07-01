@@ -100,6 +100,8 @@ class SandboxProvider(BaseSandbox, ABC):
         # state lock, so the two can never deadlock.
         self._state_lock = threading.Lock()
         self._terminated = False
+        self._event_emit: Callable[[dict[str, object]], None] | None = None
+        self._cleanup_failed = False
 
     # ------------------------------------------------------------------ #
     # Required surface (the only things a provider must implement)
@@ -150,6 +152,19 @@ class SandboxProvider(BaseSandbox, ABC):
         finally:
             if acquired:
                 self._lock.release()
+
+    def set_event_emitter(self, emit: Callable[[dict[str, object]], None] | None) -> None:
+        """Attach the job-scoped event sink used for sanitized lifecycle events."""
+        self._event_emit = emit
+
+    def _emit_event(self, event: dict[str, object]) -> None:
+        """Best-effort event delivery; observability must never break execution."""
+        if self._event_emit is None:
+            return
+        try:
+            self._event_emit(event)
+        except Exception:  # noqa: BLE001 - event persistence is non-critical
+            logger.warning("Sandbox event emission failed for %s", self.sandbox_name, exc_info=True)
 
     def close(self) -> None:
         """Release the underlying sandbox session, if any (idempotent).
@@ -203,7 +218,13 @@ class SandboxProvider(BaseSandbox, ABC):
             try:
                 session.close()
             except Exception:  # noqa: BLE001 - cleanup must never raise on the terminal path
+                self._cleanup_failed = True
                 logger.warning("Sandbox %s cleanup failed", self.sandbox_name, exc_info=True)
+
+    @property
+    def cleanup_succeeded(self) -> bool:
+        """Whether every cleanup operation completed without an observed error."""
+        return not self._cleanup_failed
 
     @property
     def id(self) -> str:

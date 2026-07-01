@@ -154,6 +154,10 @@ class DeepResearcherAgent:
         self.orchestrator_middleware = self.middleware_set.orchestrator
         self.middleware = self.researcher_middleware
 
+    def finalize(self, *, interrupted: bool) -> bool:
+        """Release this request's sandbox runtime exactly once."""
+        return self.deepagents_runtime.finalize(interrupted=interrupted)
+
     def _load_prompts(self) -> dict[str, str]:
         """Load all prompts for subagents."""
         prompts = {}

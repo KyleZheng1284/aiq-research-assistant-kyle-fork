@@ -33,6 +33,7 @@ from deepagents.backends.state import create_file_data
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
+from pydantic import model_validator
 
 from nat.data_models.function import FunctionBaseConfig
 
@@ -86,19 +87,44 @@ class DeepResearchSandboxConfig(FunctionBaseConfig, name="deep_research_sandbox"
         default=(),
         description="Python packages to install into the Modal sandbox image.",
     )
-    # OpenShell-specific (used when provider == "openshell"). The named sandbox is created
-    # out-of-band by scripts/setup_openshell.sh and attached to by name.
-    sandbox_name: str | None = Field(default=None, description="Existing named OpenShell sandbox to attach to.")
+    # OpenShell-specific (used when provider == "openshell"). The secure default creates
+    # a new policy-bound physical sandbox for each AI-Q job.
+    openshell_image: str = Field(
+        default="aiq-openshell-demo:latest",
+        description="Container image used for per-job OpenShell sandboxes.",
+    )
+    existing_sandbox_name: str | None = Field(
+        default=None,
+        description="Debug-only existing OpenShell sandbox; requires allow_shared_sandbox=true.",
+    )
+    sandbox_name: str | None = Field(
+        default=None,
+        description="Deprecated alias for existing_sandbox_name; requires allow_shared_sandbox=true.",
+    )
+    allow_shared_sandbox: bool = Field(
+        default=False,
+        description="Allow debug attachment to a shared OpenShell sandbox; not job-isolated.",
+    )
     gateway: str | None = Field(
         default=None,
         description="OpenShell gateway endpoint/name (null uses the locally selected gateway).",
     )
-    policy: str | None = Field(default=None, description="OpenShell policy file path (requires a named sandbox).")
+    policy: str | None = Field(default=None, description="OpenShell policy YAML applied at per-job creation.")
     ready_timeout_seconds: float = Field(
         default=300.0,
         description="Seconds to wait for the OpenShell sandbox to become ready.",
     )
-    delete_on_exit: bool = Field(default=False, description="Delete the OpenShell sandbox when the session closes.")
+    delete_on_exit: bool = Field(default=True, description="Delete the OpenShell sandbox when the session closes.")
+    attest: bool = Field(default=True, description="Fail closed unless the OpenShell policy revision is loaded.")
+    expected_policy_version: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional exact OpenShell policy revision pin.",
+    )
+    require_hard_landlock: bool = Field(
+        default=True,
+        description="Require landlock.compatibility=hard_requirement in the configured policy.",
+    )
     shell: tuple[str, ...] = Field(
         default=("bash", "-c"),
         description="Shell argv prefix passed to the langchain-nvidia-openshell adapter.",
@@ -107,19 +133,33 @@ class DeepResearchSandboxConfig(FunctionBaseConfig, name="deep_research_sandbox"
     workdir: str | None = Field(default=None, description="Working directory inside the sandbox")
     timeout: int = Field(default=1200, description="Maximum sandbox lifetime in seconds")
     idle_timeout: int = Field(default=1800, description="Sandbox idle timeout in seconds")
-    network: Literal["blocked", "enabled"] = Field(
+    network: Literal["blocked", "allowlist", "open", "enabled"] = Field(
         default="blocked",
-        description="Outbound network policy for the sandbox.",
+        description="Outbound network policy; 'enabled' is a deprecated alias for 'open'.",
+    )
+    network_allow: tuple[str, ...] = Field(
+        default=(),
+        description="Hostnames allowed when network='allowlist'.",
     )
     artifact_capture: ArtifactCaptureConfig = Field(
         default_factory=ArtifactCaptureConfig,
         description="Durable harvesting of generated artifacts (charts/CSVs). Disabled by default.",
     )
 
+    @model_validator(mode="after")
+    def _validate_openshell_and_network(self) -> DeepResearchSandboxConfig:
+        if self.network == "allowlist" and not self.network_allow:
+            raise ValueError("network='allowlist' requires a non-empty network_allow list")
+        if self.provider == "openshell":
+            shared_name = self.existing_sandbox_name or self.sandbox_name
+            if not shared_name and not self.attest:
+                raise ValueError("Per-job OpenShell creation requires attest=true")
+        return self
+
     @property
-    def block_network(self) -> bool:
-        """Return the block_network flag for this public network setting."""
-        return self.network == "blocked"
+    def network_mode(self) -> Literal["blocked", "allowlist", "open"]:
+        """Return the normalized provider-neutral network mode."""
+        return "open" if self.network == "enabled" else self.network
 
 
 class DeepAgentsRuntime:
@@ -148,6 +188,9 @@ class DeepAgentsRuntime:
         self._job_id = str(job_id) if job_id is not None else str(uuid4())
         self._backend: Any | None = None
         self._sandbox_provider: Any | None = None
+        self._event_emit = artifact_emit
+        self._finalize_lock = threading.Lock()
+        self._finalized = False
         self.artifact_manager: Any | None = None
         self._artifact_finalize_lock = threading.Lock()
         self._artifact_finalize_attempted = False
@@ -163,6 +206,8 @@ class DeepAgentsRuntime:
         # runtime can expose its job-scoped workdir/artifact_dir and own its lifecycle.
         if sandbox is not None:
             self._sandbox_provider = _create_sandbox_backend(sandbox, self._job_id)
+            if hasattr(self._sandbox_provider, "set_event_emitter"):
+                self._sandbox_provider.set_event_emitter(artifact_emit)
             self.artifact_manager = _maybe_build_artifact_manager(
                 provider=self._sandbox_provider,
                 job_id=self._job_id,
@@ -271,6 +316,48 @@ class DeepAgentsRuntime:
                 return False
             self.final_harvest()
             return True
+
+    def finalize(self, *, interrupted: bool) -> bool:
+        """Release the sandbox once and emit a truthful, sanitized cleanup outcome."""
+        with self._finalize_lock:
+            if self._finalized:
+                return bool(getattr(self._sandbox_provider, "cleanup_succeeded", True))
+            self._finalized = True
+
+        self._emit_cleanup("started", interrupted=interrupted)
+        try:
+            if interrupted:
+                self.terminate()
+            else:
+                self.close()
+        except Exception:  # noqa: BLE001 - terminal cleanup cannot replace the job result
+            logger.warning("Sandbox cleanup failed for job %s", self._job_id, exc_info=True)
+            self._emit_cleanup("failed", interrupted=interrupted)
+            return False
+
+        succeeded = bool(getattr(self._sandbox_provider, "cleanup_succeeded", True))
+        self._emit_cleanup("succeeded" if succeeded else "failed", interrupted=interrupted)
+        return succeeded
+
+    def _emit_cleanup(self, status: str, *, interrupted: bool) -> None:
+        """Emit cleanup metadata without policy contents, environment, or error text."""
+        if self._event_emit is None:
+            return
+        try:
+            self._event_emit(
+                {
+                    "type": "sandbox.cleanup",
+                    "data": {
+                        "status": status,
+                        "interrupted": interrupted,
+                        "provider": getattr(self._sandbox_provider, "provider_name", None),
+                        "sandbox": getattr(self._sandbox_provider, "physical_sandbox_name", None)
+                        or getattr(self._sandbox_provider, "sandbox_name", None),
+                    },
+                }
+            )
+        except Exception:  # noqa: BLE001 - observability must not break terminal cleanup
+            logger.warning("Sandbox cleanup event emission failed for job %s", self._job_id, exc_info=True)
 
     def prepare_state_files(self, files: dict[str, Any]) -> dict[str, Any]:
         """Normalize seeded virtual filesystem files for the configured backend."""
@@ -447,10 +534,16 @@ def _create_sandbox_backend(config: DeepResearchSandboxConfig, job_id: str) -> A
         providers = {
             "openshell": {
                 "gateway": config.gateway,
+                "existing_sandbox_name": config.existing_sandbox_name,
                 "sandbox_name": config.sandbox_name,
+                "allow_shared_sandbox": config.allow_shared_sandbox,
                 "policy": config.policy,
+                "image": config.openshell_image,
                 "ready_timeout_seconds": config.ready_timeout_seconds,
                 "delete_on_exit": config.delete_on_exit,
+                "attest": config.attest,
+                "expected_policy_version": config.expected_policy_version,
+                "require_hard_landlock": config.require_hard_landlock,
                 "shell": list(config.shell),
             }
         }
@@ -463,7 +556,7 @@ def _create_sandbox_backend(config: DeepResearchSandboxConfig, job_id: str) -> A
             "workdir": workdir,
             "timeout": config.timeout,
             "idle_timeout": config.idle_timeout,
-            "network": {"mode": "blocked" if config.block_network else "open"},
+            "network": {"mode": config.network_mode, "allow": config.network_allow},
             "artifact_capture": config.artifact_capture.model_dump(),
             "providers": providers,
         }

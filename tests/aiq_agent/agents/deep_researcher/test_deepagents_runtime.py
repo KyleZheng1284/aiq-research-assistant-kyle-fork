@@ -34,6 +34,7 @@ from aiq_agent.agents.deep_researcher.deepagents_runtime import SHARED_ROUTE
 from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepAgentsRuntime
 from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepResearchSandboxConfig
 from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepResearchSkillsConfig
+from aiq_agent.agents.deep_researcher.deepagents_runtime import _create_sandbox_backend
 from aiq_agent.agents.deep_researcher.deepagents_runtime import discover_skill_collections
 from aiq_agent.agents.deep_researcher.deepagents_runtime import resolve_skill_collections
 
@@ -304,6 +305,34 @@ class TestDeepAgentsRuntimeJobId:
         ):
             _ = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig(provider="modal")).backend
 
+    def test_public_openshell_config_maps_isolation_and_attestation(self) -> None:
+        public = DeepResearchSandboxConfig(
+            policy="policy.yaml",
+            openshell_image="aiq:test",
+            attest=True,
+            expected_policy_version=3,
+            network="allowlist",
+            network_allow=("api.github.com",),
+        )
+
+        with patch(
+            "aiq_agent.agents.deep_researcher.sandbox.create_sandbox_backend",
+            return_value="backend",
+        ) as create:
+            assert _create_sandbox_backend(public, "job-1") == "backend"
+
+        resolved = create.call_args.args[0]
+        assert resolved.network.mode == "allowlist"
+        assert resolved.network.allow == ("api.github.com",)
+        assert resolved.providers.openshell.image == "aiq:test"
+        assert resolved.providers.openshell.attest is True
+        assert resolved.providers.openshell.expected_policy_version == 3
+        assert resolved.providers.openshell.delete_on_exit is True
+
+    def test_public_allowlist_requires_hosts(self) -> None:
+        with pytest.raises(ValueError, match="network_allow"):
+            DeepResearchSandboxConfig(network="allowlist")
+
 
 class TestDeepAgentsRuntimeArtifacts:
     """Terminal artifact harvesting is safe on normal and interrupted paths."""
@@ -354,3 +383,48 @@ class TestDeepAgentsRuntimeArtifacts:
 
         assert runtime.finalize_artifacts(interrupted=True) is expected
         assert runtime.artifact_manager.final_harvest.call_count == int(lease_acquired)
+
+
+class TestDeepAgentsRuntimeCleanup:
+    """Terminal cleanup is idempotent and reports the provider's actual outcome."""
+
+    def test_finalize_closes_once_and_emits_success(self) -> None:
+        provider = MagicMock()
+        provider.provider_name = "openshell"
+        provider.physical_sandbox_name = "sandbox-1"
+        provider.cleanup_succeeded = True
+        events: list[dict[str, object]] = []
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(
+                sandbox=DeepResearchSandboxConfig(),
+                artifact_emit=events.append,
+            )
+
+        assert runtime.finalize(interrupted=False) is True
+        assert runtime.finalize(interrupted=False) is True
+        provider.close.assert_called_once_with()
+        assert provider.terminate.call_count == 0
+        assert [event["data"]["status"] for event in events] == ["started", "succeeded"]  # type: ignore[index]
+
+    def test_finalize_emits_failed_when_provider_observed_cleanup_error(self) -> None:
+        provider = MagicMock()
+        provider.provider_name = "openshell"
+        provider.sandbox_name = "logical-job"
+        provider.physical_sandbox_name = None
+        provider.cleanup_succeeded = False
+        events: list[dict[str, object]] = []
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(
+                sandbox=DeepResearchSandboxConfig(),
+                artifact_emit=events.append,
+            )
+
+        assert runtime.finalize(interrupted=True) is False
+        provider.terminate.assert_called_once_with()
+        assert [event["data"]["status"] for event in events] == ["started", "failed"]  # type: ignore[index]

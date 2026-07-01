@@ -1,7 +1,5 @@
-# EXPERIMENTAL: AI-Q deep research over a local, single-operator OpenShell sandbox.
-# Run ./scripts/setup_openshell.sh first to provision the gateway and named sandbox.
-# Jobs attach to that shared sandbox; per-job directories prevent filename collisions
-# but are not a security boundary. Do not run mutually untrusted jobs concurrently.
+# EXPERIMENTAL: AI-Q deep research with one policy-bound OpenShell sandbox per job.
+# Run ./scripts/setup_openshell.sh first to provision the gateway, image, and policy.
 
 general:
   use_uvloop: true
@@ -139,13 +137,30 @@ functions:
   deep_research_sandbox:
     _type: deep_research_sandbox
     provider: openshell
-    sandbox_name: ${AIQ_OPENSHELL_SANDBOX_NAME:-aiq-openshell-demo}
+    openshell_image: ${AIQ_OPENSHELL_IMAGE:-aiq-openshell-demo:latest}
     policy: ${AIQ_OPENSHELL_POLICY_FILE:-configs/openshell/generated/aiq-openshell-policy.yaml}
     workdir: /sandbox
-    network: blocked
+    # The OpenShell policy is authoritative. This declaration is an upper bound:
+    # startup fails if the policy grants a hostname not listed here.
+    network: allowlist
+    network_allow:
+      - api.github.com
+      - github.com
+      - integrate.api.nvidia.com
+      - api.tavily.com
+      - google.serper.dev
+      - pypi.org
+      - files.pythonhosted.org
+      - huggingface.co
+      - cdn-lfs.huggingface.co
+      - export.arxiv.org
+      - api.semanticscholar.org
+      - registry.npmjs.org
     timeout: 1200
     idle_timeout: 1800
-    delete_on_exit: false
+    delete_on_exit: true
+    attest: true
+    require_hard_landlock: true
     artifact_capture:
       enabled: true
       max_file_bytes: 50000000
