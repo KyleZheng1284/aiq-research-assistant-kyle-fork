@@ -212,7 +212,7 @@ class SandboxProvider(BaseSandbox, ABC):
 
     @property
     def cleanup_succeeded(self) -> bool:
-        """Whether every cleanup operation completed without an observed error."""
+        """Whether every cleanup attempt, including retry teardown, completed without an error."""
         return not self._cleanup_failed
 
     @property

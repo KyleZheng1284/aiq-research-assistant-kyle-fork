@@ -72,6 +72,29 @@ def _attested(events: list[dict[str, object]]) -> bool:
     return False
 
 
+def _loaded_policy_revision(client: object, name: str) -> int:
+    """Return the loaded revision, including the OpenShell 0.0.72 status-RPC fallback."""
+    from openshell._proto import openshell_pb2
+
+    sandbox = client.get(name)  # type: ignore[attr-defined]
+    if sandbox.current_policy_version > 0:
+        return sandbox.current_policy_version
+
+    # OpenShell 0.0.72 can leave SandboxStatus.current_policy_version at zero even
+    # after the authoritative policy status RPC records the initial revision as loaded.
+    stub = getattr(client, "_stub", None)
+    if stub is None or not hasattr(stub, "GetSandboxPolicyStatus"):
+        return 0
+    response = stub.GetSandboxPolicyStatus(
+        openshell_pb2.GetSandboxPolicyStatusRequest(name=name, version=0),
+        timeout=30,
+    )
+    revision = response.revision
+    if revision.status != openshell_pb2.POLICY_STATUS_LOADED:
+        return 0
+    return revision.version
+
+
 def main() -> int:
     args = _args()
     policy_path = Path(args.policy).resolve()
@@ -140,15 +163,12 @@ def main() -> int:
             refs = (client.get(names[0]), client.get(names[1]))
             if refs[0].id == refs[1].id:
                 raise AssertionError(f"jobs share physical sandbox id {refs[0].id}")
-            if not all(ref.current_policy_version > 0 for ref in refs):
+            revisions = tuple(_loaded_policy_revision(client, name) for name in names)
+            if not all(revision > 0 for revision in revisions):
                 raise AssertionError("a live sandbox has no loaded policy revision")
             if not all(_attested(job_events) for job_events in events):
                 raise AssertionError("AI-Q did not emit successful positive-revision attestation events")
-            print(
-                "PASS distinct attested sandboxes: "
-                f"A={names[0]}@r{refs[0].current_policy_version}, "
-                f"B={names[1]}@r{refs[1].current_policy_version}"
-            )
+            print(f"PASS distinct attested sandboxes: A={names[0]}@r{revisions[0]}, B={names[1]}@r{revisions[1]}")
 
             sandboxes[0].terminate()
             _assert_deleted(client, names[0])

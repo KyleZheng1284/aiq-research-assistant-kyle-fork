@@ -289,6 +289,52 @@ class TestDeepResearcherAgent:
         assert resolved_skills is skills
         assert resolved_sandbox is sandbox
 
+    @pytest.mark.parametrize("owns_active_agent", [False, True])
+    @pytest.mark.asyncio
+    async def test_registered_run_cancellation_finalizes_only_request_owned_agent(self, owns_active_agent):
+        """Cancellation is re-raised and only a request-scoped agent owns terminal cleanup."""
+        from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepResearchSandboxConfig
+        from aiq_agent.agents.deep_researcher.register import DeepResearchAgentConfig
+        from aiq_agent.agents.deep_researcher.register import deep_research_agent
+
+        builder = MagicMock()
+        builder.get_tools = AsyncMock(return_value=[web_search_tool])
+        builder.get_llm = AsyncMock(return_value=MagicMock())
+        template_agent = MagicMock()
+        request_agent = MagicMock()
+        active_agent = request_agent if owns_active_agent else template_agent
+        active_agent.run = AsyncMock(side_effect=asyncio.CancelledError())
+        agents = [template_agent, request_agent] if owns_active_agent else [template_agent]
+        config = DeepResearchAgentConfig(
+            orchestrator_llm="llm",
+            tools=["web_search_tool"],
+            verbose=False,
+            sandbox=DeepResearchSandboxConfig() if owns_active_agent else None,
+        )
+        state = DeepResearchAgentState(messages=[HumanMessage(content="cancel this request")])
+
+        with (
+            patch(
+                "aiq_agent.agents.deep_researcher.register.DeepResearcherAgent",
+                side_effect=agents,
+            ),
+            patch("aiq_agent.common.validate_tool_availability", return_value=(True, 1, [])),
+        ):
+            registration = deep_research_agent.__wrapped__(config, builder)
+            function_info = await anext(registration)
+            assert function_info.single_fn is not None
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await function_info.single_fn(state)
+            finally:
+                await registration.aclose()
+
+        template_agent.finalize.assert_not_called()
+        if owns_active_agent:
+            request_agent.finalize.assert_called_once_with(interrupted=True)
+        else:
+            request_agent.finalize.assert_not_called()
+
     def test_modal_sandbox_name_is_job_id(self):
         """Modal sandbox names use the resolved job ID directly."""
         from aiq_agent.agents.deep_researcher.sandbox.providers.modal import _validate_modal_sandbox_name

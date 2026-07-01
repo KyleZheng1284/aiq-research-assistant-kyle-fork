@@ -638,21 +638,29 @@ async def run_agent_job(
 
     finally:
         # Ensure terminal-path events are not left in the batch buffer.
-        if event_store is not None and hasattr(event_store, "flush"):
-            event_store.flush()
+        await _flush_event_store(event_store, job_id=job_id)
         if cancellation_monitor:
             cancellation_monitor.stop()
         # Release the sandbox off the event loop so the SDK session close never blocks the Dask
         # worker. The single artifact harvest already ran in agent.run() before this point, so
         # teardown only closes/terminates; interrupted jobs terminate() to preempt a live execute.
         await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=interrupted)
-        if event_store is not None and hasattr(event_store, "flush"):
-            event_store.flush()
+        await _flush_event_store(event_store, job_id=job_id)
         # Clean up job-scoped auth token
         if _auth_token_reset is not None:
             from ._auth_context import job_auth_token
 
             job_auth_token.reset(_auth_token_reset)
+
+
+async def _flush_event_store(event_store: Any | None, *, job_id: str) -> None:
+    """Flush terminal events off-loop without replacing the job result."""
+    if event_store is None or not hasattr(event_store, "flush"):
+        return
+    try:
+        await asyncio.to_thread(event_store.flush)
+    except Exception as exc:  # noqa: BLE001 - terminal observability must not replace the job result
+        logger.warning("Event store flush failed for job %s (%s)", job_id, type(exc).__name__)
 
 
 def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: bool) -> None:
@@ -667,7 +675,8 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
     finalize = getattr(sandbox_runtime, "finalize", None)
     if finalize is not None:
         try:
-            finalize(interrupted=interrupted)
+            if not finalize(interrupted=interrupted):
+                logger.warning("Sandbox cleanup reported failure for job %s", job_id)
         except Exception:  # noqa: BLE001 - cleanup must never replace the job result
             logger.warning("Sandbox cleanup failed for job %s", job_id, exc_info=True)
         return

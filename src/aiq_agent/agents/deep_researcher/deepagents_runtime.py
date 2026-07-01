@@ -151,7 +151,15 @@ class DeepResearchSandboxConfig(FunctionBaseConfig, name="deep_research_sandbox"
         if self.network == "allowlist" and not self.network_allow:
             raise ValueError("network='allowlist' requires a non-empty network_allow list")
         if self.provider == "openshell":
+            if (
+                self.existing_sandbox_name is not None
+                and self.sandbox_name is not None
+                and self.existing_sandbox_name != self.sandbox_name
+            ):
+                raise ValueError("existing_sandbox_name and sandbox_name must match when both are set")
             shared_name = self.existing_sandbox_name or self.sandbox_name
+            if shared_name and not self.allow_shared_sandbox:
+                raise ValueError("existing_sandbox_name/sandbox_name requires allow_shared_sandbox=true")
             if not shared_name and not self.attest:
                 raise ValueError("Per-job OpenShell creation requires attest=true")
         return self
@@ -191,6 +199,7 @@ class DeepAgentsRuntime:
         self._event_emit = artifact_emit
         self._finalize_lock = threading.Lock()
         self._finalized = False
+        self._finalize_result: bool | None = None
         self.artifact_manager: Any | None = None
         self._skill_sources_by_agent = _resolve_agent_skill_sources(skills)
         self._skill_sources = tuple(
@@ -279,23 +288,25 @@ class DeepAgentsRuntime:
         """Release the sandbox once and emit a truthful, sanitized cleanup outcome."""
         with self._finalize_lock:
             if self._finalized:
-                return bool(getattr(self._sandbox_provider, "cleanup_succeeded", True))
-            self._finalized = True
+                assert self._finalize_result is not None
+                return self._finalize_result
 
-        self._emit_cleanup("started", interrupted=interrupted)
-        try:
-            if interrupted:
-                self.terminate()
+            self._emit_cleanup("started", interrupted=interrupted)
+            try:
+                if interrupted:
+                    self.terminate()
+                else:
+                    self.close()
+            except Exception as exc:  # noqa: BLE001 - terminal cleanup cannot replace the job result
+                logger.warning("Sandbox cleanup failed for job %s (%s)", self._job_id, type(exc).__name__)
+                succeeded = False
             else:
-                self.close()
-        except Exception:  # noqa: BLE001 - terminal cleanup cannot replace the job result
-            logger.warning("Sandbox cleanup failed for job %s", self._job_id, exc_info=True)
-            self._emit_cleanup("failed", interrupted=interrupted)
-            return False
+                succeeded = bool(getattr(self._sandbox_provider, "cleanup_succeeded", True))
 
-        succeeded = bool(getattr(self._sandbox_provider, "cleanup_succeeded", True))
-        self._emit_cleanup("succeeded" if succeeded else "failed", interrupted=interrupted)
-        return succeeded
+            self._emit_cleanup("succeeded" if succeeded else "failed", interrupted=interrupted)
+            self._finalize_result = succeeded
+            self._finalized = True
+            return succeeded
 
     def _emit_cleanup(self, status: str, *, interrupted: bool) -> None:
         """Emit cleanup metadata without policy contents, environment, or error text."""
@@ -314,8 +325,8 @@ class DeepAgentsRuntime:
                     },
                 }
             )
-        except Exception:  # noqa: BLE001 - observability must not break terminal cleanup
-            logger.warning("Sandbox cleanup event emission failed for job %s", self._job_id, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - observability must not break terminal cleanup
+            logger.warning("Sandbox cleanup event emission failed for job %s (%s)", self._job_id, type(exc).__name__)
 
     def prepare_state_files(self, files: dict[str, Any]) -> dict[str, Any]:
         """Normalize seeded virtual filesystem files for the configured backend."""

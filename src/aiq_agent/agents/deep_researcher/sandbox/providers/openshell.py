@@ -33,6 +33,7 @@ import base64
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
@@ -42,6 +43,7 @@ from deepagents.backends.protocol import FileUploadResponse
 from deepagents.backends.sandbox import BaseSandbox
 
 from ..base import SandboxProvider
+from ..base import SandboxTerminatedError
 from ..capabilities import SandboxCapabilities
 from ..registry import register_sandbox_provider
 
@@ -267,6 +269,8 @@ class OpenShellSandboxProvider(SandboxProvider):
         """Initialize the provider, requiring the OpenShell SDK and adapter to import."""
         super().__init__(config, job_id)
         self._os_context: object | None = None
+        self._os_context_entering = False
+        self._os_context_exit_requested = False
         try:
             import langchain_nvidia_openshell  # noqa: F401
             import openshell  # noqa: F401
@@ -309,7 +313,7 @@ class OpenShellSandboxProvider(SandboxProvider):
 
     def _upload_files_envfree(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """Upload files via argv + stdin so no ``OPENSHELL_*`` env is required."""
-        sandbox = self._os_context
+        sandbox = self._active_os_context()
         responses: list[FileUploadResponse] = []
         for path, content in files:
             if not path.startswith("/"):
@@ -327,7 +331,7 @@ class OpenShellSandboxProvider(SandboxProvider):
 
     def _download_files_envfree(self, paths: list[str]) -> list[FileDownloadResponse]:
         """Download files via an argv bootstrap that enforces size/symlink limits in-sandbox."""
-        sandbox = self._os_context
+        sandbox = self._active_os_context()
         # Cap passed to the bootstrap so oversized files are refused before transfer.
         max_bytes = self.config.artifact_capture.max_file_bytes
         responses: list[FileDownloadResponse] = []
@@ -383,7 +387,9 @@ class OpenShellSandboxProvider(SandboxProvider):
                 shared_name,
                 self.job_id,
             )
-            sandbox_kwargs.update(sandbox=shared_name, delete_on_exit=oscfg.delete_on_exit)
+            # Attachment does not transfer ownership: never delete a shared sandbox
+            # that this job did not create.
+            sandbox_kwargs.update(sandbox=shared_name, delete_on_exit=False)
         else:
             if not oscfg.policy:
                 raise ValueError("Per-job OpenShell creation requires a policy file")
@@ -396,33 +402,35 @@ class OpenShellSandboxProvider(SandboxProvider):
             policy = _parse_policy_proto(policy_data, policy_path=oscfg.policy)
             sandbox_kwargs.update(
                 spec=_build_sandbox_spec(policy=policy, image=oscfg.image, job_id=self.job_id),
-                delete_on_exit=True,
+                delete_on_exit=oscfg.delete_on_exit,
             )
 
         os_sandbox = openshell.Sandbox(**sandbox_kwargs)
-        # Record ownership before entering so a partially successful __enter__ is
-        # still torn down if readiness or attestation raises.
-        self._os_context = os_sandbox
+        self._enter_context(os_sandbox)
+        backend: BaseSandbox | None = None
         try:
-            os_sandbox.__enter__()
+            self._ensure_context_active(os_sandbox)
             self.physical_sandbox_name = getattr(os_sandbox.sandbox, "name", None)
-            self._attest(os_sandbox)
+            phase, policy_version = self._attest(os_sandbox)
+            self._ensure_context_active(os_sandbox)
             backend = OpenShellSandbox(sandbox=os_sandbox, timeout=cfg.timeout, shell=oscfg.shell)
+            self._ensure_context_active(os_sandbox)
             sandbox_ref = os_sandbox.sandbox
             logger.info(
-                "OpenShell sandbox attested: id=%s name=%s gateway=%s policy_version=%s shared=%s",
+                "OpenShell sandbox attested: id=%s name=%s policy_version=%s shared=%s",
                 backend.id,
                 getattr(sandbox_ref, "name", None),
-                oscfg.gateway,
-                getattr(sandbox_ref, "current_policy_version", None),
+                policy_version,
                 shared_name is not None,
             )
+            self._emit_attestation(phase=phase, policy_version=policy_version, status="succeeded")
             return backend
-        except Exception:
+        except BaseException:
+            self._safe_close(backend)
             self._exit_context()
             raise
 
-    def _attest(self, os_sandbox: Any) -> None:
+    def _attest(self, os_sandbox: Any) -> tuple[object, object]:
         """Fail closed unless the entered sandbox is READY with the expected policy revision."""
         try:
             from openshell._proto import openshell_pb2
@@ -438,6 +446,11 @@ class OpenShellSandboxProvider(SandboxProvider):
 
         oscfg = self.config.providers.openshell
         if oscfg.attest and (not isinstance(policy_version, int) or policy_version <= 0):
+            phase, policy_version = self._wait_for_loaded_policy(os_sandbox, sandbox_ref)
+            if phase != openshell_pb2.SANDBOX_PHASE_READY:
+                self._emit_attestation(phase=phase, policy_version=policy_version, status="failed")
+                raise RuntimeError(f"OpenShell sandbox attestation failed: phase={phase!r} is not READY")
+        if oscfg.attest and (not isinstance(policy_version, int) or policy_version <= 0):
             self._emit_attestation(phase=phase, policy_version=policy_version, status="failed")
             raise RuntimeError("OpenShell sandbox attestation failed: no loaded policy revision")
         if oscfg.expected_policy_version is not None and policy_version != oscfg.expected_policy_version:
@@ -446,7 +459,47 @@ class OpenShellSandboxProvider(SandboxProvider):
                 "OpenShell sandbox attestation failed: "
                 f"policy revision {policy_version!r} != expected {oscfg.expected_policy_version}"
             )
-        self._emit_attestation(phase=phase, policy_version=policy_version, status="succeeded")
+        return phase, policy_version
+
+    def _wait_for_loaded_policy(self, os_sandbox: Any, sandbox_ref: Any) -> tuple[object, object]:
+        """Wait for READY plus a loaded policy revision on OpenShell 0.0.72."""
+        from openshell._proto import openshell_pb2
+
+        oscfg = self.config.providers.openshell
+        phase = getattr(sandbox_ref, "phase", None)
+        policy_version = getattr(sandbox_ref, "current_policy_version", 0)
+        client = getattr(os_sandbox, "_client", None)
+        # OpenShell 0.0.72 does not expose policy status on SandboxClient even though the
+        # generated RPC is authoritative; isolate that compatibility access here.
+        stub = getattr(client, "_stub", None)
+        if client is None or stub is None or not hasattr(stub, "GetSandboxPolicyStatus"):
+            return phase, policy_version
+
+        request = openshell_pb2.GetSandboxPolicyStatusRequest(name=sandbox_ref.name, version=0)
+        deadline = time.monotonic() + oscfg.ready_timeout_seconds
+        while True:
+            self._ensure_context_active(os_sandbox)
+            sandbox_ref = client.get(sandbox_ref.name)
+            phase = getattr(sandbox_ref, "phase", None)
+            policy_version = getattr(sandbox_ref, "current_policy_version", 0)
+            if phase == openshell_pb2.SANDBOX_PHASE_READY and policy_version > 0:
+                return phase, policy_version
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return phase, policy_version
+
+            response = stub.GetSandboxPolicyStatus(request, timeout=min(5.0, remaining))
+            revision = getattr(response, "revision", None)
+            revision_status = getattr(revision, "status", openshell_pb2.POLICY_STATUS_UNSPECIFIED)
+            if revision_status == openshell_pb2.POLICY_STATUS_LOADED:
+                policy_version = getattr(revision, "version", 0)
+                if phase == openshell_pb2.SANDBOX_PHASE_READY and policy_version > 0:
+                    return phase, policy_version
+            elif revision_status == openshell_pb2.POLICY_STATUS_FAILED:
+                return phase, 0
+            if phase == openshell_pb2.SANDBOX_PHASE_ERROR:
+                return phase, policy_version
+            time.sleep(min(0.5, remaining))
 
     def _emit_attestation(self, *, phase: object, policy_version: object, status: str) -> None:
         """Emit a secret-free OpenShell attestation outcome."""
@@ -473,11 +526,74 @@ class OpenShellSandboxProvider(SandboxProvider):
         super()._terminate_session(session)
         self._exit_context()
 
+    def _active_os_context(self) -> Any:
+        """Return the current SDK context without racing an out-of-band teardown."""
+        with self._state_lock:
+            ctx = self._os_context
+        if ctx is None:
+            raise SandboxTerminatedError(f"OpenShell sandbox {self.sandbox_name} has no active context")
+        return ctx
+
+    def _enter_context(self, ctx: object) -> None:
+        """Enter an SDK context while allowing terminate() to request deferred cleanup."""
+        with self._state_lock:
+            if self._terminated:
+                raise SandboxTerminatedError(f"Sandbox {self.sandbox_name} has been terminated")
+            if self._os_context is not None:
+                raise RuntimeError(f"OpenShell sandbox {self.sandbox_name} context creation is already in progress")
+            self._os_context = ctx
+            self._os_context_entering = True
+            self._os_context_exit_requested = False
+
+        try:
+            ctx.__enter__()  # type: ignore[attr-defined]
+        except BaseException:
+            self._finish_context_entry(ctx, entered=False)
+            raise
+
+        if not self._finish_context_entry(ctx, entered=True):
+            raise SandboxTerminatedError(f"Sandbox {self.sandbox_name} was closed during creation")
+
+    def _finish_context_entry(self, ctx: object, *, entered: bool) -> bool:
+        """Publish an entered context, or honor a pending teardown exactly once."""
+        with self._state_lock:
+            owns_context = self._os_context is ctx
+            if owns_context:
+                self._os_context_entering = False
+                release_context = not entered or self._os_context_exit_requested or self._terminated
+                if release_context:
+                    self._os_context = None
+                    self._os_context_exit_requested = False
+            else:
+                release_context = entered
+
+        if release_context:
+            self._close_os_context(ctx)
+        return entered and owns_context and not release_context
+
+    def _ensure_context_active(self, ctx: object) -> None:
+        """Abort session publication when teardown won a creation race."""
+        with self._state_lock:
+            active = self._os_context is ctx and not self._os_context_exit_requested and not self._terminated
+        if not active:
+            raise SandboxTerminatedError(f"Sandbox {self.sandbox_name} was closed during creation")
+
     def _exit_context(self) -> None:
-        """Exit the OpenShell context once, swallowing cleanup errors on the terminal path."""
-        ctx = self._os_context
-        self._os_context = None
-        if ctx is not None and hasattr(ctx, "__exit__"):
+        """Exit once, deferring deletion to the creator while ``__enter__`` is in flight."""
+        with self._state_lock:
+            ctx = self._os_context
+            if ctx is None:
+                return
+            if self._os_context_entering:
+                self._os_context_exit_requested = True
+                return
+            self._os_context = None
+            self._os_context_exit_requested = False
+        self._close_os_context(ctx)
+
+    def _close_os_context(self, ctx: object) -> None:
+        """Drive one detached SDK context exit without replacing the job result."""
+        if hasattr(ctx, "__exit__"):
             try:
                 ctx.__exit__(None, None, None)
             except Exception:  # noqa: BLE001 - cleanup must never raise on the terminal path

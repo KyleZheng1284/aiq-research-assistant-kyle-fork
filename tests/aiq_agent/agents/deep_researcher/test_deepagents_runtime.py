@@ -17,6 +17,9 @@
 
 from __future__ import annotations
 
+import logging
+from threading import Event
+from threading import Thread
 from typing import Any
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -331,6 +334,22 @@ class TestDeepAgentsRuntimeJobId:
         with pytest.raises(ValueError, match="network_allow"):
             DeepResearchSandboxConfig(network="allowlist")
 
+    @pytest.mark.parametrize("shared_field", ["existing_sandbox_name", "sandbox_name"])
+    def test_public_shared_attachment_requires_debug_opt_in(self, shared_field: str) -> None:
+        with pytest.raises(ValueError, match="allow_shared_sandbox=true"):
+            DeepResearchSandboxConfig(**{shared_field: "shared"})
+
+        sandbox = DeepResearchSandboxConfig(**{shared_field: "shared", "allow_shared_sandbox": True})
+        assert getattr(sandbox, shared_field) == "shared"
+
+    def test_public_shared_attachment_rejects_conflicting_aliases(self) -> None:
+        with pytest.raises(ValueError, match="must match"):
+            DeepResearchSandboxConfig(
+                existing_sandbox_name="shared-a",
+                sandbox_name="shared-b",
+                allow_shared_sandbox=True,
+            )
+
 
 class TestDeepAgentsRuntimeCleanup:
     """Terminal cleanup is idempotent and reports the provider's actual outcome."""
@@ -374,4 +393,71 @@ class TestDeepAgentsRuntimeCleanup:
 
         assert runtime.finalize(interrupted=True) is False
         provider.terminate.assert_called_once_with()
+        assert [event["data"]["status"] for event in events] == ["started", "failed"]  # type: ignore[index]
+
+    def test_finalize_logs_only_cleanup_exception_type(self, caplog: pytest.LogCaptureFixture) -> None:
+        provider = MagicMock()
+        provider.provider_name = "openshell"
+        provider.physical_sandbox_name = "sandbox-1"
+        provider.close.side_effect = RuntimeError("credential=do-not-log")
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig())
+
+        with caplog.at_level(logging.WARNING):
+            assert runtime.finalize(interrupted=False) is False
+
+        assert "RuntimeError" in caplog.text
+        assert "credential=do-not-log" not in caplog.text
+
+    def test_concurrent_finalize_waits_for_and_reuses_exact_result(self) -> None:
+        provider = MagicMock()
+        provider.provider_name = "openshell"
+        provider.physical_sandbox_name = "sandbox-1"
+        provider.cleanup_succeeded = True
+        cleanup_started = Event()
+        allow_cleanup = Event()
+        second_caller_started = Event()
+        events: list[dict[str, object]] = []
+        results: list[bool] = []
+
+        def close() -> None:
+            cleanup_started.set()
+            if not allow_cleanup.wait(timeout=2):
+                raise AssertionError("cleanup was not released")
+            provider.cleanup_succeeded = False
+
+        provider.close.side_effect = close
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(
+                sandbox=DeepResearchSandboxConfig(),
+                artifact_emit=events.append,
+            )
+
+        first = Thread(target=lambda: results.append(runtime.finalize(interrupted=False)))
+
+        def finalize_again() -> None:
+            second_caller_started.set()
+            results.append(runtime.finalize(interrupted=True))
+
+        second = Thread(target=finalize_again)
+        first.start()
+        assert cleanup_started.wait(timeout=2)
+        second.start()
+        assert second_caller_started.wait(timeout=2)
+        assert results == []
+
+        allow_cleanup.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert results == [False, False]
+        provider.close.assert_called_once_with()
+        provider.terminate.assert_not_called()
         assert [event["data"]["status"] for event in events] == ["started", "failed"]  # type: ignore[index]
