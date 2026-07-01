@@ -316,6 +316,7 @@ class TestDeepAgentsRuntimeJobId:
             openshell_image="aiq:test",
             attest=True,
             expected_policy_version=3,
+            resources={"cpu": 1.5, "memory_mb": 2048},
             network="allowlist",
             network_allow=("api.github.com",),
         )
@@ -333,6 +334,8 @@ class TestDeepAgentsRuntimeJobId:
         assert resolved.providers.openshell.attest is True
         assert resolved.providers.openshell.expected_policy_version == 3
         assert resolved.providers.openshell.delete_on_exit is True
+        assert resolved.resources.cpu == 1.5
+        assert resolved.resources.memory_mb == 2048
 
     def test_public_allowlist_requires_hosts(self) -> None:
         with pytest.raises(ValueError, match="network_allow"):

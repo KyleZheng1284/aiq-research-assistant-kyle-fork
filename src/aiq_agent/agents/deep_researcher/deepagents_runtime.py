@@ -38,6 +38,7 @@ from pydantic import model_validator
 from nat.data_models.function import FunctionBaseConfig
 
 from .sandbox.config import ArtifactCaptureConfig
+from .sandbox.config import ResourceLimits
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +132,12 @@ class DeepResearchSandboxConfig(FunctionBaseConfig, name="deep_research_sandbox"
     )
     # Shared across providers.
     workdir: str | None = Field(default=None, description="Working directory inside the sandbox")
-    timeout: int = Field(default=1200, description="Maximum sandbox lifetime in seconds")
-    idle_timeout: int = Field(default=1800, description="Sandbox idle timeout in seconds")
+    timeout: int = Field(default=1200, gt=0, description="Maximum sandbox lifetime in seconds")
+    idle_timeout: int = Field(default=1800, gt=0, description="Sandbox idle timeout in seconds")
+    resources: ResourceLimits = Field(
+        default_factory=ResourceLimits,
+        description="Provider-enforced CPU and memory limits. Disk limits are not currently supported.",
+    )
     network: Literal["blocked", "allowlist", "open", "enabled"] = Field(
         default="blocked",
         description="Outbound network policy; 'enabled' is a deprecated alias for 'open'.",
@@ -553,6 +558,7 @@ def _create_sandbox_backend(config: DeepResearchSandboxConfig, job_id: str) -> A
             "workdir": workdir,
             "timeout": config.timeout,
             "idle_timeout": config.idle_timeout,
+            "resources": config.resources.model_dump(),
             "network": {"mode": config.network_mode, "allow": config.network_allow},
             "artifact_capture": config.artifact_capture.model_dump(),
             "providers": providers,

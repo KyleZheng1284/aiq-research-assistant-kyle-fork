@@ -30,7 +30,9 @@ runtime (`.../job/{job_id}/artifacts`), which is also auth-scoped to the job.
   job's creation spec, checked against the declared network upper bound, and attested before use.
 - Job IDs must satisfy each provider's object-name rules (Modal: 64 chars or fewer,
   alphanumeric plus dash/period/underscore).
-- `timeout` bounds individual execution. Other lifecycle controls are provider-dependent.
+- `timeout` still clamps individual execution, and host watchdogs independently enforce
+  total sandbox lifetime plus `idle_timeout`. Activity disarms the idle watchdog until the
+  serialized operation finishes; cleanup cancels both timers.
 - Files written inside the workdir are temporary scratch state. Durable text should
   be written through DeepAgents virtual paths such as `/shared/`; durable binaries
   (charts, CSVs) are captured by the artifact runtime.
@@ -64,3 +66,10 @@ The following safeguards are in place:
 - Sandbox quota and concurrency controls, and artifact retention via job-expiry cleanup.
 - Structured lifecycle logging for sandbox create, reuse, failure, and cleanup.
 - Structured `sandbox.attestation` and `sandbox.cleanup` events.
+- Sanitized `sandbox.timeout` and structured OpenShell `sandbox.policy_denied` events; neither
+  includes commands, policy bodies, environment values, credentials, or raw exceptions.
+
+OpenShell 0.0.72 CPU and memory requests map to
+`SandboxTemplate.resources.limits.cpu` and `.memory` (`<value>Mi`). The capability remains
+fail-closed until the required live 0.0.72 gateway smoke is complete. `disk_mb` is rejected:
+OpenShell has no portable disk-limit field, and artifact quotas are not disk enforcement.

@@ -32,9 +32,11 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
+from deepagents.backends.protocol import ExecuteResponse
 
 from aiq_agent.agents.deep_researcher.sandbox.base import SandboxProvider
 from aiq_agent.agents.deep_researcher.sandbox.base import SandboxTerminatedError
+from aiq_agent.agents.deep_researcher.sandbox.config import ResourceLimits
 from aiq_agent.agents.deep_researcher.sandbox.config import SandboxConfig
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import OpenShellSandboxProvider
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _build_sandbox_spec
@@ -254,6 +256,33 @@ def test_sandbox_spec_normalizes_long_job_id_label() -> None:
     assert "_" not in job_label
 
 
+@pytest.mark.parametrize(
+    ("limits", "expected"),
+    [
+        (ResourceLimits(cpu=1.5), {"limits": {"cpu": "1.5"}}),
+        (ResourceLimits(memory_mb=2048), {"limits": {"memory": "2048Mi"}}),
+        (ResourceLimits(cpu=2, memory_mb=512), {"limits": {"cpu": "2", "memory": "512Mi"}}),
+    ],
+)
+def test_sandbox_spec_maps_official_openshell_resource_shape(
+    limits: ResourceLimits,
+    expected: dict[str, object],
+) -> None:
+    if importlib.util.find_spec("openshell") is None:
+        pytest.skip("optional OpenShell SDK is not installed")
+    from google.protobuf.json_format import MessageToDict
+    from openshell._proto import sandbox_pb2
+
+    spec = _build_sandbox_spec(
+        policy=sandbox_pb2.SandboxPolicy(version=1),
+        image="aiq:test",
+        job_id="job-1",
+        resource_limits=limits,
+    )
+
+    assert MessageToDict(spec.template.resources) == expected
+
+
 def test_policy_network_must_not_exceed_declared_allowlist() -> None:
     policy = {"network_policies": {"github": {"endpoints": [{"host": "api.github.com"}, {"host": "github.com"}]}}}
 
@@ -266,6 +295,12 @@ def test_policy_network_must_not_exceed_declared_allowlist() -> None:
         _validate_policy_network(policy, mode="allowlist", allow=("api.github.com",))
     with pytest.raises(ValueError, match="network endpoints"):
         _validate_policy_network(policy, mode="blocked", allow=())
+
+
+def test_resource_capability_remains_gated_until_live_072_smoke() -> None:
+    provider = _provider()
+
+    assert provider.capabilities.supports_resource_limits is False
 
 
 def test_per_job_session_uses_policy_spec_and_attests_before_return(
@@ -328,8 +363,9 @@ def test_two_jobs_create_distinct_specs_without_named_attachment(tmp_path: Path)
         created.append(kwargs)
         return _FakeCreatedContext(name=f"generated-{len(created)}")
 
-    def build_spec(*, policy: Any, image: str, job_id: str) -> str:
+    def build_spec(*, policy: Any, image: str, job_id: str, resource_limits: ResourceLimits) -> str:
         del policy, image
+        assert resource_limits == ResourceLimits()
         spec_jobs.append(job_id)
         return f"spec-{job_id}"
 
@@ -885,3 +921,31 @@ def test_retry_cleanup_failure_remains_terminal_failure() -> None:
     replacement.close.assert_called_once_with()
     assert provider.cleanup_succeeded is False
     assert [event["data"]["status"] for event in events] == ["started", "failed"]  # type: ignore[index]
+
+
+def test_policy_denial_event_requires_structured_openshell_result() -> None:
+    provider = _provider()
+    events: list[dict[str, object]] = []
+    provider.set_event_emitter(events.append)
+    provider._session.execute.side_effect = [  # type: ignore[union-attr]
+        ExecuteResponse(output="permission denied: ordinary Unix mode", exit_code=1),
+        ExecuteResponse(
+            output='{"error":"policy_denied","detail":"secret-bearing policy detail"}',
+            exit_code=1,
+        ),
+    ]
+
+    provider.execute("cat /root/secret")
+    provider.execute("curl -H 'Authorization: secret' https://blocked.example")
+
+    assert events == [
+        {
+            "type": "sandbox.policy_denied",
+            "data": {
+                "provider": "openshell",
+                "sandbox": "aiq-deep-research-job-1",
+                "exit_code": 1,
+            },
+        }
+    ]
+    assert "secret" not in str(events)

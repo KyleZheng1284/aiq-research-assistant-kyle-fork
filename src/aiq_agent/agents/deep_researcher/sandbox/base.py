@@ -102,6 +102,12 @@ class SandboxProvider(BaseSandbox, ABC):
         self._terminated = False
         self._event_emit: Callable[[dict[str, object]], None] | None = None
         self._cleanup_failed = False
+        # Host-side watchdogs enforce the configured lifetime even when a provider only
+        # treats timeout values as per-command hints. The idle timer is disarmed while an
+        # operation is active and rearmed when it completes.
+        self._watchdog_lock = threading.Lock()
+        self._lifetime_timer: threading.Timer | None = None
+        self._idle_timer: threading.Timer | None = None
 
     # ------------------------------------------------------------------ #
     # Required surface (the only things a provider must implement)
@@ -175,6 +181,7 @@ class SandboxProvider(BaseSandbox, ABC):
         operation may lazily recreate the session. Default delegates to the session's
         ``close`` when present.
         """
+        self._cancel_watchdogs()
         with self._state_lock:
             session = self._session
             self._session = None
@@ -188,11 +195,88 @@ class SandboxProvider(BaseSandbox, ABC):
         long-running ``execute`` rather than waiting for it to finish. Providers that can
         hard-kill a remote process should override :meth:`_terminate_session`.
         """
+        self._cancel_watchdogs()
         with self._state_lock:
             session = self._session
             self._session = None
             self._terminated = True
         self._terminate_session(session)
+
+    def _cancel_watchdogs(self) -> None:
+        """Cancel both timers and make already-queued callbacks harmless."""
+        with self._watchdog_lock:
+            timers = (self._lifetime_timer, self._idle_timer)
+            self._lifetime_timer = None
+            self._idle_timer = None
+        for timer in timers:
+            if timer is not None:
+                timer.cancel()
+
+    def _start_watchdogs(self) -> None:
+        """Start the absolute lifetime watchdog for the newly published session."""
+        with self._watchdog_lock:
+            previous = (self._lifetime_timer, self._idle_timer)
+            self._lifetime_timer = None
+            self._idle_timer = None
+            with self._state_lock:
+                active = self._session is not None and not self._terminated
+            if active:
+                timer = threading.Timer(self.config.timeout, lambda: self._watchdog_expired("lifetime", timer))
+                timer.daemon = True
+                self._lifetime_timer = timer
+                timer.start()
+        for previous_timer in previous:
+            if previous_timer is not None:
+                previous_timer.cancel()
+
+    def _begin_activity(self) -> None:
+        """Disarm the idle timer while a serialized sandbox operation is active."""
+        with self._watchdog_lock:
+            timer = self._idle_timer
+            self._idle_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _end_activity(self) -> None:
+        """Rearm the idle watchdog after activity, if the session is still live."""
+        with self._watchdog_lock:
+            previous = self._idle_timer
+            self._idle_timer = None
+            with self._state_lock:
+                active = self._session is not None and not self._terminated
+            if active:
+                timer = threading.Timer(self.config.idle_timeout, lambda: self._watchdog_expired("idle", timer))
+                timer.daemon = True
+                self._idle_timer = timer
+                timer.start()
+        if previous is not None:
+            previous.cancel()
+
+    def _watchdog_expired(self, kind: str, timer: threading.Timer) -> None:
+        """Terminate only when ``timer`` is still the active generation for ``kind``."""
+        with self._watchdog_lock:
+            current = self._lifetime_timer if kind == "lifetime" else self._idle_timer
+            if current is not timer:
+                return
+            other = self._idle_timer if kind == "lifetime" else self._lifetime_timer
+            self._lifetime_timer = None
+            self._idle_timer = None
+        if other is not None:
+            other.cancel()
+        self._emit_event(
+            {
+                "type": "sandbox.timeout",
+                "data": {
+                    "provider": self.provider_name,
+                    "sandbox": getattr(self, "physical_sandbox_name", None) or self.sandbox_name,
+                    "kind": kind,
+                },
+            }
+        )
+        logger.warning(
+            "Sandbox watchdog expired: provider=%s name=%s kind=%s", self.provider_name, self.sandbox_name, kind
+        )
+        self.terminate()
 
     def _terminate_session(self, session: BaseSandbox | None) -> None:
         """Forcibly stop a session. Default closes it; providers may override to hard-kill."""
@@ -289,13 +373,33 @@ class SandboxProvider(BaseSandbox, ABC):
                 return self._session
         logger.info("Sandbox session init: provider=%s name=%s", self.provider_name, self.sandbox_name)
         created = self._create_session()
+        self._activate_session(created)
+        return created
+
+    def _activate_session(self, created: BaseSandbox) -> None:
+        """Publish, watchdog, and prepare one newly created physical session."""
+        with self._state_lock:
+            published = not self._terminated
+            if published:
+                self._session = created
+        if not published:
+            self._safe_close(created)
+            raise SandboxTerminatedError(f"Sandbox {self.sandbox_name} has been terminated")
+
+        # Publish under the operation lock before preparation so a lifetime timer or
+        # concurrent cancellation can close a stuck workspace-preparation call.
+        self._start_watchdogs()
         self._prepare_workspace(created)
         with self._state_lock:
-            if not self._terminated:
-                self._session = created
-                return created
+            if not self._terminated and self._session is created:
+                return
         # Terminated mid-creation: discard the freshly created session rather than leak it.
-        self._safe_close(created)
+        with self._state_lock:
+            still_owned = self._session is created
+            if still_owned:
+                self._session = None
+        if still_owned:
+            self._safe_close(created)
         raise SandboxTerminatedError(f"Sandbox {self.sandbox_name} has been terminated")
 
     def _reset_session(self) -> None:
@@ -308,15 +412,10 @@ class SandboxProvider(BaseSandbox, ABC):
         with self._state_lock:
             stale = self._session
             self._session = None
+        self._cancel_watchdogs()
         self._safe_close(stale)
         created = self._create_session()
-        self._prepare_workspace(created)
-        with self._state_lock:
-            if not self._terminated:
-                self._session = created
-                return
-        self._safe_close(created)
-        raise SandboxTerminatedError(f"Sandbox {self.sandbox_name} has been terminated")
+        self._activate_session(created)
 
     def _call(self, op_name: str, fn: Callable[[BaseSandbox], _T], *, idempotent: bool) -> _T:
         """Run a remote call with the serialization lock and gated retry.
@@ -329,6 +428,7 @@ class SandboxProvider(BaseSandbox, ABC):
         AND the provider classifies the error as recoverable (fail-safe over fail-silent).
         """
         with self._lock:
+            self._begin_activity()
             try:
                 result = fn(self._session_or_create())
                 # A concurrent terminate() can flip _terminated while the call was in
@@ -348,3 +448,5 @@ class SandboxProvider(BaseSandbox, ABC):
                     self._reset_session()
                     return fn(self._session_or_create())
                 raise
+            finally:
+                self._end_activity()

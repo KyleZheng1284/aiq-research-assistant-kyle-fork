@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
@@ -148,6 +149,11 @@ class TestSandboxConfig:
         with pytest.raises(ValueError, match="Registered providers"):
             SandboxConfig(provider="does-not-exist")
 
+    @pytest.mark.parametrize("field", ["timeout", "idle_timeout"])
+    def test_watchdog_timeouts_must_be_positive(self, field: str) -> None:
+        with pytest.raises(ValidationError):
+            SandboxConfig(provider="registered-fake", **{field: 0})
+
 
 class TestCapabilityGate:
     def test_block_network_requires_capability(self) -> None:
@@ -222,6 +228,15 @@ class TestResourceLimits:
     def test_resource_limit_rejects_non_positive(self) -> None:
         with pytest.raises(ValidationError):
             SandboxConfig(provider="registered-fake", resources={"cpu": 0})
+
+    @pytest.mark.parametrize("cpu", [float("nan"), float("inf"), float("-inf")])
+    def test_resource_limit_rejects_nonfinite_cpu(self, cpu: float) -> None:
+        with pytest.raises(ValidationError):
+            SandboxConfig(provider="registered-fake", resources={"cpu": cpu})
+
+    def test_disk_limit_fails_with_upstream_action(self) -> None:
+        with pytest.raises(ValidationError, match="OpenShell 0.0.72"):
+            SandboxConfig(provider="registered-fake", resources={"disk_mb": 1024})
 
 
 class TestEntryPointDiscovery:
@@ -317,6 +332,94 @@ class TestProviderLifecycle:
         provider.execute("echo ok", timeout=30)
 
         session.execute.assert_called_once_with("echo ok", timeout=30)
+
+    def test_activity_resets_idle_watchdog_and_close_cancels_timers(self) -> None:
+        timers: list[Any] = []
+
+        class FakeTimer:
+            def __init__(self, interval: float, callback: Any) -> None:
+                self.interval = interval
+                self.callback = callback
+                self.cancelled = False
+                self.daemon = False
+                timers.append(self)
+
+            def start(self) -> None:
+                return None
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+            def fire(self) -> None:
+                self.callback()
+
+        session = MagicMock()
+        session.execute.return_value = "ok"
+        provider = _ScriptedProvider(_fake_config(timeout=1200, idle_timeout=30), "job-1", sessions=[session])
+
+        with patch("aiq_agent.agents.deep_researcher.sandbox.base.threading.Timer", FakeTimer):
+            provider.execute("first")
+            lifetime, first_idle = timers
+            provider.execute("second")
+            second_idle = timers[-1]
+
+            assert lifetime.interval == 1200
+            assert first_idle.interval == 30
+            assert first_idle.cancelled is True
+
+            # A queued callback from the cancelled generation is harmless.
+            first_idle.fire()
+            session.close.assert_not_called()
+
+            provider.close()
+            assert lifetime.cancelled is True
+            assert second_idle.cancelled is True
+            session.close.assert_called_once()
+
+    @pytest.mark.parametrize("timer_index", [0, 1], ids=["lifetime", "idle"])
+    def test_watchdog_expiry_terminates_once_and_emits_sanitized_event(self, timer_index: int) -> None:
+        timers: list[Any] = []
+
+        class FakeTimer:
+            def __init__(self, interval: float, callback: Any) -> None:
+                self.callback = callback
+                self.cancelled = False
+                self.daemon = False
+                timers.append(self)
+
+            def start(self) -> None:
+                return None
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+            def fire(self) -> None:
+                self.callback()
+
+        session = MagicMock()
+        session.execute.return_value = "ok"
+        events: list[dict[str, object]] = []
+        provider = _ScriptedProvider(_fake_config(), "job-1", sessions=[session])
+        provider.set_event_emitter(events.append)
+
+        with patch("aiq_agent.agents.deep_researcher.sandbox.base.threading.Timer", FakeTimer):
+            provider.execute("echo ok")
+            timers[timer_index].fire()
+            provider.terminate()
+
+        session.close.assert_called_once()
+        assert events == [
+            {
+                "type": "sandbox.timeout",
+                "data": {
+                    "provider": "scripted",
+                    "sandbox": "job-1",
+                    "kind": "lifetime" if timer_index == 0 else "idle",
+                },
+            }
+        ]
+        with pytest.raises(SandboxTerminatedError):
+            provider.execute("echo late")
 
     def test_close_releases_session(self) -> None:
         session = MagicMock()

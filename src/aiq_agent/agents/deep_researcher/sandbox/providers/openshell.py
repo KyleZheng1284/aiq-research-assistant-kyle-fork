@@ -30,7 +30,9 @@ install it from a git spec (see ``scripts/setup_openshell.sh`` /
 from __future__ import annotations
 
 import base64
+import json
 import logging
+import math
 import os
 import re
 import time
@@ -45,6 +47,7 @@ from deepagents.backends.sandbox import BaseSandbox
 from ..base import SandboxProvider
 from ..base import SandboxTerminatedError
 from ..capabilities import SandboxCapabilities
+from ..config import ResourceLimits
 from ..registry import register_sandbox_provider
 
 if TYPE_CHECKING:
@@ -244,7 +247,30 @@ def _validate_policy_network(policy_data: dict[str, Any], *, mode: str, allow: t
             raise ValueError(f"OpenShell policy grants hosts outside sandbox.network.allow: {sorted(unexpected)}")
 
 
-def _build_sandbox_spec(*, policy: Any, image: str, job_id: str) -> Any:
+def _resource_values(limits: ResourceLimits | None) -> dict[str, object]:
+    """Map validated provider-neutral limits to OpenShell 0.0.72's OCI shape."""
+    if limits is None:
+        return {}
+    values: dict[str, str] = {}
+    if limits.cpu is not None:
+        cpu = float(limits.cpu)
+        if not math.isfinite(cpu) or cpu <= 0:
+            raise ValueError("OpenShell CPU limit must be finite and greater than zero")
+        values["cpu"] = str(int(cpu)) if cpu.is_integer() else format(cpu, ".15g")
+    if limits.memory_mb is not None:
+        if limits.memory_mb <= 0:
+            raise ValueError("OpenShell memory limit must be greater than zero")
+        values["memory"] = f"{limits.memory_mb}Mi"
+    return {"limits": values} if values else {}
+
+
+def _build_sandbox_spec(
+    *,
+    policy: Any,
+    image: str,
+    job_id: str,
+    resource_limits: ResourceLimits | None = None,
+) -> Any:
     """Build a secret-free per-job OpenShell spec using the installed SDK schema."""
     try:
         from openshell._proto import openshell_pb2
@@ -254,10 +280,26 @@ def _build_sandbox_spec(*, policy: Any, image: str, job_id: str) -> Any:
     template = openshell_pb2.SandboxTemplate(
         image=image,
         labels={"aiq": "deep-research", "aiq-job-id": _normalize_openshell_name(job_id, prefix="")},
+        resources=_resource_values(resource_limits),
     )
     # Deliberately omit environment and providers. Research/model credentials stay
     # on the host unless a future explicit credential-provider feature is configured.
     return openshell_pb2.SandboxSpec(template=template, policy=policy)
+
+
+def _is_policy_denial(response: object) -> bool:
+    """Recognize OpenShell's structured denial body without matching arbitrary stderr."""
+    output = getattr(response, "output", "")
+    if not isinstance(output, str):
+        return False
+    for candidate in (output, *output.splitlines()):
+        try:
+            payload = json.loads(candidate.strip())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(payload, dict) and payload.get("error") == "policy_denied":
+            return True
+    return False
 
 
 class OpenShellSandboxProvider(SandboxProvider):
@@ -290,6 +332,9 @@ class OpenShellSandboxProvider(SandboxProvider):
             supports_network_allowlist=True,
             supports_filesystem_policy=True,
             supports_process_policy=True,
+            # The 0.0.72 protobuf mapping is implemented and schema-tested, but this
+            # claim stays false until the required live 0.0.72 gateway smoke passes.
+            supports_resource_limits=False,
             supports_artifact_download=True,
             supports_cleanup=True,
             supports_terminate=True,
@@ -298,6 +343,22 @@ class OpenShellSandboxProvider(SandboxProvider):
     def is_recoverable_error(self, exc: Exception) -> bool:
         """Return whether the error is a missing-sandbox condition worth one retry."""
         return _is_openshell_not_found_error(exc)
+
+    def execute(self, command: str, *, timeout: int | None = None):
+        """Execute and emit metadata only for a structured OpenShell policy denial."""
+        response = super().execute(command, timeout=timeout)
+        if _is_policy_denial(response):
+            self._emit_event(
+                {
+                    "type": "sandbox.policy_denied",
+                    "data": {
+                        "provider": self.provider_name,
+                        "sandbox": getattr(self, "physical_sandbox_name", None) or self.sandbox_name,
+                        "exit_code": getattr(response, "exit_code", None),
+                    },
+                }
+            )
+        return response
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """Upload files. Uses the local env-free shim by default (OpenShell <=0.0.67 strips
@@ -401,7 +462,12 @@ class OpenShellSandboxProvider(SandboxProvider):
             )
             policy = _parse_policy_proto(policy_data, policy_path=oscfg.policy)
             sandbox_kwargs.update(
-                spec=_build_sandbox_spec(policy=policy, image=oscfg.image, job_id=self.job_id),
+                spec=_build_sandbox_spec(
+                    policy=policy,
+                    image=oscfg.image,
+                    job_id=self.job_id,
+                    resource_limits=cfg.resources,
+                ),
                 delete_on_exit=oscfg.delete_on_exit,
             )
 

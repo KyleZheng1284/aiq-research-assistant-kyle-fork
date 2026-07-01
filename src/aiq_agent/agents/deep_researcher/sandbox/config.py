@@ -24,6 +24,7 @@ is automatically accepted with no edits here.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 from typing import Literal
 
@@ -205,16 +206,36 @@ class ResourceLimits(BaseModel):
     Both default to ``None`` (no limit), so an unset ``resources`` block changes nothing.
     When a limit is set, the fail-closed capability gate refuses to run on a provider that
     cannot enforce it (``supports_resource_limits``), rather than silently ignoring it.
-    Disk quotas are intentionally omitted: no current provider can enforce them, so a disk
-    field would be unenforceable.
+    ``disk_mb`` is accepted only to return an actionable configuration error: OpenShell
+    0.0.72 has no portable sandbox disk-limit field, and artifact quotas are not a substitute
+    for filesystem enforcement.
     """
 
     cpu: float | None = Field(default=None, gt=0, description="Max CPU cores (provider-enforced).")
     memory_mb: int | None = Field(default=None, gt=0, description="Max memory in MB (provider-enforced).")
+    disk_mb: int | None = Field(default=None, gt=0, description="Requested disk cap (currently unsupported).")
+
+    @field_validator("cpu")
+    @classmethod
+    def _cpu_must_be_finite(cls, value: float | None) -> float | None:
+        """Reject quantities that cannot be represented by a runtime resource limit."""
+        if value is not None and not math.isfinite(value):
+            raise ValueError("sandbox.resources.cpu must be finite and greater than zero")
+        return value
+
+    @model_validator(mode="after")
+    def _disk_is_explicitly_unsupported(self) -> ResourceLimits:
+        """Fail instead of misrepresenting artifact quotas as sandbox disk enforcement."""
+        if self.disk_mb is not None:
+            raise ValueError(
+                "sandbox.resources.disk_mb is not enforceable by OpenShell 0.0.72; "
+                "remove disk_mb and track upstream OpenShell disk-limit support"
+            )
+        return self
 
     def any_set(self) -> bool:
         """Whether any limit is requested (so the capability gate applies)."""
-        return self.cpu is not None or self.memory_mb is not None
+        return self.cpu is not None or self.memory_mb is not None or self.disk_mb is not None
 
 
 class SandboxConfig(BaseModel):
@@ -236,8 +257,8 @@ class SandboxConfig(BaseModel):
         default_factory=NetworkPolicy,
         description="Normalized outbound network policy. Legacy `block_network: bool` is lifted into this.",
     )
-    timeout: int = Field(default=1200, description="Maximum sandbox lifetime in seconds")
-    idle_timeout: int = Field(default=1800, description="Sandbox idle timeout in seconds")
+    timeout: int = Field(default=1200, gt=0, description="Maximum sandbox lifetime in seconds")
+    idle_timeout: int = Field(default=1800, gt=0, description="Sandbox idle timeout in seconds")
     resources: ResourceLimits = Field(
         default_factory=ResourceLimits,
         description="Optional CPU/memory caps; enforced only by providers declaring supports_resource_limits.",

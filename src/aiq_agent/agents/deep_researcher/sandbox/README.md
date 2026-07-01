@@ -130,8 +130,9 @@ sandbox:
   timeout: 1200
   idle_timeout: 1800
   resources:                   # optional CPU/memory caps; omit for no limit
-    # cpu: 2                   # cores; needs supports_resource_limits (Modal enforces; OpenShell does not)
+    # cpu: 2                   # cores; needs supports_resource_limits
     # memory_mb: 4096          # a requested limit on a provider that can't enforce it fails closed
+    # disk_mb: 10240           # rejected; artifact quotas are not sandbox disk enforcement
   artifact_capture:
     enabled: true              # requires supports_artifact_download
     max_file_bytes: 50000000
@@ -217,6 +218,17 @@ AI-Q refuses startup if the YAML does not match the installed SDK schema, the po
 host outside the declared public allowlist, production Landlock mode is not fail-closed, or
 the entered sandbox is not ready with a loaded policy revision. The creation spec deliberately
 has no copied host environment or credential providers.
+
+OpenShell 0.0.72 represents CPU and memory under
+`SandboxTemplate.resources.limits` (`cpu` and `memory: <value>Mi`). AI-Q builds that exact
+shape and rejects nonfinite/nonpositive quantities. The provider does not declare
+`supports_resource_limits` until the live 0.0.72 gateway acceptance smoke passes, so a
+configured limit currently fails closed instead of being silently ignored. `disk_mb` is an
+explicit configuration error until OpenShell exposes portable disk enforcement upstream.
+
+Provider-independent host watchdogs enforce total lifetime and idle expiry even if the
+remote driver treats its timeout as a command hint. The idle timer is paused during each
+serialized operation, reset after activity, and both timers are cancelled during cleanup.
 
 Two ad-hoc deps (never in `pyproject`): the `openshell` SDK and the official
 `langchain-nvidia-openshell` adapter (`OpenShellSandbox`), the OpenShell partner package in
