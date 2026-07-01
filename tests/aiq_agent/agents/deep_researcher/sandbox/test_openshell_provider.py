@@ -23,6 +23,8 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
+from threading import Thread
 from types import ModuleType
 from types import SimpleNamespace
 from typing import Any
@@ -32,6 +34,7 @@ from unittest.mock import patch
 import pytest
 
 from aiq_agent.agents.deep_researcher.sandbox.base import SandboxProvider
+from aiq_agent.agents.deep_researcher.sandbox.base import SandboxTerminatedError
 from aiq_agent.agents.deep_researcher.sandbox.config import SandboxConfig
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import OpenShellSandboxProvider
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _build_sandbox_spec
@@ -76,6 +79,8 @@ def _provider(**openshell_config: Any) -> OpenShellSandboxProvider:
     provider = object.__new__(OpenShellSandboxProvider)
     SandboxProvider.__init__(provider, cfg, "job-1")
     provider._os_context = None
+    provider._os_context_entering = False
+    provider._os_context_exit_requested = False
     # Avoid real session creation: a non-None _session short-circuits _session_or_create.
     provider._session = MagicMock()  # type: ignore[assignment]
     return provider
@@ -115,7 +120,14 @@ def _fake_optional_modules(context_factory, adapter_cls: type = _FakeAdapter):
     adapter_module = ModuleType("langchain_nvidia_openshell")
     adapter_module.OpenShellSandbox = adapter_cls  # type: ignore[attr-defined]
     proto_module = ModuleType("openshell._proto")
-    proto_module.openshell_pb2 = SimpleNamespace(SANDBOX_PHASE_READY=2)  # type: ignore[attr-defined]
+    proto_module.openshell_pb2 = SimpleNamespace(  # type: ignore[attr-defined]
+        SANDBOX_PHASE_READY=2,
+        SANDBOX_PHASE_ERROR=3,
+        POLICY_STATUS_UNSPECIFIED=0,
+        POLICY_STATUS_LOADED=2,
+        POLICY_STATUS_FAILED=3,
+        GetSandboxPolicyStatusRequest=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
     with patch.dict(
         sys.modules,
         {
@@ -256,7 +268,10 @@ def test_policy_network_must_not_exceed_declared_allowlist() -> None:
         _validate_policy_network(policy, mode="blocked", allow=())
 
 
-def test_per_job_session_uses_policy_spec_and_attests_before_return(tmp_path: Path) -> None:
+def test_per_job_session_uses_policy_spec_and_attests_before_return(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     policy_path = tmp_path / "policy.yaml"
     _write_policy(policy_path)
     created: list[tuple[_FakeCreatedContext, dict[str, Any]]] = []
@@ -280,11 +295,18 @@ def test_per_job_session_uses_policy_spec_and_attests_before_return(tmp_path: Pa
         provider = OpenShellSandboxProvider(
             SandboxConfig(
                 provider="openshell",
-                providers={"openshell": {"policy": str(policy_path), "image": "aiq:test"}},
+                providers={
+                    "openshell": {
+                        "policy": str(policy_path),
+                        "image": "aiq:test",
+                        "gateway": "sensitive-gateway-name",
+                    }
+                },
             ),
             "job-123",
         )
-        backend = provider._create_session()
+        with caplog.at_level("INFO"):
+            backend = provider._create_session()
 
     context, kwargs = created[0]
     assert backend.id == context.id
@@ -293,6 +315,7 @@ def test_per_job_session_uses_policy_spec_and_attests_before_return(tmp_path: Pa
     assert kwargs["delete_on_exit"] is True
     assert "sandbox" not in kwargs
     assert provider.physical_sandbox_name == "generated"
+    assert "sensitive-gateway-name" not in caplog.text
 
 
 def test_two_jobs_create_distinct_specs_without_named_attachment(tmp_path: Path) -> None:
@@ -385,6 +408,47 @@ def test_attestation_failure_deletes_before_raising(
     assert provider._os_context is None
 
 
+def test_attestation_refreshes_ready_sandbox_until_policy_is_loaded(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+    context = _FakeCreatedContext(policy_version=0)
+    refreshed = SimpleNamespace(phase=2, current_policy_version=0, name=context.sandbox.name)
+    policy_status = MagicMock(
+        return_value=SimpleNamespace(revision=SimpleNamespace(version=1, status=2)),
+    )
+    context._client = SimpleNamespace(  # type: ignore[attr-defined]
+        get=MagicMock(return_value=refreshed),
+        _stub=SimpleNamespace(GetSandboxPolicyStatus=policy_status),
+    )
+    events: list[dict[str, object]] = []
+
+    with (
+        _fake_optional_modules(lambda **_kwargs: context),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
+            return_value="policy-proto",
+        ),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
+            return_value="job-spec",
+        ),
+    ):
+        provider = OpenShellSandboxProvider(
+            SandboxConfig(provider="openshell", providers={"openshell": {"policy": str(policy_path)}}),
+            "job-123",
+        )
+        provider.set_event_emitter(events.append)
+
+        provider._create_session()
+
+    request = policy_status.call_args.args[0]
+    assert request.name == context.sandbox.name
+    assert request.version == 0
+    succeeded = [event for event in events if event["data"]["status"] == "succeeded"]  # type: ignore[index]
+    assert len(succeeded) == 1
+    assert succeeded[0]["data"]["policy_version"] == 1  # type: ignore[index]
+
+
 def test_shared_attachment_requires_explicit_debug_opt_in() -> None:
     with pytest.raises(ValueError, match="allow_shared_sandbox"):
         SandboxConfig(provider="openshell", providers={"openshell": {"existing_sandbox_name": "shared"}})
@@ -402,11 +466,46 @@ def test_shared_attachment_requires_explicit_debug_opt_in() -> None:
     assert config.providers.openshell.shared_sandbox_name == "shared"
 
 
+def test_shared_attachment_never_deletes_unowned_sandbox() -> None:
+    created: list[dict[str, Any]] = []
+
+    def context_factory(**kwargs: Any) -> _FakeCreatedContext:
+        created.append(kwargs)
+        return _FakeCreatedContext(name="shared")
+
+    with _fake_optional_modules(context_factory):
+        provider = OpenShellSandboxProvider(
+            SandboxConfig(
+                provider="openshell",
+                providers={
+                    "openshell": {
+                        "existing_sandbox_name": "shared",
+                        "allow_shared_sandbox": True,
+                        "delete_on_exit": True,
+                    }
+                },
+            ),
+            "job-123",
+        )
+        provider._create_session()
+        provider.close()
+
+    assert created[0]["sandbox"] == "shared"
+    assert created[0]["delete_on_exit"] is False
+    assert "spec" not in created[0]
+
+
 def test_per_job_mode_rejects_disabled_attestation() -> None:
     with pytest.raises(ValueError, match="attest=true"):
         SandboxConfig(
             provider="openshell",
             providers={"openshell": {"policy": "policy.yaml", "attest": False}},
+        )
+
+    with pytest.raises(ValueError, match="delete_on_exit=true"):
+        SandboxConfig(
+            provider="openshell",
+            providers={"openshell": {"policy": "policy.yaml", "delete_on_exit": False}},
         )
 
 
@@ -434,11 +533,191 @@ def test_adapter_construction_failure_deletes_sandbox(tmp_path: Path) -> None:
             SandboxConfig(provider="openshell", providers={"openshell": {"policy": str(policy_path)}}),
             "job-123",
         )
+        events: list[dict[str, object]] = []
+        provider.set_event_emitter(events.append)
         with pytest.raises(ValueError, match="bad adapter"):
             provider._create_session()
 
     assert context.exit_calls == 1
     assert provider._os_context is None
+    assert not any(event["data"]["status"] == "succeeded" for event in events)  # type: ignore[index]
+
+
+def test_attestation_success_is_emitted_after_adapter_construction(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+    context = _FakeCreatedContext()
+    order: list[str] = []
+
+    class RecordingAdapter(_FakeAdapter):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            order.append("adapter")
+
+    with (
+        _fake_optional_modules(lambda **_kwargs: context, RecordingAdapter),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
+            return_value="policy-proto",
+        ),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
+            return_value="job-spec",
+        ),
+    ):
+        provider = OpenShellSandboxProvider(
+            SandboxConfig(provider="openshell", providers={"openshell": {"policy": str(policy_path)}}),
+            "job-123",
+        )
+        provider.set_event_emitter(lambda event: order.append(event["data"]["status"]))  # type: ignore[index]
+        provider._create_session()
+
+    assert order == ["adapter", "succeeded"]
+
+
+def test_terminate_before_context_entry_prevents_creation(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+    context = _FakeCreatedContext()
+
+    class UnexpectedAdapter:
+        def __init__(self, **_kwargs: Any) -> None:
+            raise AssertionError("adapter must not be constructed after termination")
+
+    with (
+        _fake_optional_modules(lambda **_kwargs: context, UnexpectedAdapter),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
+            return_value="policy-proto",
+        ),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
+            return_value="job-spec",
+        ),
+    ):
+        provider = OpenShellSandboxProvider(
+            SandboxConfig(provider="openshell", providers={"openshell": {"policy": str(policy_path)}}),
+            "job-123",
+        )
+        provider.terminate()
+
+        with pytest.raises(SandboxTerminatedError):
+            provider._create_session()
+
+    assert context.enter_calls == 0
+    assert context.exit_calls == 0
+
+
+def test_terminate_during_context_entry_defers_one_exit(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+    entry_started = Event()
+    allow_entry = Event()
+
+    class BlockingContext(_FakeCreatedContext):
+        def __enter__(self):
+            self.enter_calls += 1
+            entry_started.set()
+            if not allow_entry.wait(timeout=2):
+                raise AssertionError("context entry was not released")
+            return self
+
+    class UnexpectedAdapter:
+        def __init__(self, **_kwargs: Any) -> None:
+            raise AssertionError("adapter must not be constructed after termination")
+
+    context = BlockingContext()
+    errors: list[BaseException] = []
+
+    with (
+        _fake_optional_modules(lambda **_kwargs: context, UnexpectedAdapter),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
+            return_value="policy-proto",
+        ),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
+            return_value="job-spec",
+        ),
+    ):
+        provider = OpenShellSandboxProvider(
+            SandboxConfig(provider="openshell", providers={"openshell": {"policy": str(policy_path)}}),
+            "job-123",
+        )
+
+        def create() -> None:
+            try:
+                provider._session_or_create()
+            except BaseException as exc:  # noqa: BLE001 - capture the worker outcome for assertion
+                errors.append(exc)
+
+        worker = Thread(target=create)
+        worker.start()
+        assert entry_started.wait(timeout=2)
+
+        provider.terminate()
+        assert context.exit_calls == 0
+        allow_entry.set()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], SandboxTerminatedError)
+    assert context.exit_calls == 1
+    assert provider._session is None
+
+
+def test_terminate_during_adapter_construction_cannot_publish_session(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+    adapter_started = Event()
+    allow_adapter = Event()
+    context = _FakeCreatedContext()
+    errors: list[BaseException] = []
+    events: list[dict[str, object]] = []
+
+    class BlockingAdapter(_FakeAdapter):
+        def __init__(self, **kwargs: Any) -> None:
+            adapter_started.set()
+            if not allow_adapter.wait(timeout=2):
+                raise AssertionError("adapter construction was not released")
+            super().__init__(**kwargs)
+
+    with (
+        _fake_optional_modules(lambda **_kwargs: context, BlockingAdapter),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
+            return_value="policy-proto",
+        ),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
+            return_value="job-spec",
+        ),
+    ):
+        provider = OpenShellSandboxProvider(
+            SandboxConfig(provider="openshell", providers={"openshell": {"policy": str(policy_path)}}),
+            "job-123",
+        )
+        provider.set_event_emitter(events.append)
+
+        def create() -> None:
+            try:
+                provider._session_or_create()
+            except BaseException as exc:  # noqa: BLE001 - capture the worker outcome for assertion
+                errors.append(exc)
+
+        worker = Thread(target=create)
+        worker.start()
+        assert adapter_started.wait(timeout=2)
+
+        provider.terminate()
+        allow_adapter.set()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], SandboxTerminatedError)
+    assert context.exit_calls == 1
+    assert provider._session is None
+    assert not any(event["data"]["status"] == "succeeded" for event in events)  # type: ignore[index]
 
 
 def test_upload_passes_path_via_argv_and_data_via_stdin_no_env() -> None:
@@ -576,3 +855,33 @@ def test_context_exit_failure_marks_cleanup_failed() -> None:
 
     assert provider.cleanup_succeeded is False
     assert provider._os_context is None
+
+
+def test_retry_cleanup_failure_remains_terminal_failure() -> None:
+    from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepAgentsRuntime
+    from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepResearchSandboxConfig
+
+    provider = _provider()
+    stale = MagicMock()
+    stale.close.side_effect = RuntimeError("stale sandbox close failed")
+    replacement = MagicMock()
+    provider._session = stale
+    provider._create_session = MagicMock(return_value=replacement)  # type: ignore[method-assign]
+    provider._prepare_workspace = MagicMock()  # type: ignore[method-assign]
+    events: list[dict[str, object]] = []
+
+    with patch(
+        "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+        return_value=provider,
+    ):
+        runtime = DeepAgentsRuntime(
+            sandbox=DeepResearchSandboxConfig(),
+            artifact_emit=events.append,
+        )
+
+    provider._reset_session()
+
+    assert runtime.finalize(interrupted=False) is False
+    replacement.close.assert_called_once_with()
+    assert provider.cleanup_succeeded is False
+    assert [event["data"]["status"] for event in events] == ["started", "failed"]  # type: ignore[index]
