@@ -33,7 +33,9 @@ import base64
 import logging
 import os
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
 
 from deepagents.backends.protocol import FileDownloadResponse
 from deepagents.backends.protocol import FileUploadResponse
@@ -88,6 +90,7 @@ _DOWNLOAD_CODE = (
 
 # Bootstrap exit codes mapped to a download error reason (see _DOWNLOAD_CODE).
 _DOWNLOAD_EXIT_ERRORS = {3: "is_directory", 4: "too_large", 5: "symlink_rejected"}
+_POLICY_DENIAL_MARKERS = ("policy_denied", "permission denied", "operation not permitted")
 
 
 def _classify_fs_error(text: str) -> str:
@@ -125,14 +128,110 @@ def _is_openshell_not_found_error(exc: Exception) -> bool:
     return "not found" in text and ("sandbox" in text or exc.__class__.__module__.startswith("openshell"))
 
 
-class OpenShellSandboxProvider(SandboxProvider):
-    """OpenShell backend that attaches to a configured sandbox.
+def _read_policy_data(policy_path: str, *, require_hard_landlock: bool) -> dict[str, Any]:
+    """Read and normalize OpenShell policy YAML without importing the optional SDK."""
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ImportError(_OPENSHELL_IMPORT_HINT) from exc
 
-    OpenShell enforces filesystem/process/network policy at the gateway, so this
-    provider declares those capabilities. The SDK cannot apply or verify a policy
-    file while attaching: ``policy`` requires a pre-created named sandbox whose
-    policy is managed externally.
-    """
+    path = Path(policy_path).expanduser()
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"Could not read OpenShell policy file: {path}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid OpenShell policy YAML: {path}") from exc
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"OpenShell policy must be a YAML mapping: {path}")
+    if raw.get("version") != 1:
+        raise ValueError("OpenShell policy version must be exactly 1")
+
+    landlock = raw.get("landlock")
+    compatibility = landlock.get("compatibility") if isinstance(landlock, dict) else None
+    if require_hard_landlock and compatibility != "hard_requirement":
+        raise ValueError(
+            "OpenShell production policy requires landlock.compatibility=hard_requirement; "
+            "set require_hard_landlock=false only for an explicit local demo."
+        )
+
+    # OpenShell's YAML schema calls this field filesystem_policy while the 0.0.72
+    # Python proto calls it filesystem. Keep this compatibility translation in one
+    # place and reject every other unknown field through ParseDict below.
+    policy_data = dict(raw)
+    if "filesystem_policy" in policy_data:
+        if "filesystem" in policy_data:
+            raise ValueError("OpenShell policy cannot contain both filesystem_policy and filesystem")
+        policy_data["filesystem"] = policy_data.pop("filesystem_policy")
+    return policy_data
+
+
+def _load_policy_proto(policy_path: str, *, require_hard_landlock: bool) -> Any:
+    """Load an OpenShell YAML policy into the SDK proto with strict field validation."""
+    try:
+        from google.protobuf.json_format import ParseDict
+        from openshell._proto import sandbox_pb2
+    except ImportError as exc:
+        raise ImportError(_OPENSHELL_IMPORT_HINT) from exc
+
+    policy_data = _read_policy_data(policy_path, require_hard_landlock=require_hard_landlock)
+    try:
+        return ParseDict(policy_data, sandbox_pb2.SandboxPolicy(), ignore_unknown_fields=False)
+    except Exception as exc:  # noqa: BLE001 - protobuf raises several parse exception types
+        raise ValueError(f"OpenShell policy does not match the installed SDK schema: {policy_path}") from exc
+
+
+def _policy_network_hosts(policy_data: dict[str, Any]) -> set[str]:
+    """Return every hostname authorized by an OpenShell network policy."""
+    policies = policy_data.get("network_policies") or {}
+    if not isinstance(policies, dict):
+        return set()
+    hosts: set[str] = set()
+    for policy in policies.values():
+        if not isinstance(policy, dict):
+            continue
+        endpoints = policy.get("endpoints") or []
+        if not isinstance(endpoints, list):
+            continue
+        for endpoint in endpoints:
+            if isinstance(endpoint, dict) and isinstance(endpoint.get("host"), str):
+                hosts.add(endpoint["host"].lower().rstrip("."))
+    return hosts
+
+
+def _validate_policy_network(policy_data: dict[str, Any], *, mode: str, allow: tuple[str, ...]) -> None:
+    """Fail closed when the policy grants more egress than the public config declares."""
+    policy_hosts = _policy_network_hosts(policy_data)
+    if mode == "blocked" and policy_hosts:
+        raise ValueError(
+            f"OpenShell policy grants network endpoints while sandbox.network is 'blocked': {sorted(policy_hosts)}"
+        )
+    if mode == "allowlist":
+        configured_hosts = {host.lower().rstrip(".") for host in allow}
+        unexpected = policy_hosts - configured_hosts
+        if unexpected:
+            raise ValueError(f"OpenShell policy grants hosts outside sandbox.network.allow: {sorted(unexpected)}")
+
+
+def _build_sandbox_spec(*, policy: Any, image: str, job_id: str) -> Any:
+    """Build a secret-free per-job OpenShell spec using the installed SDK schema."""
+    try:
+        from openshell._proto import openshell_pb2
+    except ImportError as exc:
+        raise ImportError(_OPENSHELL_IMPORT_HINT) from exc
+
+    template = openshell_pb2.SandboxTemplate(
+        image=image,
+        labels={"aiq": "deep-research", "aiq-job-id": _normalize_openshell_name(job_id, prefix="")},
+    )
+    # Deliberately omit environment and providers. Research/model credentials stay
+    # on the host unless a future explicit credential-provider feature is configured.
+    return openshell_pb2.SandboxSpec(template=template, policy=policy)
+
+
+class OpenShellSandboxProvider(SandboxProvider):
+    """OpenShell backend that creates and attests a policy-bound sandbox per job."""
 
     provider_name = "openshell"
 
@@ -161,11 +260,30 @@ class OpenShellSandboxProvider(SandboxProvider):
             supports_process_policy=True,
             supports_artifact_download=True,
             supports_cleanup=True,
+            supports_terminate=True,
         )
 
     def is_recoverable_error(self, exc: Exception) -> bool:
         """Return whether the error is a missing-sandbox condition worth one retry."""
         return _is_openshell_not_found_error(exc)
+
+    def execute(self, command: str, *, timeout: int | None = None):
+        """Execute and emit a sanitized event when the returned result indicates policy denial."""
+        response = super().execute(command, timeout=timeout)
+        output = str(getattr(response, "output", "") or "").lower()
+        exit_code = getattr(response, "exit_code", None)
+        if exit_code not in (None, 0) and any(marker in output for marker in _POLICY_DENIAL_MARKERS):
+            self._emit_event(
+                {
+                    "type": "sandbox.policy_denied",
+                    "data": {
+                        "provider": self.provider_name,
+                        "sandbox": getattr(self, "physical_sandbox_name", None) or self.sandbox_name,
+                        "exit_code": exit_code,
+                    },
+                }
+            )
+        return response
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """Upload files. Uses the local env-free shim by default (OpenShell <=0.0.67 strips
@@ -228,11 +346,7 @@ class OpenShellSandboxProvider(SandboxProvider):
         return responses
 
     def _create_session(self) -> BaseSandbox:
-        """Create/attach the OpenShell sandbox and wrap it in the official adapter.
-
-        A configured ``policy`` requires a pre-created named sandbox, because the
-        SDK cannot apply policy files to anonymous sandboxes.
-        """
+        """Create and attest a per-job OpenShell sandbox, or explicitly attach for debug."""
         try:
             import openshell
             from langchain_nvidia_openshell import OpenShellSandbox
@@ -241,36 +355,101 @@ class OpenShellSandboxProvider(SandboxProvider):
 
         cfg = self.config
         oscfg = cfg.providers.openshell
-        if oscfg.policy and not oscfg.sandbox_name:
-            raise ValueError(
-                "OpenShell `policy` requires `sandbox_name`. The SDK cannot apply a policy file to an "
-                "anonymous sandbox. Create the named sandbox with `openshell sandbox create --policy <file>` "
-                "first, then set providers.openshell.sandbox_name."
-            )
 
         # Release any prior context (covers the recoverable-error reset path).
         self._exit_context()
 
         sandbox_kwargs: dict[str, object] = {
             "cluster": oscfg.gateway,
-            "delete_on_exit": oscfg.delete_on_exit,
             "ready_timeout_seconds": oscfg.ready_timeout_seconds,
         }
-        if oscfg.sandbox_name:
-            sandbox_kwargs["sandbox"] = oscfg.sandbox_name
+        shared_name = oscfg.shared_sandbox_name
+        if shared_name is not None:
+            logger.warning(
+                "OpenShell shared-sandbox debug attachment enabled: sandbox=%s job=%s; physical job isolation is off",
+                shared_name,
+                self.job_id,
+            )
+            sandbox_kwargs.update(sandbox=shared_name, delete_on_exit=oscfg.delete_on_exit)
+        else:
+            if not oscfg.policy:
+                raise ValueError("Per-job OpenShell creation requires a policy file")
+            policy_data = _read_policy_data(oscfg.policy, require_hard_landlock=oscfg.require_hard_landlock)
+            _validate_policy_network(
+                policy_data,
+                mode=cfg.network.mode,
+                allow=cfg.network.allow,
+            )
+            policy = _load_policy_proto(oscfg.policy, require_hard_landlock=oscfg.require_hard_landlock)
+            sandbox_kwargs.update(
+                spec=_build_sandbox_spec(policy=policy, image=oscfg.image, job_id=self.job_id),
+                delete_on_exit=True,
+            )
 
         os_sandbox = openshell.Sandbox(**sandbox_kwargs)
-        os_sandbox.__enter__()
+        # Record ownership before entering so a partially successful __enter__ is
+        # still torn down if readiness or attestation raises.
         self._os_context = os_sandbox
+        try:
+            os_sandbox.__enter__()
+            self.physical_sandbox_name = getattr(os_sandbox.sandbox, "name", None)
+            self._attest(os_sandbox)
+        except Exception:
+            self._exit_context()
+            raise
+
         backend = OpenShellSandbox(sandbox=os_sandbox, timeout=cfg.timeout, shell=oscfg.shell)
+        sandbox_ref = os_sandbox.sandbox
         logger.info(
-            "OpenShell sandbox READY: id=%s gateway=%s sandbox_name=%s policy=%s",
+            "OpenShell sandbox attested: id=%s name=%s gateway=%s policy_version=%s shared=%s",
             backend.id,
+            getattr(sandbox_ref, "name", None),
             oscfg.gateway,
-            oscfg.sandbox_name,
-            oscfg.policy,
+            getattr(sandbox_ref, "current_policy_version", None),
+            shared_name is not None,
         )
         return backend
+
+    def _attest(self, os_sandbox: Any) -> None:
+        """Fail closed unless the entered sandbox is READY with the expected policy revision."""
+        try:
+            from openshell._proto import openshell_pb2
+        except ImportError as exc:
+            raise ImportError(_OPENSHELL_IMPORT_HINT) from exc
+
+        sandbox_ref = os_sandbox.sandbox
+        phase = getattr(sandbox_ref, "phase", None)
+        policy_version = getattr(sandbox_ref, "current_policy_version", 0)
+        if phase != openshell_pb2.SANDBOX_PHASE_READY:
+            self._emit_attestation(phase=phase, policy_version=policy_version, status="failed")
+            raise RuntimeError(f"OpenShell sandbox attestation failed: phase={phase!r} is not READY")
+
+        oscfg = self.config.providers.openshell
+        if oscfg.attest and (not isinstance(policy_version, int) or policy_version <= 0):
+            self._emit_attestation(phase=phase, policy_version=policy_version, status="failed")
+            raise RuntimeError("OpenShell sandbox attestation failed: no loaded policy revision")
+        if oscfg.expected_policy_version is not None and policy_version != oscfg.expected_policy_version:
+            self._emit_attestation(phase=phase, policy_version=policy_version, status="failed")
+            raise RuntimeError(
+                "OpenShell sandbox attestation failed: "
+                f"policy revision {policy_version!r} != expected {oscfg.expected_policy_version}"
+            )
+        self._emit_attestation(phase=phase, policy_version=policy_version, status="succeeded")
+
+    def _emit_attestation(self, *, phase: object, policy_version: object, status: str) -> None:
+        """Emit a secret-free OpenShell attestation outcome."""
+        self._emit_event(
+            {
+                "type": "sandbox.attestation",
+                "data": {
+                    "provider": self.provider_name,
+                    "sandbox": getattr(self, "physical_sandbox_name", None) or self.sandbox_name,
+                    "phase": phase,
+                    "policy_version": policy_version,
+                    "status": status,
+                },
+            }
+        )
 
     def close(self) -> None:
         """Terminate the session and exit the OpenShell context manager."""

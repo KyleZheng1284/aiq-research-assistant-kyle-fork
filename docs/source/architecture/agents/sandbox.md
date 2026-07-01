@@ -6,9 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # Deep Research Sandbox Notes
 
 Deep research can optionally run DeepAgents `execute` calls through a sandbox provider
-(Modal, OpenShell, or any registered provider). Modal creates a sandbox per job. The
-experimental OpenShell path attaches to a pre-created named sandbox shared by its jobs;
-job-scoped directories prevent filename collisions but are not a security boundary.
+(Modal, OpenShell, or any registered provider). Modal and OpenShell create a fresh physical
+sandbox per job. OpenShell binds the configured policy at creation and attests readiness plus
+the loaded policy revision before exposing the execution backend.
 
 The sandbox is an internal execution detail. There are no sandbox-specific API
 endpoints, and job-level auth remains responsible for submit, stream, status,
@@ -21,12 +21,13 @@ runtime (`.../job/{job_id}/artifacts`), which is also auth-scoped to the job.
 
 ## Current Behavior
 
-- Modal uses one sandbox per deep research job. OpenShell currently attaches jobs to
-  the configured shared sandbox name and is intended for local, single-operator testing.
+- Modal and OpenShell use one physical sandbox per deep research job. OpenShell shared
+  attachment is available only through an explicit debug-only opt-in and is not job-isolated.
 - Synchronous sandbox-enabled runs use an internal per-agent runtime ID.
 - Providers are selected by config (`sandbox.provider` + `providers.<name>`); the
   provider is validated against the registry and gated by its declared capabilities.
-  OpenShell policy is provisioned externally and is not verified when AI-Q attaches.
+  OpenShell policy YAML is parsed strictly against the installed SDK schema, applied in the
+  job's creation spec, checked against the declared network upper bound, and attested before use.
 - Job IDs must satisfy each provider's object-name rules (Modal: 64 chars or fewer,
   alphanumeric plus dash/period/underscore).
 - `timeout` bounds individual execution. Other lifecycle controls are provider-dependent.
@@ -36,13 +37,14 @@ runtime (`.../job/{job_id}/artifacts`), which is also auth-scoped to the job.
 
 ## Operational Notes
 
-- High-concurrency Modal runs create one sandbox per job. OpenShell runs share the named
-  sandbox and must not be used concurrently for mutually untrusted jobs. Optional submit-path
+- High-concurrency Modal and OpenShell runs create one sandbox per job. Optional submit-path
   caps (`AIQ_MAX_SANDBOXES_PER_PRINCIPAL` / `AIQ_MAX_SANDBOXES_GLOBAL`, default-off) bound
-  concurrency/cost but do not provide filesystem isolation.
+  concurrency and cost.
 - Custom client-supplied job IDs must not be reused for a new job.
-- The runtime closes provider sessions on success, failure, cancellation, and timeout.
-  A named OpenShell sandbox persists when `delete_on_exit` is disabled.
+- The runtime finalizer harvests artifacts before closing provider sessions on success or
+  failure. Cancellation and timeout use a bounded best-effort harvest before termination.
+- Per-job OpenShell mode requires `delete_on_exit: true`. A persistent shared sandbox is
+  possible only through the explicit debug attachment settings.
 
 ## Current Safeguards
 
@@ -54,3 +56,4 @@ The following safeguards are in place:
   with MIME-from-bytes spoof rejection, SVG sanitization, and an inline-render allowlist.
 - Sandbox quota and concurrency controls, and artifact retention via job-expiry cleanup.
 - Structured lifecycle logging for sandbox create, reuse, failure, and cleanup.
+- Structured `sandbox.attestation`, `sandbox.policy_denied`, and `sandbox.cleanup` events.

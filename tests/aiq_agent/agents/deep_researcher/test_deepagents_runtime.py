@@ -32,6 +32,7 @@ from aiq_agent.agents.deep_researcher.deepagents_runtime import SHARED_ROUTE
 from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepAgentsRuntime
 from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepResearchSandboxConfig
 from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepResearchSkillsConfig
+from aiq_agent.agents.deep_researcher.deepagents_runtime import _create_sandbox_backend
 from aiq_agent.agents.deep_researcher.deepagents_runtime import discover_skill_collections
 from aiq_agent.agents.deep_researcher.deepagents_runtime import resolve_skill_collections
 
@@ -301,3 +302,84 @@ class TestDeepAgentsRuntimeJobId:
             pytest.raises(ImportError, match="langchain-modal"),
         ):
             _ = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig(provider="modal")).backend
+
+    def test_public_openshell_config_maps_security_and_resource_fields(self) -> None:
+        public = DeepResearchSandboxConfig(
+            policy="policy.yaml",
+            openshell_image="aiq:test",
+            attest=True,
+            expected_policy_version=3,
+            resources={"cpu": 2, "memory_mb": 4096},
+            network="allowlist",
+            network_allow=("api.github.com",),
+        )
+
+        with patch(
+            "aiq_agent.agents.deep_researcher.sandbox.create_sandbox_backend",
+            return_value="backend",
+        ) as create:
+            assert _create_sandbox_backend(public, "job-1") == "backend"
+
+        resolved = create.call_args.args[0]
+        assert resolved.resources.cpu == 2
+        assert resolved.resources.memory_mb == 4096
+        assert resolved.network.mode == "allowlist"
+        assert resolved.network.allow == ("api.github.com",)
+        assert resolved.providers.openshell.image == "aiq:test"
+        assert resolved.providers.openshell.attest is True
+        assert resolved.providers.openshell.expected_policy_version == 3
+        assert resolved.providers.openshell.delete_on_exit is True
+
+    def test_public_allowlist_requires_hosts(self) -> None:
+        with pytest.raises(ValueError, match="network_allow"):
+            DeepResearchSandboxConfig(network="allowlist")
+
+
+class TestDeepAgentsRuntimeFinalization:
+    """Terminal finalization harvests before cleanup and is idempotent."""
+
+    @staticmethod
+    def _runtime(events: list[dict[str, Any]]) -> tuple[DeepAgentsRuntime, MagicMock]:
+        provider = MagicMock()
+        provider.provider_name = "fake"
+        provider.sandbox_name = "job-sandbox"
+        provider.physical_sandbox_name = None
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(
+                sandbox=DeepResearchSandboxConfig(),
+                job_id="job-1",
+                artifact_emit=events.append,
+            )
+        runtime.artifact_manager = MagicMock()
+        return runtime, provider
+
+    def test_normal_finalization_harvests_before_close_and_emits_cleanup(self) -> None:
+        events: list[dict[str, Any]] = []
+        runtime, provider = self._runtime(events)
+        order: list[str] = []
+        runtime.artifact_manager.final_harvest.side_effect = lambda: order.append("harvest")
+        provider.close.side_effect = lambda: order.append("close")
+
+        runtime.finalize(interrupted=False)
+        runtime.finalize(interrupted=False)
+
+        assert order == ["harvest", "close"]
+        assert [event["data"]["status"] for event in events if event["type"] == "sandbox.cleanup"] == [
+            "started",
+            "succeeded",
+        ]
+
+    def test_interrupted_finalization_checkpoints_then_terminates(self) -> None:
+        events: list[dict[str, Any]] = []
+        runtime, provider = self._runtime(events)
+        order: list[str] = []
+        runtime.artifact_manager.final_harvest.side_effect = lambda: order.append("harvest")
+        provider.terminate.side_effect = lambda: order.append("terminate")
+
+        runtime.finalize(interrupted=True, harvest_timeout_seconds=1)
+
+        assert order == ["harvest", "terminate"]
+        provider.close.assert_not_called()

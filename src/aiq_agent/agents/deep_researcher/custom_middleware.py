@@ -467,6 +467,27 @@ class SourceRegistryMiddleware(AgentMiddleware):
         return self._render_source_list_text(self.get_source_entries(mode=mode))
 
 
+class ArtifactHarvestMiddleware(AgentMiddleware):
+    """Checkpoint durable artifacts after successful sandbox execute calls."""
+
+    def __init__(self, artifact_manager: object) -> None:
+        """Store the artifact manager used for best-effort checkpoints."""
+        self.artifact_manager = artifact_manager
+
+    async def awrap_tool_call(self, request, handler):
+        """Run the tool, then checkpoint manifest-declared artifacts after execute."""
+        result = await handler(request)
+        tool_name = ""
+        if hasattr(request, "tool_call") and isinstance(request.tool_call, dict):
+            tool_name = request.tool_call.get("name", "")
+        if tool_name == "execute":
+            try:
+                await asyncio.to_thread(self.artifact_manager.harvest_after_execute)
+            except Exception:  # noqa: BLE001 - artifact capture must not fail the agent
+                logger.warning("Artifact checkpoint harvest failed", exc_info=True)
+        return result
+
+
 class PlanPersistenceMiddleware(AgentMiddleware):
     """Persists the planner's structured ResearchPlan to the shared filesystem.
 

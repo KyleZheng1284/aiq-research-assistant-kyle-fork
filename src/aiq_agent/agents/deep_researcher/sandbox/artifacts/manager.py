@@ -183,10 +183,16 @@ class ArtifactManager:
         self._count = 0
 
     def final_harvest(self) -> list[Artifact]:
-        """Harvest at the end of a successful agent run, with a directory scan fallback."""
+        """Harvest at a terminal boundary, with a directory scan fallback."""
         if not self.config.enabled:
             return []
         return self._harvest(scan=True)
+
+    def harvest_after_execute(self) -> list[Artifact]:
+        """Checkpoint manifest-declared artifacts after a sandbox execute call."""
+        if not self.config.enabled:
+            return []
+        return self._harvest(scan=False)
 
     def resolve_report_references(self, markdown: str, artifacts: list[Artifact] | None = None) -> str:
         """Validate ``artifact://`` image references against this job's artifacts.

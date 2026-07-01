@@ -99,6 +99,7 @@ class SandboxProvider(BaseSandbox, ABC):
         # state lock, so the two can never deadlock.
         self._state_lock = threading.Lock()
         self._terminated = False
+        self._event_emit: Callable[[dict[str, object]], None] | None = None
 
     # ------------------------------------------------------------------ #
     # Required surface (the only things a provider must implement)
@@ -139,6 +140,19 @@ class SandboxProvider(BaseSandbox, ABC):
         own SDK's typed exceptions rather than fragile string matching.
         """
         return False
+
+    def set_event_emitter(self, emit: Callable[[dict[str, object]], None] | None) -> None:
+        """Attach the job-scoped event sink used for sanitized lifecycle events."""
+        self._event_emit = emit
+
+    def _emit_event(self, event: dict[str, object]) -> None:
+        """Best-effort event delivery; observability must never break execution."""
+        if self._event_emit is None:
+            return
+        try:
+            self._event_emit(event)
+        except Exception:  # noqa: BLE001 - event persistence is non-critical
+            logger.warning("Sandbox event emission failed for %s", self.sandbox_name, exc_info=True)
 
     def close(self) -> None:
         """Release the underlying sandbox session, if any (idempotent).

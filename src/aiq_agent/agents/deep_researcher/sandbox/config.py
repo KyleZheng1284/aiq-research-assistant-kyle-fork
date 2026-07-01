@@ -90,21 +90,60 @@ class OpenShellProviderConfig(BaseModel):
     """OpenShell-specific sandbox settings (enterprise/on-prem example provider)."""
 
     gateway: str | None = Field(default=None, description="OpenShell gateway/cluster endpoint or name")
+    existing_sandbox_name: str | None = Field(
+        default=None,
+        description="Debug-only existing OpenShell sandbox to attach to; requires allow_shared_sandbox=true.",
+    )
     sandbox_name: str | None = Field(
         default=None,
-        description="Existing named OpenShell sandbox to attach to (required when a policy file is used).",
+        description="Deprecated alias for existing_sandbox_name; requires allow_shared_sandbox=true.",
+    )
+    allow_shared_sandbox: bool = Field(
+        default=False,
+        description="Explicitly allow debug attachment to a shared sandbox (does not provide per-job isolation).",
     )
     policy: str | None = Field(
         default=None,
-        description="OpenShell policy file path. Requires a pre-created named sandbox (sandbox_name).",
+        description="OpenShell policy YAML applied when the per-job sandbox is created.",
     )
-    image: str = Field(default="base", description="OpenShell image identifier")
+    image: str = Field(default="aiq-openshell-demo:latest", description="OpenShell image identifier")
     ready_timeout_seconds: float = Field(default=300.0, description="Seconds to wait for the sandbox to become ready")
     delete_on_exit: bool = Field(default=True, description="Delete the sandbox when its session context closes")
+    attest: bool = Field(default=True, description="Require READY state and a loaded policy revision before execution")
+    expected_policy_version: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional exact OpenShell policy revision pin.",
+    )
+    require_hard_landlock: bool = Field(
+        default=True,
+        description="Reject policy files that do not require Landlock filesystem enforcement.",
+    )
     shell: tuple[str, ...] = Field(
         default=("bash", "-c"),
         description="Shell argv prefix passed to the langchain-nvidia-openshell adapter.",
     )
+
+    @model_validator(mode="after")
+    def _validate_lifecycle_mode(self) -> OpenShellProviderConfig:
+        """Require an explicit opt-in for shared attachment and cleanup for per-job mode."""
+        if self.sandbox_name and self.existing_sandbox_name and self.sandbox_name != self.existing_sandbox_name:
+            raise ValueError("Set only one of sandbox_name or existing_sandbox_name.")
+        if (self.sandbox_name or self.existing_sandbox_name) and not self.allow_shared_sandbox:
+            raise ValueError(
+                "Attaching to an existing OpenShell sandbox is debug-only and requires allow_shared_sandbox=true. "
+                "Remove the sandbox name to create a physically isolated sandbox per job."
+            )
+        if not (self.sandbox_name or self.existing_sandbox_name) and not self.delete_on_exit:
+            raise ValueError("Per-job OpenShell sandboxes require delete_on_exit=true.")
+        if self.expected_policy_version is not None and not self.attest:
+            raise ValueError("expected_policy_version requires attest=true.")
+        return self
+
+    @property
+    def shared_sandbox_name(self) -> str | None:
+        """Return the explicitly configured debug attachment target, if any."""
+        return self.existing_sandbox_name or self.sandbox_name
 
 
 class SandboxProvidersConfig(BaseModel):

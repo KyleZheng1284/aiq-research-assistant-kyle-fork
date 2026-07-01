@@ -41,6 +41,7 @@ from aiq_agent.common import LLMProvider
 from aiq_agent.common import LLMRole
 from aiq_agent.common import render_prompt_template
 
+from .custom_middleware import ArtifactHarvestMiddleware
 from .custom_middleware import EmptyContentFixMiddleware
 from .custom_middleware import PlanPersistenceMiddleware
 from .custom_middleware import SourceRegistryMiddleware
@@ -199,13 +200,14 @@ def build_common_middleware(
     *,
     tool_set: DeepResearchToolSet,
     source_registry_middleware: SourceRegistryMiddleware,
+    artifact_manager: object | None = None,
     extra_valid_tool_names: Sequence[str] = (),
 ) -> list[Any]:
     """Build the shared middleware stack with agent-specific valid tool names."""
     valid_tool_names = {tool.name for tool in [*tool_set.all_tools, *tool_set.researcher_tools]}
     valid_tool_names.update(FILESYSTEM_TOOL_NAMES)
     valid_tool_names.update(extra_valid_tool_names)
-    return [
+    middleware: list[Any] = [
         EmptyContentFixMiddleware(),
         ToolNameSanitizationMiddleware(valid_tool_names=sorted(valid_tool_names)),
         ToolRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0),
@@ -213,6 +215,9 @@ def build_common_middleware(
         ToolResultPruningMiddleware(keep_last_n=10, max_chars=2000),
         ModelRetryMiddleware(max_retries=2, backoff_factor=2.0, initial_delay=1.0),
     ]
+    if artifact_manager is not None:
+        middleware.append(ArtifactHarvestMiddleware(artifact_manager))
+    return middleware
 
 
 def build_source_router_middleware(*, extra_valid_tool_names: Sequence[str] = ()) -> list[Any]:
@@ -229,6 +234,7 @@ def build_deep_research_middleware_set(
     *,
     tool_set: DeepResearchToolSet,
     source_registry_middleware: SourceRegistryMiddleware,
+    artifact_manager: object | None = None,
 ) -> DeepResearchMiddlewareSet:
     """Build researcher, writer, and orchestrator middleware stacks."""
 
@@ -237,6 +243,7 @@ def build_deep_research_middleware_set(
         return build_common_middleware(
             tool_set=tool_set,
             source_registry_middleware=source_registry_middleware,
+            artifact_manager=artifact_manager,
             extra_valid_tool_names=extra_valid_tool_names,
         )
 

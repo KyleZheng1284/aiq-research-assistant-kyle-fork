@@ -580,7 +580,15 @@ async def run_agent_job(
                     # Signal event stream completion
                     event_stream.on_complete()
 
-                    # Flush any buffered events before updating status
+                    # Terminal harvest/cleanup emits artifact and lifecycle events. Complete
+                    # it before publishing SUCCESS so clients never stop at terminal status
+                    # before those durable events are visible.
+                    await asyncio.to_thread(
+                        _teardown_sandbox,
+                        sandbox_runtime,
+                        job_id=job_id,
+                        interrupted=False,
+                    )
                     if hasattr(event_store, "flush"):
                         event_store.flush()
 
@@ -596,17 +604,10 @@ async def run_agent_job(
     except asyncio.CancelledError:
         logger.info("Job %s cancelled", job_id)
         interrupted = True
-        if job_store:
-            try:
-                job = await job_store.get_job(job_id)
-                if job and job.status != JobStatus.INTERRUPTED.value:
-                    await job_store.update_status(job_id, JobStatus.INTERRUPTED, error="cancelled by user")
-            except (ConnectionError, TimeoutError, RuntimeError):
-                pass
-
         if event_store is None:
             event_store = BatchingEventStore(EventStore(db_url, job_id))
 
+        await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=True)
         event_store.store(
             {
                 "type": "job.cancelled",
@@ -616,14 +617,20 @@ async def run_agent_job(
         if hasattr(event_store, "flush"):
             event_store.flush()
 
+        if job_store:
+            try:
+                job = await job_store.get_job(job_id)
+                if job and job.status != JobStatus.INTERRUPTED.value:
+                    await job_store.update_status(job_id, JobStatus.INTERRUPTED, error="cancelled by user")
+            except (ConnectionError, TimeoutError, RuntimeError):
+                pass
+
     except Exception as e:
         logger.exception("Job %s failed: %s", job_id, type(e).__name__)
-        if job_store:
-            await job_store.update_status(job_id, JobStatus.FAILURE, error=str(e))
-
         if event_store is None:
             event_store = BatchingEventStore(EventStore(db_url, job_id))
 
+        await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=False)
         event_store.store(
             {
                 "type": "job.error",
@@ -635,6 +642,8 @@ async def run_agent_job(
         )
         if hasattr(event_store, "flush"):
             event_store.flush()
+        if job_store:
+            await job_store.update_status(job_id, JobStatus.FAILURE, error=str(e))
 
     finally:
         # Ensure terminal-path events are not left in the batch buffer.
@@ -642,10 +651,12 @@ async def run_agent_job(
             event_store.flush()
         if cancellation_monitor:
             cancellation_monitor.stop()
-        # Release the sandbox off the event loop so the SDK session close never blocks the Dask
-        # worker. The single artifact harvest already ran in agent.run() before this point, so
-        # teardown only closes/terminates; interrupted jobs terminate() to preempt a live execute.
+        # Idempotent fallback for failures that occurred before the terminal branch could
+        # finalize. Failed jobs receive a best-effort terminal harvest; interrupted jobs get
+        # a bounded grace period before terminate() preempts any live execute.
         await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=interrupted)
+        if event_store is not None and hasattr(event_store, "flush"):
+            event_store.flush()
         # Clean up job-scoped auth token
         if _auth_token_reset is not None:
             from ._auth_context import job_auth_token
@@ -661,6 +672,13 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
     off the event loop (``asyncio.to_thread``) so the SDK session close cannot block the worker.
     """
     if sandbox_runtime is None:
+        return
+    finalize = getattr(sandbox_runtime, "finalize", None)
+    if finalize is not None:
+        try:
+            finalize(interrupted=interrupted)
+        except Exception:  # noqa: BLE001 - cleanup must never raise on the terminal path
+            logger.warning("Sandbox cleanup failed for job %s", job_id, exc_info=True)
         return
     teardown = getattr(sandbox_runtime, "terminate", None) if interrupted else None
     if teardown is None:
