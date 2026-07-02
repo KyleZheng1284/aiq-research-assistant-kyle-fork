@@ -47,6 +47,11 @@ runtime (`.../job/{job_id}/artifacts`), which is also auth-scoped to the job.
 - Job status becomes terminal only after artifact and cleanup events are flushed.
 - Per-job OpenShell mode requires `delete_on_exit: true`. A persistent shared sandbox is
   possible only through the explicit debug attachment settings.
+- Hosts without a Landlock LSM (local macOS / Docker Desktop) cannot satisfy the production
+  default `landlock.compatibility: hard_requirement`; every sandbox fails prepare there.
+  Generate a local policy with `./scripts/setup_openshell.sh --landlock-compatibility best_effort`
+  and set `require_hard_landlock: false`. See the deep researcher sandbox README ("Local
+  macOS / Docker Desktop") for the two-knob detail.
 
 ## Current Safeguards
 

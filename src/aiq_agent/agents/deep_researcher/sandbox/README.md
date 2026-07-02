@@ -246,6 +246,27 @@ export AIQ_OPENSHELL_IMAGE="aiq-openshell-demo:latest"
 export AIQ_OPENSHELL_POLICY_FILE="$PWD/configs/openshell/generated/aiq-openshell-policy.yaml"
 ```
 
+### Local macOS / Docker Desktop
+
+macOS (and Docker Desktop) has no Landlock LSM, so a policy with the production default
+`landlock.compatibility: hard_requirement` fails closed at sandbox prepare: every sandbox
+goes straight to `SANDBOX_PHASE_ERROR` and no `execute` ever runs. Generate a local policy
+with `best_effort` instead:
+
+```bash
+./scripts/setup_openshell.sh --landlock-compatibility best_effort
+# or, persistently, so regeneration keeps it:
+export AIQ_OPENSHELL_LANDLOCK_COMPATIBILITY=best_effort
+```
+
+Two independent knobs must agree for a local run; setting only one is a common trap:
+
+- `landlock.compatibility: best_effort` in the **policy file** is what the OpenShell gateway
+  actually enforces (this is what lets prepare succeed without Landlock).
+- `require_hard_landlock: false` in the **AI-Q config** only relaxes AI-Q's own acceptance
+  gate so it will load a non-`hard_requirement` policy. It does not change what the gateway
+  enforces, so it is insufficient on its own.
+
 For a local host that cannot enforce Landlock, an explicit non-production demo can use
 `--landlock-compatibility best_effort` together with `require_hard_landlock: false` in the
 AI-Q config. `--create-shared-debug-sandbox` creates the old named attachment target only

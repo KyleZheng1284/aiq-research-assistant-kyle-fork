@@ -90,7 +90,9 @@ Options:
                                 Services: $SUPPORTED_SERVICES
   --policy-file PATH            Output policy file.
                                 Default: configs/openshell/generated/aiq-openshell-policy.yaml
-  --landlock-compatibility MODE hard_requirement (default) or best_effort (local demo only).
+  --landlock-compatibility MODE hard_requirement (default; production/Linux, fails closed)
+                                or best_effort (required for local macOS / Docker Desktop,
+                                which have no Landlock LSM; never use in production).
   --create-shared-debug-sandbox Create one named shared sandbox for explicit debug attachment.
   --sandbox-name NAME           Debug sandbox name (default: aiq-openshell-demo).
   --image-name NAME             Docker image tag (default: aiq-openshell-demo:latest).
