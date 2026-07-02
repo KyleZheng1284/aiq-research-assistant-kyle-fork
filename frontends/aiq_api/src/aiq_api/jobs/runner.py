@@ -677,8 +677,8 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
         try:
             if not finalize(interrupted=interrupted):
                 logger.warning("Sandbox cleanup reported failure for job %s", job_id)
-        except Exception:  # noqa: BLE001 - cleanup must never replace the job result
-            logger.warning("Sandbox cleanup failed for job %s", job_id, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - cleanup must never replace the job result
+            logger.warning("Sandbox cleanup failed for job %s (%s)", job_id, type(exc).__name__)
         return
     teardown = getattr(sandbox_runtime, "terminate", None) if interrupted else None
     if teardown is None:
@@ -687,8 +687,8 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
         return
     try:
         teardown()
-    except Exception:  # noqa: BLE001 - cleanup must never raise on the terminal path
-        logger.warning("Sandbox cleanup failed for job %s", job_id, exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - cleanup must never raise on the terminal path
+        logger.warning("Sandbox cleanup failed for job %s (%s)", job_id, type(exc).__name__)
 
 
 def _create_agent_instance(
