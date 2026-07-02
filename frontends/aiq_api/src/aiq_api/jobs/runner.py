@@ -955,7 +955,7 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
             if not finalize(interrupted=interrupted):
                 logger.warning("Sandbox cleanup reported failure for job %s", job_id)
         except Exception as exc:  # noqa: BLE001 - cleanup must never replace the job result
-            logger.warning("Sandbox cleanup failed for job %s exception=%s", job_id, exc.__class__.__name__)
+            logger.warning("Sandbox cleanup failed for job %s (%s)", job_id, type(exc).__name__)
         return
     teardown = getattr(sandbox_runtime, "terminate", None) if interrupted else None
     if teardown is None:
@@ -968,7 +968,7 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
         # Secret-safe: log only the exception type. A provider cleanup error can carry a
         # credential or internal hostname, which must never reach the logs (matches the
         # finalize_artifacts handler above).
-        logger.warning("Sandbox cleanup failed for job %s exception=%s", job_id, exc.__class__.__name__)
+        logger.warning("Sandbox cleanup failed for job %s (%s)", job_id, type(exc).__name__)
 
 
 def _create_agent_instance(

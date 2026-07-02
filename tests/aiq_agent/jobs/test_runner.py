@@ -2479,6 +2479,18 @@ class TestTerminalTeardown:
 
         assert "Sandbox cleanup reported failure for job job-1" in caplog.text
 
+    def test_runtime_finalizer_exception_is_nonfatal_and_sanitized(self, caplog):
+        from aiq_api.jobs.runner import _teardown_sandbox
+
+        runtime = MagicMock(spec=["finalize"])
+        runtime.finalize.side_effect = RuntimeError("credential=do-not-log")
+
+        with caplog.at_level("WARNING", logger="aiq_api.jobs.runner"):
+            _teardown_sandbox(runtime, job_id="job-1", interrupted=False)
+
+        assert "Sandbox cleanup failed for job job-1 (RuntimeError)" in caplog.text
+        assert "credential=do-not-log" not in caplog.text
+
     def test_normal_path_calls_close(self):
         from aiq_api.jobs.runner import _teardown_sandbox
 
@@ -2505,13 +2517,17 @@ class TestTerminalTeardown:
 
         runtime.close.assert_called_once_with()
 
-    def test_never_raises_when_teardown_fails(self):
+    def test_fallback_teardown_exception_is_nonfatal_and_sanitized(self, caplog):
         from aiq_api.jobs.runner import _teardown_sandbox
 
         runtime = MagicMock(spec=["close", "terminate"])
-        runtime.close.side_effect = RuntimeError("sdk session close failed")
-        # Must swallow the error; teardown is best-effort on the terminal path.
-        _teardown_sandbox(runtime, job_id="job-1", interrupted=False)
+        runtime.close.side_effect = RuntimeError("credential=do-not-log")
+
+        with caplog.at_level("WARNING", logger="aiq_api.jobs.runner"):
+            _teardown_sandbox(runtime, job_id="job-1", interrupted=False)
+
+        assert "Sandbox cleanup failed for job job-1 (RuntimeError)" in caplog.text
+        assert "credential=do-not-log" not in caplog.text
 
     def test_finalizes_artifacts_before_close(self):
         from aiq_api.jobs.runner import _teardown_sandbox
