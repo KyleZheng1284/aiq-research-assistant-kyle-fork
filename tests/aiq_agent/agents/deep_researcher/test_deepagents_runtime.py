@@ -360,6 +360,14 @@ class TestDeepAgentsRuntimeCleanup:
         assert provider.terminate.call_count == 0
         assert [event["data"]["status"] for event in events] == ["started", "succeeded"]  # type: ignore[index]
 
+    def test_finalize_without_provider_emits_no_cleanup_events(self) -> None:
+        events: list[dict[str, object]] = []
+        runtime = DeepAgentsRuntime(sandbox=None, artifact_emit=events.append)
+
+        assert runtime.finalize(interrupted=False) is True
+        assert runtime.finalize(interrupted=True) is True
+        assert events == []
+
     def test_finalize_emits_failed_when_provider_observed_cleanup_error(self) -> None:
         provider = MagicMock()
         provider.provider_name = "openshell"
