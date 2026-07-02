@@ -909,7 +909,6 @@ filesystem_policy:
     - /usr
     - /lib
     - /etc
-    - /app
     - /var/log
     - /proc/self
     - /dev/urandom
