@@ -291,6 +291,13 @@ class DeepAgentsRuntime:
                 assert self._finalize_result is not None
                 return self._finalize_result
 
+            # No provider means there is no sandbox lifecycle to report; skip the
+            # cleanup events so non-sandbox jobs never emit an empty sandbox.cleanup.
+            if self._sandbox_provider is None:
+                self._finalize_result = True
+                self._finalized = True
+                return True
+
             self._emit_cleanup("started", interrupted=interrupted)
             try:
                 if interrupted:
