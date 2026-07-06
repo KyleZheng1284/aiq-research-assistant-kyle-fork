@@ -40,7 +40,6 @@ PYTHON_BIN=""
 # spec or a local checkout (e.g. to test an unreleased adapter build).
 DEFAULT_LANGCHAIN_NVIDIA_INSTALL_SPEC="langchain-nvidia-openshell==0.1.0"
 LANGCHAIN_NVIDIA_REPO="${LANGCHAIN_NVIDIA_REPO:-$DEFAULT_LANGCHAIN_NVIDIA_INSTALL_SPEC}"
-SANDBOX_NAME="${AIQ_OPENSHELL_SANDBOX_NAME:-aiq-openshell-demo}"
 IMAGE_NAME="${AIQ_OPENSHELL_IMAGE:-aiq-openshell-demo:latest}"
 # Sandbox log verbosity baked into the image (RUST_LOG). Default `warn` is OpenShell's
 # stock sandbox level; set to `debug` to surface in-container process/relay detail.
@@ -49,16 +48,9 @@ POLICY_PRESET="${AIQ_OPENSHELL_POLICY:-}"
 POLICY_ALLOWLIST="${AIQ_OPENSHELL_POLICY_ALLOWLIST:-${AIQ_OPENSHELL_POLICY_SERVICES:-}}"
 POLICY_FILE="${AIQ_OPENSHELL_POLICY_FILE:-$REPO_ROOT/configs/openshell/generated/aiq-openshell-policy.yaml}"
 LANDLOCK_COMPATIBILITY="${AIQ_OPENSHELL_LANDLOCK_COMPATIBILITY:-hard_requirement}"
-GATEWAY_NAME="${AIQ_OPENSHELL_GATEWAY_NAME:-aiq-local}"
-GATEWAY_PORT="${AIQ_OPENSHELL_GATEWAY_PORT:-8080}"
 DOCKER_BIN="${DOCKER_BIN:-}"
 OPENSHELL_BIN="${OPENSHELL_BIN:-}"
-OPENSHELL_GATEWAY_LAUNCH_BIN="${OPENSHELL_GATEWAY_LAUNCH_BIN:-}"
-GATEWAY_ENDPOINT=""
-GATEWAY_DISABLE_TLS=false
-RESTART_GATEWAY=true
 BUILD_IMAGE=true
-CREATE_SANDBOX=false
 LIST_OPENSHELL_VERSIONS=false
 
 SUPPORTED_SERVICES="github,pypi,nvidia,tavily,serper,huggingface,arxiv,semantic-scholar,npm"
@@ -73,11 +65,12 @@ Sets up OpenShell for AI-Q:
   2. Checks available OpenShell releases and selects an exact version.
   3. Installs the selected OpenShell Python package version.
   4. Installs the langchain-nvidia-openshell deepagents adapter.
-  5. Resolves Docker and OpenShell gateway paths.
-  6. Generates an initial OpenShell policy.
-  7. Starts/verifies the OpenShell gateway.
-  8. Builds the AI-Q sandbox image.
-  9. Leaves per-job sandbox creation to the AI-Q runtime.
+  5. Generates an initial OpenShell policy.
+  6. Resolves Docker and builds the reusable AI-Q sandbox image.
+
+This script never starts, stops, registers, or probes a gateway. Run
+scripts/start_openshell_gateway.sh after provisioning; per-job sandbox creation
+remains owned by the AI-Q runtime.
 
 Options:
   --openshell-version VERSION   Exact OpenShell version, or "latest".
@@ -91,21 +84,14 @@ Options:
   --policy-file PATH            Output policy file.
                                 Default: configs/openshell/generated/aiq-openshell-policy.yaml
   --landlock-compatibility MODE hard_requirement (default) or best_effort (local demo only).
-  --create-shared-debug-sandbox Create one named shared sandbox for explicit debug attachment.
-  --sandbox-name NAME           Debug sandbox name (default: aiq-openshell-demo).
   --image-name NAME             Docker image tag (default: aiq-openshell-demo:latest).
   --sandbox-log-level LEVEL     In-container OpenShell log verbosity baked into the
                                 image via RUST_LOG (default: warn). Use "debug" to
                                 surface process/relay detail in the sandbox logs.
   --langchain-nvidia SPEC       uv install spec or local langchain-nvidia checkout
                                 for the langchain-nvidia-openshell adapter.
-  --gateway-name NAME           OpenShell gateway name (default: aiq-local).
-  --gateway-port PORT           Local gateway port (default: 8080).
   --docker-bin PATH             Docker CLI path when docker is not on PATH.
-  --gateway-bin PATH            OpenShell gateway launcher path.
-  --no-restart-gateway          Reuse the active gateway instead of starting one.
   --skip-build                  Do not build the sandbox image.
-  --skip-sandbox                Deprecated no-op; per-job creation is already the default.
   --list-policies               Print supported policy choices.
   --list-services               Print supported services for --allow.
   --list-openshell-versions     Print released OpenShell versions >= 0.0.72.
@@ -156,14 +142,6 @@ while [[ $# -gt 0 ]]; do
             LANDLOCK_COMPATIBILITY="$2"
             shift 2
             ;;
-        --create-shared-debug-sandbox)
-            CREATE_SANDBOX=true
-            shift
-            ;;
-        --sandbox-name)
-            SANDBOX_NAME="$2"
-            shift 2
-            ;;
         --image-name)
             IMAGE_NAME="$2"
             shift 2
@@ -176,33 +154,16 @@ while [[ $# -gt 0 ]]; do
             LANGCHAIN_NVIDIA_REPO="$2"
             shift 2
             ;;
-        --gateway-name)
-            GATEWAY_NAME="$2"
-            shift 2
-            ;;
-        --gateway-port)
-            GATEWAY_PORT="$2"
-            shift 2
-            ;;
         --docker-bin)
             DOCKER_BIN="$2"
             shift 2
-            ;;
-        --gateway-bin)
-            OPENSHELL_GATEWAY_LAUNCH_BIN="$2"
-            shift 2
-            ;;
-        --no-restart-gateway)
-            RESTART_GATEWAY=false
-            shift
             ;;
         --skip-build)
             BUILD_IMAGE=false
             shift
             ;;
-        --skip-sandbox)
-            CREATE_SANDBOX=false
-            shift
+        --create-shared-debug-sandbox|--sandbox-name|--gateway-name|--gateway-port|--gateway-bin|--no-restart-gateway|--skip-sandbox)
+            fail "Gateway and debug-sandbox lifecycle moved to scripts/start_openshell_gateway.sh"
             ;;
         --list-policies)
             echo "$SUPPORTED_POLICIES" | tr ',' '\n'
@@ -641,132 +602,6 @@ EOF
     exit 1
 }
 
-resolve_gateway_launcher() {
-    if [[ -n "$OPENSHELL_GATEWAY_LAUNCH_BIN" && -x "$OPENSHELL_GATEWAY_LAUNCH_BIN" ]]; then
-        echo "OpenShell gateway launcher: $OPENSHELL_GATEWAY_LAUNCH_BIN"
-        return
-    fi
-
-    local candidates=(
-        "/opt/homebrew/opt/openshell/libexec/openshell-gateway-homebrew-service"
-        "$(command -v openshell-gateway || true)"
-        "/opt/homebrew/bin/openshell-gateway"
-        "/usr/local/bin/openshell-gateway"
-        "/usr/bin/openshell-gateway"
-        "$HOME/.local/bin/openshell-gateway"
-        "$VENV_DIR/bin/openshell-gateway"
-    )
-    local candidate
-    for candidate in "${candidates[@]}"; do
-        if [[ -n "$candidate" && -x "$candidate" ]]; then
-            OPENSHELL_GATEWAY_LAUNCH_BIN="$candidate"
-            echo "OpenShell gateway launcher: $OPENSHELL_GATEWAY_LAUNCH_BIN"
-            return
-        fi
-    done
-
-    if [[ "$OS_NAME" == "macos" ]]; then
-        # The nvidia/openshell Homebrew tap (github.com/nvidia/homebrew-openshell) is not
-        # published, so `brew install nvidia/openshell/openshell` 404s. Use OpenShell's
-        # official installer instead, which sets up the gateway (local brew service + mTLS).
-        log "Installing the OpenShell gateway via the official installer (NVIDIA/OpenShell)"
-        curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
-        local installed_candidate
-        for installed_candidate in \
-            "/opt/homebrew/opt/openshell/libexec/openshell-gateway-homebrew-service" \
-            "$(command -v openshell-gateway || true)" \
-            "/opt/homebrew/bin/openshell-gateway"; do
-            if [[ -n "$installed_candidate" && -x "$installed_candidate" ]]; then
-                OPENSHELL_GATEWAY_LAUNCH_BIN="$installed_candidate"
-                echo "OpenShell gateway launcher: $OPENSHELL_GATEWAY_LAUNCH_BIN"
-                return
-            fi
-        done
-    fi
-
-    cat <<EOF
-OpenShell gateway launcher was not found.
-
-Install the gateway, or rerun with:
-
-  scripts/setup_openshell.sh --gateway-bin /path/to/openshell-gateway
-
-On macOS, install the OpenShell gateway with the official installer:
-
-  curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
-EOF
-    exit 1
-}
-
-configure_gateway_mode() {
-    GATEWAY_ENDPOINT="https://127.0.0.1:$GATEWAY_PORT"
-    GATEWAY_DISABLE_TLS=false
-
-    if [[ "$(basename "$OPENSHELL_GATEWAY_LAUNCH_BIN")" == "openshell-gateway" ]]; then
-        if [[ "$CREATE_SANDBOX" == "true" ]]; then
-            cat <<'EOF'
-The raw openshell-gateway binary is not enough for Docker sandbox creation in
-this setup because Docker sandboxes require gateway JWT/mTLS configuration.
-
-Use the packaged gateway service wrapper when available, for example:
-
-  scripts/setup_openshell.sh --gateway-bin /opt/homebrew/opt/openshell/libexec/openshell-gateway-homebrew-service
-
-Or start a configured OpenShell gateway yourself, then rerun:
-
-  scripts/setup_openshell.sh --no-restart-gateway
-EOF
-            exit 1
-        fi
-        GATEWAY_ENDPOINT="http://127.0.0.1:$GATEWAY_PORT"
-        GATEWAY_DISABLE_TLS=true
-        echo "OpenShell gateway mode: plaintext local HTTP"
-    else
-        echo "OpenShell gateway mode: local mTLS"
-    fi
-}
-
-start_or_verify_gateway() {
-    log "Starting/verifying OpenShell gateway"
-    if [[ "$RESTART_GATEWAY" == "true" ]]; then
-        resolve_gateway_launcher
-        configure_gateway_mode
-        pkill -f openshell-gateway >/dev/null 2>&1 || true
-        sleep 2
-        rm -f /tmp/aiq-openshell-gateway.log
-        if [[ "$GATEWAY_DISABLE_TLS" == "true" ]]; then
-            nohup env OPENSHELL_SERVER_PORT="$GATEWAY_PORT" \
-                OPENSHELL_DRIVERS=docker \
-                DOCKER_HOST="${DOCKER_HOST:-}" \
-                "$OPENSHELL_GATEWAY_LAUNCH_BIN" --disable-tls >/tmp/aiq-openshell-gateway.log 2>&1 &
-        else
-            nohup env OPENSHELL_SERVER_PORT="$GATEWAY_PORT" \
-                OPENSHELL_DRIVERS=docker \
-                DOCKER_HOST="${DOCKER_HOST:-}" \
-                "$OPENSHELL_GATEWAY_LAUNCH_BIN" >/tmp/aiq-openshell-gateway.log 2>&1 &
-        fi
-        "$OPENSHELL_BIN" gateway remove "$GATEWAY_NAME" >/dev/null 2>&1 || true
-        if [[ "$GATEWAY_DISABLE_TLS" == "true" ]]; then
-            "$OPENSHELL_BIN" gateway add --name "$GATEWAY_NAME" "$GATEWAY_ENDPOINT" --local
-        else
-            "$OPENSHELL_BIN" gateway add --name "$GATEWAY_NAME" "$GATEWAY_ENDPOINT" --local --gateway-insecure
-        fi
-        "$OPENSHELL_BIN" gateway select "$GATEWAY_NAME"
-    fi
-
-    local attempt
-    for attempt in $(seq 1 60); do
-        if "$OPENSHELL_BIN" status; then
-            return
-        fi
-        sleep 1
-    done
-
-    echo "OpenShell gateway log:"
-    LC_ALL=C tr -d '\000' </tmp/aiq-openshell-gateway.log 2>/dev/null | sed -n '1,220p' || true
-    fail "OpenShell gateway did not become reachable"
-}
-
 print_policy_menu() {
     cat <<'EOF'
 
@@ -1019,60 +854,27 @@ build_image() {
         -f "$REPO_ROOT/deploy/openshell/Dockerfile.aiq-demo" "$REPO_ROOT/deploy/openshell"
 }
 
-create_sandbox() {
-    if [[ "$CREATE_SANDBOX" != "true" ]]; then
-        return
-    fi
-    log "Creating named OpenShell sandbox: $SANDBOX_NAME"
-    "$OPENSHELL_BIN" sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
-    local create_log="/tmp/${SANDBOX_NAME}-openshell-create.log"
-    local policy_label="${POLICY_PRESET//,/_}"
-    rm -f "$create_log"
-    "$OPENSHELL_BIN" sandbox create \
-        --name "$SANDBOX_NAME" \
-        --from "$IMAGE_NAME" \
-        --policy "$POLICY_FILE" \
-        --label aiq=openshell \
-        --label aiq-policy="$policy_label" \
-        --no-tty \
-        -- sleep infinity >"$create_log" 2>&1 &
-
-    local attempt
-    for attempt in $(seq 1 120); do
-        if "$OPENSHELL_BIN" sandbox list | grep -F "$SANDBOX_NAME" | grep -F "Ready" >/dev/null 2>&1; then
-            "$OPENSHELL_BIN" sandbox list | grep -F "$SANDBOX_NAME" || true
-            return
-        fi
-        sleep 1
-    done
-
-    echo "Sandbox create log:"
-    sed -n '1,220p' "$create_log" || true
-    fail "Timed out waiting for sandbox '$SANDBOX_NAME' to become Ready"
-}
-
 print_next_steps() {
     cat <<EOF
 
-OpenShell is ready for AI-Q.
+OpenShell dependencies, policy, and image are provisioned for AI-Q.
 
 Use these exports in shells where you run AI-Q:
 
   export AIQ_OPENSHELL_IMAGE="$IMAGE_NAME"
   export AIQ_OPENSHELL_POLICY_FILE="$POLICY_FILE"
 
-Start CLI mode:
+Start or verify an authenticated gateway and run its create/delete probe:
+
+  ./scripts/start_openshell_gateway.sh
+
+Start CLI mode after the gateway probe succeeds:
 
   ./scripts/start_cli.sh --config_file configs/config_openshell.yml --verbose
 
 Start E2E mode:
 
-  ./scripts/start_e2e.sh --config_file configs/config_openshell.yml
-
-Useful cleanup:
-
-  $OPENSHELL_BIN sandbox list
-  pkill -f openshell-gateway
+  ./scripts/start_e2e.sh --start-openshell-gateway --config_file configs/config_openshell.yml
 
 EOF
 }
@@ -1094,9 +896,7 @@ main() {
     configure_docker_host
     verify_docker_runtime
     generate_policy
-    start_or_verify_gateway
     build_image
-    create_sandbox
     print_next_steps
 }
 

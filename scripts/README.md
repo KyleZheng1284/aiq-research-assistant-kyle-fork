@@ -53,20 +53,25 @@ Starts the agent in CLI mode with browser-based authentication.
 
 Sets up the experimental NVIDIA OpenShell path for AI-Q. Run this once before using
 `configs/config_openshell.yml` with `start_cli.sh` or `start_e2e.sh`. It installs
-the `openshell` SDK and the `langchain-nvidia-openshell` adapter, starts/verifies
-the local OpenShell gateway, builds the reusable sandbox image, and generates a network
-policy. AI-Q then creates, attests, and deletes a policy-bound physical sandbox for every
-job. Inference is unaffected (it stays host-side, routed to NVIDIA Build); only generated
-code runs in the sandbox.
+the `openshell` SDK and the `langchain-nvidia-openshell` adapter, builds the reusable
+sandbox image, and generates a network policy. It does not start, stop, or register a
+gateway. `start_openshell_gateway.sh` owns gateway startup/readiness and proves the selected
+authenticated gateway can create and delete the required sandbox. AI-Q then creates,
+attests, and deletes a policy-bound physical sandbox for every job. Inference is unaffected
+(it stays host-side); only generated code runs in the sandbox.
 
 Production setup defaults to `landlock.compatibility: hard_requirement`. For a local demo
 host that cannot enforce Landlock, pass `--landlock-compatibility best_effort` and explicitly
 set `require_hard_landlock: false` in the AI-Q config. The legacy named shared sandbox is
-created only with `--create-shared-debug-sandbox` and remains a debug-only, non-isolated mode.
+created only by the gateway launcher with `--create-shared-debug-sandbox` and remains a
+debug-only, non-isolated mode.
 
 ```bash
 ./scripts/setup_openshell.sh --policy offline
+./scripts/start_openshell_gateway.sh
 ./scripts/start_e2e.sh --config_file configs/config_openshell.yml
+# or explicitly have E2E invoke the authenticated launcher/probe:
+./scripts/start_e2e.sh --start-openshell-gateway --config_file configs/config_openshell.yml
 # or direct serve:
 dotenv -f deploy/.env run .venv/bin/nat serve --config_file configs/config_openshell.yml --host 0.0.0.0 --port 8000
 ```
@@ -84,12 +89,13 @@ In the interactive version prompt, pressing Enter selects `0.0.72`.
 Deterministic live acceptance (no LLM or external research API involved):
 
 ```bash
-.venv/bin/python scripts/smoke_openshell_isolation.py --gateway aiq-local
+.venv/bin/python scripts/smoke_openshell_isolation.py --gateway openshell
 ```
 
 The probe fails unless the gateway service itself reports OpenShell `0.0.72`. It creates two
-jobs concurrently, proves they have distinct physical sandbox IDs and positive loaded policy
-revisions, cancels one, proves the other still executes, and then proves both were deleted.
+jobs concurrently, proves they have distinct physical sandbox IDs and strict effective-policy
+source/content/hash attestation, cancels one, proves the other still executes, and then proves
+both were deleted.
 Success is four explicit lines:
 
 ```text
@@ -103,7 +109,7 @@ On a non-production local host that intentionally uses the generated `best_effor
 
 ```bash
 .venv/bin/python scripts/smoke_openshell_isolation.py \
-  --gateway aiq-local \
+  --gateway openshell \
   --policy configs/openshell/generated/aiq-openshell-policy.yaml \
   --allow-best-effort-landlock
 ```
@@ -126,11 +132,11 @@ Verify and clean up:
 
 ```bash
 .venv/bin/openshell status
-.venv/bin/openshell sandbox list          # expect: aiq-openshell-demo ... Ready
-.venv/bin/openshell sandbox delete aiq-openshell-demo
-# Inspect, then stop only the gateway you started (avoid killing other sessions):
-pgrep -fl openshell-gateway        # find the PID(s)
-kill <PID>                         # stop the specific process
+.venv/bin/openshell gateway list -o json  # selected gateway must be HTTPS + mTLS/OIDC/edge auth
+.venv/bin/openshell sandbox list
+# Manage a local packaged service through its owner, never with broad process killing:
+brew services restart openshell                 # macOS
+systemctl --user restart openshell-gateway      # Linux
 ```
 
 

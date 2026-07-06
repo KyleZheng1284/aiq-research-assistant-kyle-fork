@@ -39,9 +39,11 @@ prevents accidental filename collisions and keeps harvesting scoped to the curre
 
 Modal and OpenShell both create a fresh physical sandbox for each job. OpenShell parses the
 configured policy with the installed SDK schema, applies it in the creation `SandboxSpec`,
-waits for `READY`, and requires a positive loaded policy revision before exposing the backend.
-An optional `expected_policy_version` provides an exact revision pin. Any creation or
-attestation failure closes the owning SDK context so the partially created sandbox is deleted.
+waits for `READY`, and verifies the authoritative effective policy source, protobuf content,
+OpenShell hash, and active revision before exposing the backend. A positive status version
+alone is never treated as attestation. An optional `expected_policy_version` provides an exact
+revision pin. Any creation or attestation failure closes the owning SDK context so the partially
+created sandbox is deleted.
 
 OpenShell shared attachment remains available only as an explicit debug escape hatch:
 `existing_sandbox_name` plus `allow_shared_sandbox: true`. It is not a job isolation boundary
@@ -149,6 +151,7 @@ sandbox:
       policy: configs/openshell/generated/aiq-openshell-policy.yaml
       delete_on_exit: true
       attest: true
+      cleanup_timeout_seconds: 30
       # expected_policy_version: 1
       require_hard_landlock: true
 ```
@@ -217,9 +220,9 @@ Requires `modal` + `langchain-modal` (in `pyproject`) and `modal setup`. See
 
 Each job creates a new policy-bound OpenShell sandbox and deletes it on terminal cleanup.
 AI-Q refuses startup if the YAML does not match the installed SDK schema, the policy grants a
-host outside the declared public allowlist, production Landlock mode is not fail-closed, or
-the entered sandbox is not ready with a loaded policy revision. The creation spec deliberately
-has no copied host environment or credential providers.
+host or hostless/CIDR override outside the declared public network contract, production Landlock
+mode is not fail-closed, or the gateway cannot prove the submitted policy is effective. The
+creation spec deliberately has no copied host environment or credential providers.
 
 Two ad-hoc deps (never in `pyproject`): the `openshell` SDK and the official
 `langchain-nvidia-openshell` adapter (`OpenShellSandbox`), the OpenShell partner package in
@@ -232,17 +235,23 @@ checkout). To install it into your `.venv` manually:
 uv pip install 'langchain-nvidia-openshell==0.1.0'
 ```
 
-One-command setup:
+Provision once, then start or reuse the authenticated gateway through its explicit lifecycle
+owner. The launcher rejects raw/plaintext/insecure registrations and requires a successful
+disposable sandbox create/delete probe:
 
 ```bash
 ./scripts/setup_openshell.sh --policy offline
+./scripts/start_openshell_gateway.sh
 ./scripts/start_e2e.sh --config_file configs/config_openshell.yml
+# or: ./scripts/start_e2e.sh --start-openshell-gateway --config_file configs/config_openshell.yml
 ```
 
 The setup script prints the environment variables needed by any later shell that starts
-AI-Q. It builds the reusable image and generates the policy; AI-Q creates the physical
-sandbox per job. If you start the backend in a different terminal/session, export the
-printed values before running `start_e2e.sh` (or put them in your local env file):
+AI-Q. It installs dependencies, builds the reusable image, and generates the policy; it never
+starts, stops, registers, or kills a gateway. The launcher reuses an authenticated registered
+gateway or starts the official packaged Homebrew/systemd service. AI-Q creates the physical
+sandbox per job. If you start the backend in a different terminal/session, export the printed
+values before running the launcher and `start_e2e.sh` (or put them in your local env file):
 
 ```bash
 export AIQ_OPENSHELL_IMAGE="aiq-openshell-demo:latest"
@@ -252,8 +261,9 @@ export AIQ_OPENSHELL_POLICY_FILE="$PWD/configs/openshell/generated/aiq-openshell
 For a local host that cannot enforce Landlock, an explicit non-production demo can use
 `--landlock-compatibility best_effort` together with `require_hard_landlock: false` in the
 AI-Q config. `--create-shared-debug-sandbox` creates the old named attachment target only
-for deliberate debugging; configure `existing_sandbox_name` and `allow_shared_sandbox: true`
-to attach to it.
+when passed to `start_openshell_gateway.sh`; configure `existing_sandbox_name` and
+`allow_shared_sandbox: true` to attach to it. When a policy file is supplied for shared debug,
+AI-Q strictly attests it; omitting the file emits `assurance=reduced`.
 
 Inference is routed host-side (e.g. NVIDIA Build or an internal inference hub set in the
 config); sandbox policy egress never requires or receives the inference key.

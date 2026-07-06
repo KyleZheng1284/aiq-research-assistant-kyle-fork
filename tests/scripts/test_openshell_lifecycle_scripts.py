@@ -1,0 +1,211 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Regression tests for OpenShell provisioning and gateway lifecycle ownership."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_GATEWAY_SCRIPT = _REPO_ROOT / "scripts" / "start_openshell_gateway.sh"
+_SETUP_SCRIPT = _REPO_ROOT / "scripts" / "setup_openshell.sh"
+_E2E_SCRIPT = _REPO_ROOT / "scripts" / "start_e2e.sh"
+
+
+def _fake_openshell(tmp_path: Path) -> tuple[Path, Path, Path]:
+    binary = tmp_path / "openshell"
+    log = tmp_path / "openshell.log"
+    state = tmp_path / "sandbox.state"
+    binary.write_text(
+        """#!/bin/bash
+set -euo pipefail
+echo "$*" >>"$FAKE_LOG"
+if [[ "$1 ${2:-}" == "gateway list" ]]; then
+    echo "$FAKE_GATEWAYS_JSON"
+elif [[ "$1 ${2:-}" == "gateway select" ]]; then
+    exit 0
+elif [[ "$1" == "status" ]]; then
+    exit "${FAKE_STATUS_EXIT:-0}"
+elif [[ "$1 ${2:-}" == "sandbox create" ]]; then
+    name=""
+    shift 2
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--name" ]]; then name="$2"; break; fi
+        shift
+    done
+    echo "$name" >"$FAKE_STATE"
+    [[ "${FAKE_CREATE_FAIL:-false}" != "true" ]]
+elif [[ "$1 ${2:-}" == "sandbox list" ]]; then
+    if [[ -s "$FAKE_STATE" ]]; then
+        name="$(sed -n '1p' "$FAKE_STATE")"
+        if [[ "${FAKE_NEVER_READY:-false}" == "true" ]]; then
+            echo "$name Creating"
+        else
+            echo "$name Ready"
+        fi
+    fi
+elif [[ "$1 ${2:-}" == "sandbox delete" ]]; then
+    [[ "${FAKE_DELETE_FAIL:-false}" != "true" ]]
+    rm -f "$FAKE_STATE"
+fi
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary, log, state
+
+
+def _run_launcher(
+    tmp_path: Path,
+    *,
+    gateway: dict[str, object],
+    extra_env: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    binary, log, state = _fake_openshell(tmp_path)
+    policy = tmp_path / "policy.yaml"
+    policy.write_text("version: 1\n", encoding="utf-8")
+    env = os.environ.copy()
+    for key in ("OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE", "OPENSHELL_GATEWAY_LAUNCH_BIN"):
+        env.pop(key, None)
+    env.update(
+        {
+            "OPENSHELL_BIN": str(binary),
+            "PYTHON_BIN": sys.executable,
+            "FAKE_LOG": str(log),
+            "FAKE_STATE": str(state),
+            "FAKE_GATEWAYS_JSON": json.dumps([gateway]),
+            "AIQ_OPENSHELL_STATUS_ATTEMPTS": "1",
+            "AIQ_OPENSHELL_PROBE_ATTEMPTS": "1",
+            "AIQ_OPENSHELL_DELETE_ATTEMPTS": "1",
+            "AIQ_OPENSHELL_POLL_DELAY": "0",
+        }
+    )
+    env.update(extra_env or {})
+    result = subprocess.run(
+        [
+            str(_GATEWAY_SCRIPT),
+            "--reuse-existing",
+            "--gateway-name",
+            "enterprise",
+            "--policy-file",
+            str(policy),
+        ],
+        cwd=_REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, log.read_text(encoding="utf-8") if log.exists() else ""
+
+
+def test_authenticated_gateway_runs_mandatory_create_delete_probe(tmp_path: Path) -> None:
+    result, calls = _run_launcher(
+        tmp_path,
+        gateway={
+            "name": "enterprise",
+            "endpoint": "https://gateway.example.com",
+            "type": "remote",
+            "auth": "oidc",
+            "active": False,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "gateway list -o json" in calls
+    assert "gateway select enterprise" in calls
+    assert "sandbox create" in calls
+    assert "sandbox delete" in calls
+    assert "gateway add" not in calls
+
+
+def test_plaintext_gateway_is_rejected_before_probe(tmp_path: Path) -> None:
+    result, calls = _run_launcher(
+        tmp_path,
+        gateway={
+            "name": "enterprise",
+            "endpoint": "http://127.0.0.1:8080",
+            "type": "local",
+            "auth": "plaintext",
+            "active": True,
+        },
+    )
+
+    assert result.returncode != 0
+    assert "not authenticated" in result.stderr
+    assert "sandbox create" not in calls
+
+
+def test_raw_gateway_launcher_is_rejected_independent_of_probe_mode(tmp_path: Path) -> None:
+    result, calls = _run_launcher(
+        tmp_path,
+        gateway={
+            "name": "enterprise",
+            "endpoint": "https://127.0.0.1:8080",
+            "type": "local",
+            "auth": "mtls",
+            "active": True,
+        },
+        extra_env={"OPENSHELL_GATEWAY_LAUNCH_BIN": "/usr/bin/openshell-gateway"},
+    )
+
+    assert result.returncode != 0
+    assert "raw gateway" in result.stderr.lower()
+    assert calls == ""
+
+
+def test_failed_readiness_probe_still_deletes_sandbox(tmp_path: Path) -> None:
+    result, calls = _run_launcher(
+        tmp_path,
+        gateway={
+            "name": "enterprise",
+            "endpoint": "https://127.0.0.1:8080",
+            "type": "local",
+            "auth": "mtls",
+            "active": True,
+        },
+        extra_env={"FAKE_NEVER_READY": "true"},
+    )
+
+    assert result.returncode != 0
+    assert "sandbox create" in calls
+    assert "sandbox delete" in calls
+
+
+def test_setup_is_provisioning_only_and_migrates_old_lifecycle_flags() -> None:
+    source = _SETUP_SCRIPT.read_text(encoding="utf-8")
+    assert "pkill" not in source
+    assert "start_or_verify_gateway" not in source
+    assert '"$OPENSHELL_BIN" sandbox create' not in source
+
+    result = subprocess.run(
+        [str(_SETUP_SCRIPT), "--gateway-name", "old"],
+        cwd=_REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "start_openshell_gateway.sh" in result.stderr
+
+
+def test_e2e_gateway_start_is_explicit_opt_in() -> None:
+    source = _E2E_SCRIPT.read_text(encoding="utf-8")
+    result = subprocess.run(
+        [str(_E2E_SCRIPT), "--help"],
+        cwd=_REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "--start-openshell-gateway" in result.stdout
+    assert "START_OPENSHELL_GATEWAY=false" in source
+    assert 'if [[ "$START_OPENSHELL_GATEWAY" != "true" ]]' in source
+    assert '"$PROJECT_ROOT/scripts/start_openshell_gateway.sh"' in source

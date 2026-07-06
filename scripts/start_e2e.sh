@@ -23,6 +23,7 @@ UI_DIR="$PROJECT_ROOT/frontends/ui"
 # Default config file
 CONFIG_FILE="configs/config_web_default_llamaindex.yml"
 PORT=8000
+START_OPENSHELL_GATEWAY=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -35,16 +36,22 @@ while [[ $# -gt 0 ]]; do
             PORT="$2"
             shift 2
             ;;
+        --start-openshell-gateway)
+            START_OPENSHELL_GATEWAY=true
+            shift
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
             echo "  --config_file <path>  Path to config file (default: configs/config_web_default_llamaindex.yml)"
             echo "  --port PORT           Backend server port (default: 8000)"
+            echo "  --start-openshell-gateway  Start/verify an authenticated gateway and run its create/delete probe"
             echo "  --help, -h            Show this help message"
             echo ""
-            echo "Example:"
+            echo "Examples:"
             echo "  $0 --config_file configs/config_web_default_llamaindex.yml --port 8000"
+            echo "  $0 --start-openshell-gateway --config_file configs/config_openshell.yml --port 8000"
             exit 0
             ;;
         *)
@@ -159,6 +166,14 @@ start_backend() {
     echo "Backend PID: $BACKEND_PID"
 }
 
+start_openshell_gateway() {
+    if [[ "$START_OPENSHELL_GATEWAY" != "true" ]]; then
+        return
+    fi
+    echo "Starting/verifying authenticated OpenShell gateway..."
+    "$PROJECT_ROOT/scripts/start_openshell_gateway.sh"
+}
+
 wait_for_backend() {
     echo "Waiting for backend to be ready..."
     local max_attempts=150
@@ -208,6 +223,9 @@ main() {
     echo ""
 
     check_dependencies
+    echo ""
+
+    start_openshell_gateway
     echo ""
 
     if check_ui_dependencies; then

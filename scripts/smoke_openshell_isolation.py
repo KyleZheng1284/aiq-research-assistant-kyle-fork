@@ -22,6 +22,8 @@ import grpc
 
 from aiq_agent.agents.deep_researcher.sandbox import SandboxConfig
 from aiq_agent.agents.deep_researcher.sandbox import create_sandbox_backend
+from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _deterministic_policy_hash
+from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _parse_policy_proto
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _policy_network_hosts
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _read_policy_data
 
@@ -62,13 +64,20 @@ def _assert_deleted(client: object, name: str) -> None:
     raise AssertionError(f"sandbox still exists after cleanup: {name}")
 
 
-def _attested(events: list[dict[str, object]]) -> bool:
+def _attested(events: list[dict[str, object]], *, expected_hash: str) -> bool:
     for event in events:
         if event.get("type") != "sandbox.attestation":
             continue
         data = event.get("data")
         if isinstance(data, dict) and data.get("status") == "succeeded":
-            return isinstance(data.get("policy_version"), int) and data["policy_version"] > 0
+            return (
+                isinstance(data.get("policy_version"), int)
+                and data["policy_version"] > 0
+                and data.get("policy_hash") == expected_hash
+                and data.get("policy_source") == 1
+                and data.get("assurance") == "strict"
+                and data.get("reason_code") is None
+            )
     return False
 
 
@@ -100,6 +109,8 @@ def main() -> int:
     policy_path = Path(args.policy).resolve()
     require_hard_landlock = not args.allow_best_effort_landlock
     policy_data = _read_policy_data(str(policy_path), require_hard_landlock=require_hard_landlock)
+    expected_policy = _parse_policy_proto(policy_data, policy_path=str(policy_path))
+    expected_policy_hash = _deterministic_policy_hash(expected_policy)
     hosts = tuple(sorted(_policy_network_hosts(policy_data)))
     network = {"mode": "allowlist", "allow": hosts} if hosts else {"mode": "blocked"}
 
@@ -166,8 +177,8 @@ def main() -> int:
             revisions = tuple(_loaded_policy_revision(client, name) for name in names)
             if not all(revision > 0 for revision in revisions):
                 raise AssertionError("a live sandbox has no loaded policy revision")
-            if not all(_attested(job_events) for job_events in events):
-                raise AssertionError("AI-Q did not emit successful positive-revision attestation events")
+            if not all(_attested(job_events, expected_hash=expected_policy_hash) for job_events in events):
+                raise AssertionError("AI-Q did not emit strict source/content/hash attestation events")
             print(f"PASS distinct attested sandboxes: A={names[0]}@r{revisions[0]}, B={names[1]}@r{revisions[1]}")
 
             sandboxes[0].terminate()

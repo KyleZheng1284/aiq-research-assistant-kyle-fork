@@ -7,8 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 
 Deep research can optionally run DeepAgents `execute` calls through a sandbox provider
 (Modal, OpenShell, or any registered provider). Modal and OpenShell create a fresh physical
-sandbox per job. OpenShell binds the configured policy at creation and attests readiness plus
-the loaded policy revision before exposing the execution backend.
+sandbox per job. OpenShell binds the configured policy at creation and attests the authoritative
+effective policy source, content, hash, and active revision before exposing the execution backend.
 
 The sandbox is an internal execution detail. There are no sandbox-specific API
 endpoints, and job-level auth remains responsible for submit, stream, status,
@@ -27,7 +27,8 @@ runtime (`.../job/{job_id}/artifacts`), which is also auth-scoped to the job.
 - Providers are selected by config (`sandbox.provider` + `providers.<name>`); the
   provider is validated against the registry and gated by its declared capabilities.
   OpenShell policy YAML is parsed strictly against the installed SDK schema, applied in the
-  job's creation spec, checked against the declared network upper bound, and attested before use.
+  job's creation spec, checked against the declared network upper bound (hostless/CIDR overrides
+  are rejected), and attested through the gateway status/config RPCs before use.
 - Job IDs must satisfy each provider's object-name rules (Modal: 64 chars or fewer,
   alphanumeric plus dash/period/underscore).
 - `timeout` bounds individual execution. Other lifecycle controls are provider-dependent.
@@ -57,6 +58,9 @@ and [Production Considerations](../../deployment/production.md#artifact-storage)
 - The runtime closes provider sessions on success, failure, cancellation, and timeout.
 - Per-job OpenShell mode requires `delete_on_exit: true`. A persistent shared sandbox is
   possible only through the explicit debug attachment settings.
+- OpenShell provisioning (`setup_openshell.sh`) is separate from authenticated gateway
+  lifecycle (`start_openshell_gateway.sh`). The launcher rejects plaintext/raw gateways and
+  requires a successful disposable sandbox create/delete probe before AI-Q starts.
 
 ## Current Safeguards
 
