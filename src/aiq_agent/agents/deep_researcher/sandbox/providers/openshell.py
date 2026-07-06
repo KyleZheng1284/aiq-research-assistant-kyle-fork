@@ -37,6 +37,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -47,6 +48,7 @@ from deepagents.backends.sandbox import BaseSandbox
 from ..base import SandboxProvider
 from ..base import SandboxTerminatedError
 from ..capabilities import SandboxCapabilities
+from ..logging_utils import log_sandbox_failure
 from ..registry import register_sandbox_provider
 
 if TYPE_CHECKING:
@@ -337,6 +339,7 @@ class OpenShellSandboxProvider(SandboxProvider):
         self._os_context: object | None = None
         self._os_context_entering = False
         self._os_context_exit_requested = False
+        self._os_context_cleanup_complete: Event | None = None
         try:
             import langchain_nvidia_openshell  # noqa: F401
             import openshell  # noqa: F401
@@ -791,25 +794,29 @@ class OpenShellSandboxProvider(SandboxProvider):
 
     def _enter_context(self, ctx: object) -> None:
         """Enter an SDK context while allowing terminate() to request deferred cleanup."""
+        cleanup_complete = Event()
         with self._state_lock:
             if self._terminated:
                 raise SandboxTerminatedError(f"Sandbox {self.sandbox_name} has been terminated")
             if self._os_context is not None:
                 raise RuntimeError(f"OpenShell sandbox {self.sandbox_name} context creation is already in progress")
+            if self._os_context_cleanup_complete is not None and not self._os_context_cleanup_complete.is_set():
+                raise RuntimeError(f"OpenShell sandbox {self.sandbox_name} context cleanup is already in progress")
             self._os_context = ctx
             self._os_context_entering = True
             self._os_context_exit_requested = False
+            self._os_context_cleanup_complete = cleanup_complete
 
         try:
             ctx.__enter__()  # type: ignore[attr-defined]
         except BaseException:
-            self._finish_context_entry(ctx, entered=False)
+            self._finish_context_entry(ctx, cleanup_complete, entered=False)
             raise
 
-        if not self._finish_context_entry(ctx, entered=True):
+        if not self._finish_context_entry(ctx, cleanup_complete, entered=True):
             raise SandboxTerminatedError(f"Sandbox {self.sandbox_name} was closed during creation")
 
-    def _finish_context_entry(self, ctx: object, *, entered: bool) -> bool:
+    def _finish_context_entry(self, ctx: object, cleanup_complete: Event, *, entered: bool) -> bool:
         """Publish an entered context, or honor a pending teardown exactly once."""
         with self._state_lock:
             owns_context = self._os_context is ctx
@@ -823,7 +830,7 @@ class OpenShellSandboxProvider(SandboxProvider):
                 release_context = entered
 
         if release_context:
-            self._close_os_context(ctx)
+            self._close_os_context(ctx, cleanup_complete)
         return entered and owns_context and not release_context
 
     def _ensure_context_active(self, ctx: object) -> None:
@@ -834,26 +841,60 @@ class OpenShellSandboxProvider(SandboxProvider):
             raise SandboxTerminatedError(f"Sandbox {self.sandbox_name} was closed during creation")
 
     def _exit_context(self) -> None:
-        """Exit once, deferring deletion to the creator while ``__enter__`` is in flight."""
+        """Exit once and boundedly await creator-owned deletion during ``__enter__``."""
+        close_context: object | None = None
         with self._state_lock:
             ctx = self._os_context
+            cleanup_complete = self._os_context_cleanup_complete
             if ctx is None:
-                return
-            if self._os_context_entering:
+                wait_for_cleanup = cleanup_complete is not None and not cleanup_complete.is_set()
+            elif self._os_context_entering:
                 self._os_context_exit_requested = True
-                return
-            self._os_context = None
-            self._os_context_exit_requested = False
-        self._close_os_context(ctx)
+                if cleanup_complete is None:
+                    cleanup_complete = Event()
+                    self._os_context_cleanup_complete = cleanup_complete
+                wait_for_cleanup = True
+            else:
+                if cleanup_complete is None:
+                    cleanup_complete = Event()
+                    self._os_context_cleanup_complete = cleanup_complete
+                self._os_context = None
+                self._os_context_exit_requested = False
+                close_context = ctx
+                wait_for_cleanup = False
 
-    def _close_os_context(self, ctx: object) -> None:
+        if close_context is not None:
+            self._close_os_context(close_context, cleanup_complete)
+            return
+        if wait_for_cleanup and cleanup_complete is not None:
+            if not cleanup_complete.wait(timeout=self.config.providers.openshell.cleanup_timeout_seconds):
+                self._record_cleanup_failure("cleanup_timeout")
+                logger.warning(
+                    "OpenShell cleanup timed out: provider=%s sandbox=%s reason=cleanup_timeout",
+                    self.provider_name,
+                    self.sandbox_name,
+                )
+
+    def _close_os_context(self, ctx: object, cleanup_complete: Event) -> None:
         """Drive one detached SDK context exit without replacing the job result."""
-        if hasattr(ctx, "__exit__"):
-            try:
+        try:
+            if hasattr(ctx, "__exit__"):
                 ctx.__exit__(None, None, None)
-            except Exception:  # noqa: BLE001 - cleanup must never raise on the terminal path
-                self._cleanup_failed = True
-                logger.warning("OpenShell sandbox %s context cleanup failed", self.sandbox_name, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - cleanup must never raise on the terminal path
+            self._record_cleanup_failure("context_exit_failed")
+            log_sandbox_failure(
+                logger,
+                operation="context_exit",
+                reason_code="context_exit_failed",
+                exc=exc,
+                provider=self.provider_name,
+                sandbox=self.sandbox_name,
+            )
+        finally:
+            cleanup_complete.set()
+            with self._state_lock:
+                if self._os_context_cleanup_complete is cleanup_complete:
+                    self._os_context_cleanup_complete = None
 
 
 register_sandbox_provider("openshell", OpenShellSandboxProvider)

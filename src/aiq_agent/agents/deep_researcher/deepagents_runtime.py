@@ -38,6 +38,7 @@ from pydantic import model_validator
 from nat.data_models.function import FunctionBaseConfig
 
 from .sandbox.config import ArtifactCaptureConfig
+from .sandbox.logging_utils import log_sandbox_failure
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +286,14 @@ class DeepAgentsRuntime:
         try:
             manager.final_harvest()
         except Exception as exc:  # noqa: BLE001 - harvest is best-effort on the terminal path
-            logger.warning("Final artifact harvest failed for job %s (%s)", self._job_id, type(exc).__name__)
+            log_sandbox_failure(
+                logger,
+                operation="final_artifact_harvest",
+                reason_code="artifact_harvest_failed",
+                exc=exc,
+                provider=getattr(self._sandbox_provider, "provider_name", None),
+                sandbox=self._job_id,
+            )
 
     def close(self) -> None:
         """Release the sandbox provider on a normal terminal job path (idempotent)."""
@@ -371,6 +379,11 @@ class DeepAgentsRuntime:
                         "provider": getattr(self._sandbox_provider, "provider_name", None),
                         "sandbox": getattr(self._sandbox_provider, "physical_sandbox_name", None)
                         or getattr(self._sandbox_provider, "sandbox_name", None),
+                        "reason_codes": (
+                            list(getattr(self._sandbox_provider, "cleanup_failure_reason_codes", ()))
+                            if status == "failed"
+                            else []
+                        ),
                     },
                 }
             )

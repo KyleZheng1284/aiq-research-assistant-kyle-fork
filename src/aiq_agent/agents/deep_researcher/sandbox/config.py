@@ -24,6 +24,7 @@ is automatically accepted with no edits here.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 from typing import Literal
 
@@ -108,6 +109,11 @@ class OpenShellProviderConfig(BaseModel):
     )
     image: str = Field(default="aiq-openshell-demo:latest", description="OpenShell image identifier")
     ready_timeout_seconds: float = Field(default=300.0, description="Seconds to wait for the sandbox to become ready")
+    cleanup_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description="Seconds to wait for an in-flight OpenShell context teardown to finish.",
+    )
     delete_on_exit: bool = Field(default=True, description="Delete the sandbox when its session context closes")
     attest: bool = Field(default=True, description="Require READY state and a loaded policy revision before execution")
     expected_policy_version: int | None = Field(
@@ -123,6 +129,14 @@ class OpenShellProviderConfig(BaseModel):
         default=("bash", "-c"),
         description="Shell argv prefix passed to the langchain-nvidia-openshell adapter.",
     )
+
+    @field_validator("cleanup_timeout_seconds")
+    @classmethod
+    def _cleanup_timeout_must_be_finite(cls, value: float) -> float:
+        """Reject non-finite teardown deadlines that would defeat bounded finalization."""
+        if not math.isfinite(value):
+            raise ValueError("cleanup_timeout_seconds must be finite")
+        return value
 
     @model_validator(mode="after")
     def _validate_lifecycle_mode(self) -> OpenShellProviderConfig:

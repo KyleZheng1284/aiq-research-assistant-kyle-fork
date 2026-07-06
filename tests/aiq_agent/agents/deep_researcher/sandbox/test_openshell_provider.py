@@ -116,6 +116,7 @@ def _provider(**openshell_config: Any) -> OpenShellSandboxProvider:
     provider._os_context = None
     provider._os_context_entering = False
     provider._os_context_exit_requested = False
+    provider._os_context_cleanup_complete = None
     # Avoid real session creation: a non-None _session short-circuits _session_or_create.
     provider._session = MagicMock()  # type: ignore[assignment]
     return provider
@@ -879,12 +880,18 @@ def test_terminate_during_context_entry_defers_one_exit(tmp_path: Path) -> None:
         worker.start()
         assert entry_started.wait(timeout=2)
 
-        provider.terminate()
+        terminate_done = Event()
+        terminator = Thread(target=lambda: (provider.terminate(), terminate_done.set()))
+        terminator.start()
+        assert not terminate_done.wait(timeout=0.05)
         assert context.exit_calls == 0
         allow_entry.set()
         worker.join(timeout=2)
+        terminator.join(timeout=2)
 
     assert not worker.is_alive()
+    assert not terminator.is_alive()
+    assert terminate_done.is_set()
     assert len(errors) == 1 and isinstance(errors[0], SandboxTerminatedError)
     assert context.exit_calls == 1
     assert provider._session is None
@@ -1078,7 +1085,110 @@ def test_context_exit_failure_marks_cleanup_failed() -> None:
     provider.close()
 
     assert provider.cleanup_succeeded is False
+    assert provider.cleanup_failure_reason_codes == ("context_exit_failed",)
     assert provider._os_context is None
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_cleanup_timeout_must_be_positive_and_finite(timeout: float) -> None:
+    with pytest.raises(ValueError, match="cleanup_timeout_seconds"):
+        SandboxConfig(provider="openshell", providers={"openshell": {"cleanup_timeout_seconds": timeout}})
+
+
+def test_deferred_context_cleanup_timeout_is_terminal() -> None:
+    provider = _provider(cleanup_timeout_seconds=0.01)
+    provider._os_context = _FakeOpenShellSandbox()
+    provider._os_context_entering = True
+    provider._os_context_cleanup_complete = Event()
+
+    provider._exit_context()
+
+    assert provider.cleanup_succeeded is False
+    assert provider.cleanup_failure_reason_codes == ("cleanup_timeout",)
+    assert provider._os_context_exit_requested is True
+
+
+def test_finalize_waits_for_deferred_exit_failure(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepAgentsRuntime
+    from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepResearchSandboxConfig
+
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+    entry_started = Event()
+    allow_entry = Event()
+
+    class FailingExitContext(_FakeCreatedContext):
+        def __enter__(self):
+            self.enter_calls += 1
+            entry_started.set()
+            if not allow_entry.wait(timeout=2):
+                raise AssertionError("context entry was not released")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.exit_calls += 1
+            raise RuntimeError("credential=do-not-log")
+
+    context = FailingExitContext()
+    errors: list[BaseException] = []
+    finalize_results: list[bool] = []
+    events: list[dict[str, object]] = []
+
+    with (
+        _fake_optional_modules(lambda **_kwargs: context),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
+            return_value=_FAKE_POLICY,
+        ),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
+            return_value="job-spec",
+        ),
+    ):
+        provider = OpenShellSandboxProvider(
+            SandboxConfig(
+                provider="openshell",
+                providers={"openshell": {"policy": str(policy_path), "cleanup_timeout_seconds": 1}},
+            ),
+            "job-123",
+        )
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig(), artifact_emit=events.append)
+
+        def create() -> None:
+            try:
+                provider._session_or_create()
+            except BaseException as exc:  # noqa: BLE001 - capture worker outcome
+                errors.append(exc)
+
+        creator = Thread(target=create)
+        creator.start()
+        assert entry_started.wait(timeout=2)
+
+        finalizer = Thread(target=lambda: finalize_results.append(runtime.finalize(interrupted=True)))
+        with caplog.at_level("WARNING"):
+            finalizer.start()
+            assert finalizer.is_alive()
+            allow_entry.set()
+            creator.join(timeout=2)
+            finalizer.join(timeout=2)
+
+    assert not creator.is_alive()
+    assert not finalizer.is_alive()
+    assert finalize_results == [False]
+    assert len(errors) == 1 and isinstance(errors[0], SandboxTerminatedError)
+    assert context.exit_calls == 1
+    assert provider.cleanup_failure_reason_codes == ("context_exit_failed",)
+    assert [event["data"]["status"] for event in events] == ["started", "failed"]  # type: ignore[index]
+    assert events[-1]["data"]["reason_codes"] == ["context_exit_failed"]  # type: ignore[index]
+    assert "RuntimeError" in caplog.text
+    assert "credential=do-not-log" not in caplog.text
 
 
 def test_retry_cleanup_failure_remains_terminal_failure() -> None:
