@@ -159,6 +159,7 @@ class _FakeCreatedContext(_FakeOpenShellSandbox):
         )
         self._client = SimpleNamespace(
             get=MagicMock(return_value=self.sandbox),
+            health=MagicMock(return_value=SimpleNamespace(version="0.0.72")),
             _stub=SimpleNamespace(
                 GetSandboxPolicyStatus=MagicMock(return_value=status),
                 GetSandboxConfig=MagicMock(return_value=config),
@@ -590,6 +591,37 @@ def test_attestation_rejects_version_disagreement(field: str) -> None:
         config.version = 2
     else:
         context.sandbox.current_policy_version = 2
+
+    with pytest.raises(RuntimeError, match="version_mismatch"):
+        _run_attestation(context)
+
+
+def test_attestation_accepts_openshell_0072_zero_active_version_compatibility() -> None:
+    context = _FakeCreatedContext(policy_version=0)
+    status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
+    status.active_version = 0
+
+    result = _run_attestation(context)
+
+    assert result.policy_version == 1
+    context._client.health.assert_called_once_with()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("gateway_version", ["0.0.71", "0.0.73", ""])
+def test_attestation_rejects_zero_active_version_outside_openshell_0072(gateway_version: str) -> None:
+    context = _FakeCreatedContext(policy_version=0)
+    status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
+    status.active_version = 0
+    context._client.health.return_value.version = gateway_version  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="version_mismatch"):
+        _run_attestation(context)
+
+
+def test_attestation_rejects_zero_active_version_with_positive_current_version() -> None:
+    context = _FakeCreatedContext(policy_version=1)
+    status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
+    status.active_version = 0
 
     with pytest.raises(RuntimeError, match="version_mismatch"):
         _run_attestation(context)

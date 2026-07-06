@@ -648,25 +648,56 @@ class OpenShellSandboxProvider(SandboxProvider):
 
             active_version = getattr(status_response, "active_version", 0)
             config_version = getattr(config_response, "version", 0)
-            if not active_version or active_version != revision_version or active_version != config_version:
+            if not revision_version or revision_version != config_version:
                 self._fail_attestation(
                     phase=phase,
                     policy_version=revision_version,
                     assurance=assurance,
                     reason_code="version_mismatch",
                 )
-            for reported_version in (initial_policy_version, current_policy_version):
-                if isinstance(reported_version, int) and reported_version > 0 and reported_version != active_version:
+            # OpenShell 0.0.72 leaves both SandboxStatus.current_policy_version and
+            # GetSandboxPolicyStatus.active_version at zero for the initial policy,
+            # even though the LOADED revision and effective config agree on a positive
+            # version. Bind this compatibility path to that exact gateway release and
+            # require both generic status values to be zero; every positive value must
+            # still agree with the authoritative revision/config pair.
+            if active_version:
+                if active_version != revision_version:
                     self._fail_attestation(
                         phase=phase,
                         policy_version=revision_version,
                         assurance=assurance,
                         reason_code="version_mismatch",
                     )
-            if oscfg.expected_policy_version is not None and active_version != oscfg.expected_policy_version:
+            else:
+                zero_status_versions = all(
+                    isinstance(reported, int) and reported == 0
+                    for reported in (initial_policy_version, current_policy_version)
+                )
+                try:
+                    gateway_version = client.health().version
+                except Exception:  # noqa: BLE001 - compatibility detection must fail closed
+                    gateway_version = None
+                if not zero_status_versions or gateway_version != "0.0.72":
+                    self._fail_attestation(
+                        phase=phase,
+                        policy_version=revision_version,
+                        assurance=assurance,
+                        reason_code="version_mismatch",
+                    )
+            effective_version = revision_version
+            for reported_version in (initial_policy_version, current_policy_version):
+                if isinstance(reported_version, int) and reported_version > 0 and reported_version != effective_version:
+                    self._fail_attestation(
+                        phase=phase,
+                        policy_version=revision_version,
+                        assurance=assurance,
+                        reason_code="version_mismatch",
+                    )
+            if oscfg.expected_policy_version is not None and effective_version != oscfg.expected_policy_version:
                 self._fail_attestation(
                     phase=phase,
-                    policy_version=active_version,
+                    policy_version=effective_version,
                     assurance=assurance,
                     reason_code="expected_version_mismatch",
                 )
@@ -678,14 +709,14 @@ class OpenShellSandboxProvider(SandboxProvider):
                 if require_sandbox_source and policy_source != sandbox_pb2.POLICY_SOURCE_SANDBOX:
                     self._fail_attestation(
                         phase=phase,
-                        policy_version=active_version,
+                        policy_version=effective_version,
                         assurance=assurance,
                         reason_code="policy_source_mismatch",
                     )
                 if policy_source == sandbox_pb2.POLICY_SOURCE_UNSPECIFIED:
                     self._fail_attestation(
                         phase=phase,
-                        policy_version=active_version,
+                        policy_version=effective_version,
                         assurance=assurance,
                         reason_code="policy_source_mismatch",
                     )
@@ -694,7 +725,7 @@ class OpenShellSandboxProvider(SandboxProvider):
                 if config_policy != expected_policy or revision_policy != expected_policy:
                     self._fail_attestation(
                         phase=phase,
-                        policy_version=active_version,
+                        policy_version=effective_version,
                         assurance=assurance,
                         reason_code="policy_content_mismatch",
                     )
@@ -702,7 +733,7 @@ class OpenShellSandboxProvider(SandboxProvider):
                 if not policy_hash or not revision_hash:
                     self._fail_attestation(
                         phase=phase,
-                        policy_version=active_version,
+                        policy_version=effective_version,
                         assurance=assurance,
                         reason_code="policy_hash_missing",
                     )
@@ -714,14 +745,14 @@ class OpenShellSandboxProvider(SandboxProvider):
                 ):
                     self._fail_attestation(
                         phase=phase,
-                        policy_version=active_version,
+                        policy_version=effective_version,
                         assurance=assurance,
                         reason_code="policy_hash_mismatch",
                     )
 
             return _AttestationResult(
                 phase=phase,
-                policy_version=active_version,
+                policy_version=effective_version,
                 policy_hash=policy_hash or revision_hash or None,
                 policy_source=policy_source,
                 assurance=assurance,

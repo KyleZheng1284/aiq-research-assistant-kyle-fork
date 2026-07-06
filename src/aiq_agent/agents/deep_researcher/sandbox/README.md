@@ -45,6 +45,12 @@ alone is never treated as attestation. An optional `expected_policy_version` pro
 revision pin. Any creation or attestation failure closes the owning SDK context so the partially
 created sandbox is deleted.
 
+OpenShell 0.0.72 leaves both generic `current_policy_version` and authoritative
+`active_version` at zero for an initial per-sandbox policy. AI-Q accepts that compatibility case
+only when the gateway reports exactly 0.0.72 and the LOADED revision plus effective config agree
+on the same positive version, source, protobuf content, and deterministic hash. Positive status
+versions and every later gateway release remain subject to exact version agreement.
+
 OpenShell shared attachment remains available only as an explicit debug escape hatch:
 `existing_sandbox_name` plus `allow_shared_sandbox: true`. It is not a job isolation boundary
 and must not be used for mutually untrusted jobs. Production policy validation also requires

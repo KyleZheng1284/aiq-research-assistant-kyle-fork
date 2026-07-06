@@ -95,14 +95,19 @@ Deterministic live acceptance (no LLM or external research API involved):
 The probe fails unless the gateway service itself reports OpenShell `0.0.72`. It creates two
 jobs concurrently, proves they have distinct physical sandbox IDs and strict effective-policy
 source/content/hash attestation, cancels one, proves the other still executes, and then proves
-both were deleted.
-Success is four explicit lines:
+both were deleted. It also deletes a sandbox after an intentional command failure, injects a
+credential-like exception canary and proves it is absent from captured AI-Q logs/events, and
+rejects a shared-debug attachment whose claimed policy differs from the effective policy.
+Success is seven explicit lines:
 
 ```text
 PASS gateway version: 0.0.72
 PASS distinct attested sandboxes: A=<name>@r<revision>, B=<name>@r<revision>
 PASS cancellation isolation: A deleted; B remained usable
 PASS terminal cleanup: both probe sandboxes deleted
+PASS failure cleanup: failed job sandbox deleted
+PASS log redaction: credential canary absent from captured logs and events
+PASS shared-policy rejection: mismatched attachment denied and probe deleted
 ```
 
 On a non-production local host that intentionally uses the generated `best_effort` policy:

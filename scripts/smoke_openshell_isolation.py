@@ -11,17 +11,25 @@ OpenShell provider against a real gateway, using fixed shell commands as the ora
 from __future__ import annotations
 
 import argparse
+import copy
+import io
+import json
+import logging
 import os
 import shlex
 import sys
+import tempfile
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
 import grpc
+import yaml
 
 from aiq_agent.agents.deep_researcher.sandbox import SandboxConfig
 from aiq_agent.agents.deep_researcher.sandbox import create_sandbox_backend
+from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _build_sandbox_spec
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _deterministic_policy_hash
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _parse_policy_proto
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _policy_network_hosts
@@ -132,25 +140,35 @@ def main() -> int:
     job_ids = (f"aiq-isolation-a-{suffix}", f"aiq-isolation-b-{suffix}")
     events: tuple[list[dict[str, object]], list[dict[str, object]]] = ([], [])
 
-    def provider(job_id: str, sink: list[dict[str, object]]):
+    def provider(
+        job_id: str,
+        emitter: Callable[[dict[str, object]], None],
+        *,
+        configured_policy: Path = policy_path,
+        shared_name: str | None = None,
+    ):
+        openshell_config: dict[str, object] = {
+            "gateway": args.gateway,
+            "policy": str(configured_policy),
+            "image": args.image,
+            "require_hard_landlock": require_hard_landlock,
+        }
+        if shared_name is not None:
+            openshell_config.update(
+                existing_sandbox_name=shared_name,
+                allow_shared_sandbox=True,
+            )
         config = SandboxConfig(
             provider="openshell",
             workdir="/sandbox",
             network=network,
-            providers={
-                "openshell": {
-                    "gateway": args.gateway,
-                    "policy": str(policy_path),
-                    "image": args.image,
-                    "require_hard_landlock": require_hard_landlock,
-                }
-            },
+            providers={"openshell": openshell_config},
         )
         created = create_sandbox_backend(config, job_id)
-        created.set_event_emitter(sink.append)
+        created.set_event_emitter(emitter)
         return created
 
-    sandboxes = (provider(job_ids[0], events[0]), provider(job_ids[1], events[1]))
+    sandboxes = (provider(job_ids[0], events[0].append), provider(job_ids[1], events[1].append))
     markers = (f"owner-a-{suffix}", f"owner-b-{suffix}")
 
     def initialize(index: int) -> str:
@@ -196,6 +214,108 @@ def main() -> int:
     finally:
         for sandbox in sandboxes:
             sandbox.terminate()
+
+    # Prove that a failed job still reaches terminal deletion and that an exception
+    # containing a credential-like canary cannot enter AI-Q logs or events.
+    secret_canary = f"credential=aiq-smoke-{suffix}"
+    captured_logs = io.StringIO()
+    capture_handler = logging.StreamHandler(captured_logs)
+    capture_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    root_logger = logging.getLogger()
+    root_logger.addHandler(capture_handler)
+    redaction_events: list[dict[str, object]] = []
+
+    def fail_event_delivery(event: dict[str, object]) -> None:
+        redaction_events.append(event)
+        raise RuntimeError(secret_canary)
+
+    failed_sandbox = provider(f"aiq-isolation-failure-{suffix}", fail_event_delivery)
+    failed_name: str | None = None
+    try:
+        result = failed_sandbox.execute("exit 23", timeout=30)
+        failed_name = failed_sandbox.physical_sandbox_name
+        if result.exit_code != 23:
+            raise AssertionError(f"failure probe returned unexpected exit code {result.exit_code}")
+        failed_sandbox.close()
+        with SandboxClient.from_active_cluster(cluster=args.gateway) as client:
+            _assert_deleted(client, failed_name)
+    finally:
+        failed_sandbox.terminate()
+        root_logger.removeHandler(capture_handler)
+        capture_handler.close()
+    if secret_canary in captured_logs.getvalue() or secret_canary in json.dumps(redaction_events):
+        raise AssertionError("credential canary appeared in captured AI-Q logs or events")
+    print("PASS failure cleanup: failed job sandbox deleted")
+    print("PASS log redaction: credential canary absent from captured logs and events")
+
+    # Create a shared debug sandbox with the submitted policy, then prove that an
+    # attachment claiming a structurally different policy fails strict attestation.
+    mismatch_data = copy.deepcopy(policy_data)
+    filesystem = mismatch_data.get("filesystem_policy") or mismatch_data.get("filesystem")
+    if not isinstance(filesystem, dict):
+        raise AssertionError("policy has no filesystem section for the mismatch probe")
+    read_only = list(filesystem.get("read_only") or [])
+    read_only.append("/__aiq_attestation_mismatch__")
+    filesystem["read_only"] = read_only
+
+    shared_name: str | None = None
+    mismatch_provider = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="aiq-openshell-smoke-") as temp_dir:
+            mismatch_path = Path(temp_dir) / "mismatched-policy.yaml"
+            mismatch_path.write_text(yaml.safe_dump(mismatch_data, sort_keys=False), encoding="utf-8")
+            with SandboxClient.from_active_cluster(cluster=args.gateway) as client:
+                shared_ref = client.create(
+                    spec=_build_sandbox_spec(
+                        policy=expected_policy,
+                        image=args.image,
+                        job_id=f"aiq-shared-mismatch-{suffix}",
+                    )
+                )
+                shared_name = shared_ref.name
+                client.wait_ready(shared_name)
+
+            mismatch_events: list[dict[str, object]] = []
+            mismatch_provider = provider(
+                f"aiq-mismatched-attach-{suffix}",
+                mismatch_events.append,
+                configured_policy=mismatch_path,
+                shared_name=shared_name,
+            )
+            try:
+                mismatch_provider.execute("true", timeout=30)
+            except RuntimeError as exc:
+                if "policy_content_mismatch" not in str(exc):
+                    raise AssertionError("shared policy mismatch failed for an unexpected reason") from exc
+            else:
+                raise AssertionError("shared sandbox accepted a mismatched policy")
+
+            with SandboxClient.from_active_cluster(cluster=args.gateway) as client:
+                client.get(shared_name)
+            if any(
+                isinstance(event.get("data"), dict) and event["data"].get("status") == "succeeded"
+                for event in mismatch_events
+            ):
+                raise AssertionError("mismatched shared policy emitted attestation success")
+    finally:
+        if mismatch_provider is not None:
+            mismatch_provider.terminate()
+        if shared_name is not None:
+            with SandboxClient.from_active_cluster(cluster=args.gateway) as client:
+                try:
+                    client.get(shared_name)
+                except grpc.RpcError as exc:
+                    if not isinstance(exc, grpc.Call) or exc.code() != grpc.StatusCode.NOT_FOUND:
+                        raise
+                else:
+                    if not client.delete(shared_name):
+                        raise AssertionError("shared mismatch probe could not be deleted")
+                    client.wait_deleted(shared_name)
+    if shared_name is None:
+        raise AssertionError("shared mismatch probe was not created")
+    with SandboxClient.from_active_cluster(cluster=args.gateway) as client:
+        _assert_deleted(client, shared_name)
+    print("PASS shared-policy rejection: mismatched attachment denied and probe deleted")
 
     return 0
 
