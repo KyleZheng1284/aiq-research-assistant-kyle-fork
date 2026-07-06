@@ -369,7 +369,10 @@ def test_allowlist_rejects_allowed_ip_overrides(cidr: str) -> None:
 
 
 def test_deterministic_policy_hash_matches_openshell_0072_contract() -> None:
-    assert _FAKE_POLICY_HASH == "b9ae64d4c78cc3620a039abe77aeb8742b88937561e4467faf6cc4312fbf7e99"
+    assert (
+        _FAKE_POLICY_HASH
+        == "b9ae64d4c78cc3620a039abe77aeb8742b88937561e4467faf6cc4312fbf7e99"  # pragma: allowlist secret
+    )
 
 
 def test_per_job_session_uses_policy_spec_and_attests_before_return(
