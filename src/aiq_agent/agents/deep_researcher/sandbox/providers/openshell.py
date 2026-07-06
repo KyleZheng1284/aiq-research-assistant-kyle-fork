@@ -30,10 +30,12 @@ install it from a git spec (see ``scripts/setup_openshell.sh`` /
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
@@ -226,22 +228,86 @@ def _policy_network_hosts(policy_data: dict[str, Any]) -> set[str]:
             continue
         for endpoint in endpoints:
             if isinstance(endpoint, dict) and isinstance(endpoint.get("host"), str):
-                hosts.add(endpoint["host"].lower().rstrip("."))
+                host = endpoint["host"].strip().lower().rstrip(".")
+                if host:
+                    hosts.add(host)
     return hosts
+
+
+def _policy_network_endpoints(policy_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return validated endpoint mappings from every OpenShell network policy."""
+    policies = policy_data.get("network_policies") or {}
+    if not isinstance(policies, dict):
+        return []
+    endpoints: list[dict[str, Any]] = []
+    for policy in policies.values():
+        if not isinstance(policy, dict):
+            continue
+        entries = policy.get("endpoints") or []
+        if isinstance(entries, list):
+            endpoints.extend(endpoint for endpoint in entries if isinstance(endpoint, dict))
+    return endpoints
 
 
 def _validate_policy_network(policy_data: dict[str, Any], *, mode: str, allow: tuple[str, ...]) -> None:
     """Fail closed when the policy grants more egress than the public config declares."""
+    endpoints = _policy_network_endpoints(policy_data)
     policy_hosts = _policy_network_hosts(policy_data)
-    if mode == "blocked" and policy_hosts:
-        raise ValueError(
-            f"OpenShell policy grants network endpoints while sandbox.network is 'blocked': {sorted(policy_hosts)}"
-        )
+    if mode == "blocked" and endpoints:
+        raise ValueError("OpenShell policy grants network endpoints while sandbox.network is 'blocked'")
     if mode == "allowlist":
-        configured_hosts = {host.lower().rstrip(".") for host in allow}
+        for endpoint in endpoints:
+            host = endpoint.get("host")
+            if not isinstance(host, str) or not host.strip().rstrip("."):
+                raise ValueError("OpenShell allowlist endpoints require a non-empty host")
+            allowed_ips = endpoint.get("allowed_ips") or []
+            if allowed_ips:
+                raise ValueError("OpenShell allowed_ips/CIDR endpoints require an explicit public CIDR contract")
+        configured_hosts = {host.strip().lower().rstrip(".") for host in allow}
         unexpected = policy_hosts - configured_hosts
         if unexpected:
             raise ValueError(f"OpenShell policy grants hosts outside sandbox.network.allow: {sorted(unexpected)}")
+
+
+def _serialize_proto(message: Any) -> bytes:
+    """Serialize one protobuf message deterministically, with a test-double fallback."""
+    try:
+        return message.SerializeToString(deterministic=True)
+    except TypeError:
+        return message.SerializeToString()
+
+
+def _has_message_field(message: Any, field: str) -> bool:
+    """Return protobuf message-field presence without assuming a concrete SDK class."""
+    try:
+        return bool(message.HasField(field))
+    except (AttributeError, ValueError):
+        return getattr(message, field, None) is not None
+
+
+def _deterministic_policy_hash(policy: Any) -> str:
+    """Compute OpenShell 0.0.72's canonical SHA-256 policy hash."""
+    hasher = hashlib.sha256()
+    hasher.update(int(getattr(policy, "version", 0)).to_bytes(4, byteorder="little", signed=False))
+    for field in ("filesystem", "landlock", "process"):
+        if _has_message_field(policy, field):
+            hasher.update(_serialize_proto(getattr(policy, field)))
+    policies = getattr(policy, "network_policies", {})
+    for key in sorted(policies):
+        hasher.update(str(key).encode())
+        hasher.update(_serialize_proto(policies[key]))
+    return hasher.hexdigest()
+
+
+@dataclass(frozen=True)
+class _AttestationResult:
+    """Secret-free proof returned only after authoritative policy checks pass."""
+
+    phase: object
+    policy_version: int
+    policy_hash: str | None
+    policy_source: object | None
+    assurance: str
 
 
 def _build_sandbox_spec(*, policy: Any, image: str, job_id: str) -> Any:
@@ -381,6 +447,16 @@ class OpenShellSandboxProvider(SandboxProvider):
             "ready_timeout_seconds": oscfg.ready_timeout_seconds,
         }
         shared_name = oscfg.shared_sandbox_name
+        expected_policy: Any | None = None
+        if oscfg.policy:
+            policy_data = _read_policy_data(oscfg.policy, require_hard_landlock=oscfg.require_hard_landlock)
+            _validate_policy_network(
+                policy_data,
+                mode=cfg.network.mode,
+                allow=cfg.network.allow,
+            )
+            expected_policy = _parse_policy_proto(policy_data, policy_path=oscfg.policy)
+
         if shared_name is not None:
             logger.warning(
                 "OpenShell shared-sandbox debug attachment enabled: sandbox=%s job=%s; physical job isolation is off",
@@ -391,17 +467,10 @@ class OpenShellSandboxProvider(SandboxProvider):
             # that this job did not create.
             sandbox_kwargs.update(sandbox=shared_name, delete_on_exit=False)
         else:
-            if not oscfg.policy:
+            if expected_policy is None:
                 raise ValueError("Per-job OpenShell creation requires a policy file")
-            policy_data = _read_policy_data(oscfg.policy, require_hard_landlock=oscfg.require_hard_landlock)
-            _validate_policy_network(
-                policy_data,
-                mode=cfg.network.mode,
-                allow=cfg.network.allow,
-            )
-            policy = _parse_policy_proto(policy_data, policy_path=oscfg.policy)
             sandbox_kwargs.update(
-                spec=_build_sandbox_spec(policy=policy, image=oscfg.image, job_id=self.job_id),
+                spec=_build_sandbox_spec(policy=expected_policy, image=oscfg.image, job_id=self.job_id),
                 delete_on_exit=oscfg.delete_on_exit,
             )
 
@@ -411,7 +480,11 @@ class OpenShellSandboxProvider(SandboxProvider):
         try:
             self._ensure_context_active(os_sandbox)
             self.physical_sandbox_name = getattr(os_sandbox.sandbox, "name", None)
-            phase, policy_version = self._attest(os_sandbox)
+            attestation = self._attest(
+                os_sandbox,
+                expected_policy=expected_policy,
+                require_sandbox_source=shared_name is None,
+            )
             self._ensure_context_active(os_sandbox)
             backend = OpenShellSandbox(sandbox=os_sandbox, timeout=cfg.timeout, shell=oscfg.shell)
             self._ensure_context_active(os_sandbox)
@@ -420,18 +493,24 @@ class OpenShellSandboxProvider(SandboxProvider):
                 "OpenShell sandbox attested: id=%s name=%s policy_version=%s shared=%s",
                 backend.id,
                 getattr(sandbox_ref, "name", None),
-                policy_version,
+                attestation.policy_version,
                 shared_name is not None,
             )
-            self._emit_attestation(phase=phase, policy_version=policy_version, status="succeeded")
+            self._emit_attestation(attestation=attestation, status="succeeded")
             return backend
         except BaseException:
             self._safe_close(backend)
             self._exit_context()
             raise
 
-    def _attest(self, os_sandbox: Any) -> tuple[object, object]:
-        """Fail closed unless the entered sandbox is READY with the expected policy revision."""
+    def _attest(
+        self,
+        os_sandbox: Any,
+        *,
+        expected_policy: Any | None,
+        require_sandbox_source: bool,
+    ) -> _AttestationResult:
+        """Fail closed unless authoritative RPCs prove the effective policy."""
         try:
             from openshell._proto import openshell_pb2
         except ImportError as exc:
@@ -441,67 +520,239 @@ class OpenShellSandboxProvider(SandboxProvider):
         phase = getattr(sandbox_ref, "phase", None)
         policy_version = getattr(sandbox_ref, "current_policy_version", 0)
         if phase != openshell_pb2.SANDBOX_PHASE_READY:
-            self._emit_attestation(phase=phase, policy_version=policy_version, status="failed")
-            raise RuntimeError(f"OpenShell sandbox attestation failed: phase={phase!r} is not READY")
+            self._fail_attestation(
+                phase=phase,
+                policy_version=policy_version,
+                assurance="strict" if expected_policy is not None else "reduced",
+                reason_code="not_ready",
+            )
 
         oscfg = self.config.providers.openshell
-        if oscfg.attest and (not isinstance(policy_version, int) or policy_version <= 0):
-            phase, policy_version = self._wait_for_loaded_policy(os_sandbox, sandbox_ref)
-            if phase != openshell_pb2.SANDBOX_PHASE_READY:
-                self._emit_attestation(phase=phase, policy_version=policy_version, status="failed")
-                raise RuntimeError(f"OpenShell sandbox attestation failed: phase={phase!r} is not READY")
-        if oscfg.attest and (not isinstance(policy_version, int) or policy_version <= 0):
-            self._emit_attestation(phase=phase, policy_version=policy_version, status="failed")
-            raise RuntimeError("OpenShell sandbox attestation failed: no loaded policy revision")
-        if oscfg.expected_policy_version is not None and policy_version != oscfg.expected_policy_version:
-            self._emit_attestation(phase=phase, policy_version=policy_version, status="failed")
-            raise RuntimeError(
-                "OpenShell sandbox attestation failed: "
-                f"policy revision {policy_version!r} != expected {oscfg.expected_policy_version}"
+        assurance = "strict" if expected_policy is not None else "reduced"
+        if not oscfg.attest:
+            return _AttestationResult(
+                phase=phase,
+                policy_version=policy_version if isinstance(policy_version, int) else 0,
+                policy_hash=None,
+                policy_source=None,
+                assurance=assurance,
             )
-        return phase, policy_version
+        return self._wait_for_authoritative_policy(
+            os_sandbox,
+            sandbox_ref,
+            expected_policy=expected_policy,
+            require_sandbox_source=require_sandbox_source,
+            assurance=assurance,
+        )
 
-    def _wait_for_loaded_policy(self, os_sandbox: Any, sandbox_ref: Any) -> tuple[object, object]:
-        """Wait for READY plus a loaded policy revision on OpenShell 0.0.72."""
+    def _wait_for_authoritative_policy(
+        self,
+        os_sandbox: Any,
+        sandbox_ref: Any,
+        *,
+        expected_policy: Any | None,
+        require_sandbox_source: bool,
+        assurance: str,
+    ) -> _AttestationResult:
+        """Verify status, effective policy, provenance, version, and hash via 0.0.72 RPCs."""
         from openshell._proto import openshell_pb2
+        from openshell._proto import sandbox_pb2
 
         oscfg = self.config.providers.openshell
         phase = getattr(sandbox_ref, "phase", None)
-        policy_version = getattr(sandbox_ref, "current_policy_version", 0)
+        initial_policy_version = getattr(sandbox_ref, "current_policy_version", 0)
         client = getattr(os_sandbox, "_client", None)
-        # OpenShell 0.0.72 does not expose policy status on SandboxClient even though the
-        # generated RPC is authoritative; isolate that compatibility access here.
         stub = getattr(client, "_stub", None)
-        if client is None or stub is None or not hasattr(stub, "GetSandboxPolicyStatus"):
-            return phase, policy_version
+        if (
+            client is None
+            or stub is None
+            or not hasattr(stub, "GetSandboxPolicyStatus")
+            or not hasattr(stub, "GetSandboxConfig")
+        ):
+            self._fail_attestation(
+                phase=phase,
+                policy_version=initial_policy_version,
+                assurance=assurance,
+                reason_code="rpc_unavailable",
+            )
 
-        request = openshell_pb2.GetSandboxPolicyStatusRequest(name=sandbox_ref.name, version=0)
+        status_request = openshell_pb2.GetSandboxPolicyStatusRequest(name=sandbox_ref.name, version=0)
+        sandbox_id = getattr(sandbox_ref, "id", None) or sandbox_ref.name
+        config_request = sandbox_pb2.GetSandboxConfigRequest(sandbox_id=sandbox_id)
         deadline = time.monotonic() + oscfg.ready_timeout_seconds
         while True:
             self._ensure_context_active(os_sandbox)
-            sandbox_ref = client.get(sandbox_ref.name)
-            phase = getattr(sandbox_ref, "phase", None)
-            policy_version = getattr(sandbox_ref, "current_policy_version", 0)
-            if phase == openshell_pb2.SANDBOX_PHASE_READY and policy_version > 0:
-                return phase, policy_version
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return phase, policy_version
+                self._fail_attestation(
+                    phase=phase,
+                    policy_version=initial_policy_version,
+                    assurance=assurance,
+                    reason_code="attestation_timeout",
+                )
 
-            response = stub.GetSandboxPolicyStatus(request, timeout=min(5.0, remaining))
-            revision = getattr(response, "revision", None)
+            try:
+                refreshed = client.get(sandbox_ref.name)
+                phase = getattr(refreshed, "phase", None)
+                current_policy_version = getattr(refreshed, "current_policy_version", 0)
+                status_response = stub.GetSandboxPolicyStatus(status_request, timeout=min(5.0, remaining))
+            except Exception:  # noqa: BLE001 - SDK errors must not escape with credential-bearing details
+                self._fail_attestation(
+                    phase=phase,
+                    policy_version=initial_policy_version,
+                    assurance=assurance,
+                    reason_code="rpc_failed",
+                )
+
+            if phase != openshell_pb2.SANDBOX_PHASE_READY:
+                self._fail_attestation(
+                    phase=phase,
+                    policy_version=current_policy_version,
+                    assurance=assurance,
+                    reason_code="not_ready",
+                )
+
+            revision = getattr(status_response, "revision", None)
             revision_status = getattr(revision, "status", openshell_pb2.POLICY_STATUS_UNSPECIFIED)
-            if revision_status == openshell_pb2.POLICY_STATUS_LOADED:
-                policy_version = getattr(revision, "version", 0)
-                if phase == openshell_pb2.SANDBOX_PHASE_READY and policy_version > 0:
-                    return phase, policy_version
-            elif revision_status == openshell_pb2.POLICY_STATUS_FAILED:
-                return phase, 0
-            if phase == openshell_pb2.SANDBOX_PHASE_ERROR:
-                return phase, policy_version
-            time.sleep(min(0.5, remaining))
+            revision_version = getattr(revision, "version", 0)
+            if getattr(revision, "load_error", ""):
+                self._fail_attestation(
+                    phase=phase,
+                    policy_version=revision_version,
+                    assurance=assurance,
+                    reason_code="policy_load_error",
+                )
+            if revision_status == openshell_pb2.POLICY_STATUS_FAILED:
+                self._fail_attestation(
+                    phase=phase,
+                    policy_version=revision_version,
+                    assurance=assurance,
+                    reason_code="policy_status_failed",
+                )
+            if revision_status != openshell_pb2.POLICY_STATUS_LOADED:
+                time.sleep(min(0.5, remaining))
+                continue
 
-    def _emit_attestation(self, *, phase: object, policy_version: object, status: str) -> None:
+            try:
+                config_response = stub.GetSandboxConfig(config_request, timeout=min(5.0, remaining))
+            except Exception:  # noqa: BLE001 - SDK errors must not escape with credential-bearing details
+                self._fail_attestation(
+                    phase=phase,
+                    policy_version=revision_version,
+                    assurance=assurance,
+                    reason_code="rpc_failed",
+                )
+
+            active_version = getattr(status_response, "active_version", 0)
+            config_version = getattr(config_response, "version", 0)
+            if not active_version or active_version != revision_version or active_version != config_version:
+                self._fail_attestation(
+                    phase=phase,
+                    policy_version=revision_version,
+                    assurance=assurance,
+                    reason_code="version_mismatch",
+                )
+            for reported_version in (initial_policy_version, current_policy_version):
+                if isinstance(reported_version, int) and reported_version > 0 and reported_version != active_version:
+                    self._fail_attestation(
+                        phase=phase,
+                        policy_version=revision_version,
+                        assurance=assurance,
+                        reason_code="version_mismatch",
+                    )
+            if oscfg.expected_policy_version is not None and active_version != oscfg.expected_policy_version:
+                self._fail_attestation(
+                    phase=phase,
+                    policy_version=active_version,
+                    assurance=assurance,
+                    reason_code="expected_version_mismatch",
+                )
+
+            policy_source = getattr(config_response, "policy_source", sandbox_pb2.POLICY_SOURCE_UNSPECIFIED)
+            policy_hash = getattr(config_response, "policy_hash", "")
+            revision_hash = getattr(revision, "policy_hash", "")
+            if expected_policy is not None:
+                if require_sandbox_source and policy_source != sandbox_pb2.POLICY_SOURCE_SANDBOX:
+                    self._fail_attestation(
+                        phase=phase,
+                        policy_version=active_version,
+                        assurance=assurance,
+                        reason_code="policy_source_mismatch",
+                    )
+                if policy_source == sandbox_pb2.POLICY_SOURCE_UNSPECIFIED:
+                    self._fail_attestation(
+                        phase=phase,
+                        policy_version=active_version,
+                        assurance=assurance,
+                        reason_code="policy_source_mismatch",
+                    )
+                config_policy = getattr(config_response, "policy", None)
+                revision_policy = getattr(revision, "policy", None)
+                if config_policy != expected_policy or revision_policy != expected_policy:
+                    self._fail_attestation(
+                        phase=phase,
+                        policy_version=active_version,
+                        assurance=assurance,
+                        reason_code="policy_content_mismatch",
+                    )
+                expected_hash = _deterministic_policy_hash(expected_policy)
+                if not policy_hash or not revision_hash:
+                    self._fail_attestation(
+                        phase=phase,
+                        policy_version=active_version,
+                        assurance=assurance,
+                        reason_code="policy_hash_missing",
+                    )
+                if (
+                    policy_hash != revision_hash
+                    or policy_hash != expected_hash
+                    or _deterministic_policy_hash(config_policy) != expected_hash
+                    or _deterministic_policy_hash(revision_policy) != expected_hash
+                ):
+                    self._fail_attestation(
+                        phase=phase,
+                        policy_version=active_version,
+                        assurance=assurance,
+                        reason_code="policy_hash_mismatch",
+                    )
+
+            return _AttestationResult(
+                phase=phase,
+                policy_version=active_version,
+                policy_hash=policy_hash or revision_hash or None,
+                policy_source=policy_source,
+                assurance=assurance,
+            )
+
+    def _fail_attestation(
+        self,
+        *,
+        phase: object,
+        policy_version: object,
+        assurance: str,
+        reason_code: str,
+    ) -> None:
+        """Emit one classified failure and raise without SDK or policy details."""
+        self._emit_attestation(
+            attestation=_AttestationResult(
+                phase=phase,
+                policy_version=policy_version if isinstance(policy_version, int) else 0,
+                policy_hash=None,
+                policy_source=None,
+                assurance=assurance,
+            ),
+            status="failed",
+            reason_code=reason_code,
+        )
+        raise RuntimeError(f"OpenShell sandbox attestation failed: {reason_code}")
+
+    def _emit_attestation(
+        self,
+        *,
+        attestation: _AttestationResult,
+        status: str,
+        reason_code: str | None = None,
+    ) -> None:
         """Emit a secret-free OpenShell attestation outcome."""
         self._emit_event(
             {
@@ -509,8 +760,12 @@ class OpenShellSandboxProvider(SandboxProvider):
                 "data": {
                     "provider": self.provider_name,
                     "sandbox": getattr(self, "physical_sandbox_name", None) or self.sandbox_name,
-                    "phase": phase,
-                    "policy_version": policy_version,
+                    "phase": attestation.phase,
+                    "policy_version": attestation.policy_version,
+                    "policy_hash": attestation.policy_hash,
+                    "policy_source": attestation.policy_source,
+                    "assurance": attestation.assurance,
+                    "reason_code": reason_code,
                     "status": status,
                 },
             }

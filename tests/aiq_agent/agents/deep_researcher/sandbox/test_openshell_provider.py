@@ -38,6 +38,7 @@ from aiq_agent.agents.deep_researcher.sandbox.base import SandboxTerminatedError
 from aiq_agent.agents.deep_researcher.sandbox.config import SandboxConfig
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import OpenShellSandboxProvider
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _build_sandbox_spec
+from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _deterministic_policy_hash
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _parse_policy_proto
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _read_policy_data
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _validate_policy_network
@@ -48,6 +49,40 @@ class _ExecResult:
     exit_code: int
     stdout: str = ""
     stderr: str = ""
+
+
+@dataclass(frozen=True)
+class _FakeProtoPart:
+    """Small deterministic protobuf stand-in used without the optional SDK."""
+
+    payload: bytes
+
+    def SerializeToString(self, *, deterministic: bool = False) -> bytes:  # noqa: N802 - protobuf API
+        del deterministic
+        return self.payload
+
+
+class _FakePolicy:
+    """Structural stand-in for the OpenShell SandboxPolicy protobuf."""
+
+    __hash__ = None
+
+    def __init__(self, *, version: int = 1, network_policies: dict[str, _FakeProtoPart] | None = None) -> None:
+        self.version = version
+        self.filesystem = _FakeProtoPart(b"filesystem")
+        self.landlock = _FakeProtoPart(b"landlock")
+        self.process = _FakeProtoPart(b"process")
+        self.network_policies = network_policies or {}
+
+    def HasField(self, field: str) -> bool:  # noqa: N802 - protobuf API
+        return getattr(self, field, None) is not None
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _FakePolicy) and vars(self) == vars(other)
+
+
+_FAKE_POLICY = _FakePolicy()
+_FAKE_POLICY_HASH = _deterministic_policy_hash(_FAKE_POLICY)
 
 
 class _FakeOpenShellSandbox:
@@ -89,13 +124,44 @@ def _provider(**openshell_config: Any) -> OpenShellSandboxProvider:
 class _FakeCreatedContext(_FakeOpenShellSandbox):
     """Entered SDK context with a public sandbox reference for attestation."""
 
-    def __init__(self, *, phase: int = 2, policy_version: int = 1, name: str = "generated") -> None:
+    def __init__(
+        self,
+        *,
+        phase: int = 2,
+        policy_version: int = 1,
+        name: str = "generated",
+        policy: _FakePolicy = _FAKE_POLICY,
+        policy_source: int = 1,
+    ) -> None:
         super().__init__()
         self.enter_calls = 0
         self.sandbox = SimpleNamespace(
+            id=f"{name}-id",
             phase=phase,
             current_policy_version=policy_version,
             name=name,
+        )
+        revision_version = policy_version if policy_version > 0 else 1
+        revision = SimpleNamespace(
+            version=revision_version,
+            status=2,
+            load_error="",
+            policy_hash=_deterministic_policy_hash(policy),
+            policy=policy,
+        )
+        status = SimpleNamespace(revision=revision, active_version=revision_version)
+        config = SimpleNamespace(
+            version=revision_version,
+            policy_hash=_deterministic_policy_hash(policy),
+            policy=policy,
+            policy_source=policy_source,
+        )
+        self._client = SimpleNamespace(
+            get=MagicMock(return_value=self.sandbox),
+            _stub=SimpleNamespace(
+                GetSandboxPolicyStatus=MagicMock(return_value=status),
+                GetSandboxConfig=MagicMock(return_value=config),
+            ),
         )
 
     def __enter__(self):
@@ -127,6 +193,12 @@ def _fake_optional_modules(context_factory, adapter_cls: type = _FakeAdapter):
         POLICY_STATUS_LOADED=2,
         POLICY_STATUS_FAILED=3,
         GetSandboxPolicyStatusRequest=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    proto_module.sandbox_pb2 = SimpleNamespace(  # type: ignore[attr-defined]
+        POLICY_SOURCE_UNSPECIFIED=0,
+        POLICY_SOURCE_SANDBOX=1,
+        POLICY_SOURCE_GLOBAL=2,
+        GetSandboxConfigRequest=lambda **kwargs: SimpleNamespace(**kwargs),
     )
     with patch.dict(
         sys.modules,
@@ -268,6 +340,36 @@ def test_policy_network_must_not_exceed_declared_allowlist() -> None:
         _validate_policy_network(policy, mode="blocked", allow=())
 
 
+@pytest.mark.parametrize("host", [None, "", "   ", "."])
+def test_allowlist_rejects_hostless_endpoints(host: str | None) -> None:
+    endpoint: dict[str, object] = {"allowed_ips": ["0.0.0.0/0"]}
+    if host is not None:
+        endpoint["host"] = host
+    policy = {"network_policies": {"cidr": {"endpoints": [endpoint]}}}
+
+    with pytest.raises(ValueError, match="non-empty host"):
+        _validate_policy_network(policy, mode="allowlist", allow=("api.github.com",))
+    with pytest.raises(ValueError, match="network endpoints"):
+        _validate_policy_network(policy, mode="blocked", allow=())
+
+
+@pytest.mark.parametrize("cidr", ["0.0.0.0/0", "10.0.0.0/8", "::/0", "2001:db8::/32"])
+def test_allowlist_rejects_allowed_ip_overrides(cidr: str) -> None:
+    policy = {
+        "network_policies": {
+            "mixed": {"endpoints": [{"host": "api.github.com", "allowed_ips": [cidr]}]},
+        }
+    }
+
+    with pytest.raises(ValueError, match="CIDR"):
+        _validate_policy_network(policy, mode="allowlist", allow=("api.github.com",))
+    _validate_policy_network(policy, mode="open", allow=())
+
+
+def test_deterministic_policy_hash_matches_openshell_0072_contract() -> None:
+    assert _FAKE_POLICY_HASH == "b9ae64d4c78cc3620a039abe77aeb8742b88937561e4467faf6cc4312fbf7e99"
+
+
 def test_per_job_session_uses_policy_spec_and_attests_before_return(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -285,7 +387,7 @@ def test_per_job_session_uses_policy_spec_and_attests_before_return(
         _fake_optional_modules(context_factory),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
-            return_value="policy-proto",
+            return_value=_FAKE_POLICY,
         ),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
@@ -316,6 +418,8 @@ def test_per_job_session_uses_policy_spec_and_attests_before_return(
     assert "sandbox" not in kwargs
     assert provider.physical_sandbox_name == "generated"
     assert "sensitive-gateway-name" not in caplog.text
+    context._client._stub.GetSandboxPolicyStatus.assert_called_once()  # type: ignore[attr-defined]
+    context._client._stub.GetSandboxConfig.assert_called_once()  # type: ignore[attr-defined]
 
 
 def test_two_jobs_create_distinct_specs_without_named_attachment(tmp_path: Path) -> None:
@@ -337,7 +441,7 @@ def test_two_jobs_create_distinct_specs_without_named_attachment(tmp_path: Path)
         _fake_optional_modules(context_factory),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
-            return_value="policy-proto",
+            return_value=_FAKE_POLICY,
         ),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
@@ -362,9 +466,8 @@ def test_two_jobs_create_distinct_specs_without_named_attachment(tmp_path: Path)
 @pytest.mark.parametrize(
     ("phase", "policy_version", "expected", "message"),
     [
-        (3, 1, None, "not READY"),
-        (2, 0, None, "no loaded policy"),
-        (2, 2, 1, "expected 1"),
+        (3, 1, None, "not_ready"),
+        (2, 2, 1, "expected_version_mismatch"),
     ],
 )
 def test_attestation_failure_deletes_before_raising(
@@ -382,7 +485,7 @@ def test_attestation_failure_deletes_before_raising(
         _fake_optional_modules(lambda **_kwargs: context),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
-            return_value="policy-proto",
+            return_value=_FAKE_POLICY,
         ),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
@@ -412,21 +515,15 @@ def test_attestation_refreshes_ready_sandbox_until_policy_is_loaded(tmp_path: Pa
     policy_path = tmp_path / "policy.yaml"
     _write_policy(policy_path)
     context = _FakeCreatedContext(policy_version=0)
-    refreshed = SimpleNamespace(phase=2, current_policy_version=0, name=context.sandbox.name)
-    policy_status = MagicMock(
-        return_value=SimpleNamespace(revision=SimpleNamespace(version=1, status=2)),
-    )
-    context._client = SimpleNamespace(  # type: ignore[attr-defined]
-        get=MagicMock(return_value=refreshed),
-        _stub=SimpleNamespace(GetSandboxPolicyStatus=policy_status),
-    )
+    policy_status = context._client._stub.GetSandboxPolicyStatus  # type: ignore[attr-defined]
+    sandbox_config = context._client._stub.GetSandboxConfig  # type: ignore[attr-defined]
     events: list[dict[str, object]] = []
 
     with (
         _fake_optional_modules(lambda **_kwargs: context),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
-            return_value="policy-proto",
+            return_value=_FAKE_POLICY,
         ),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
@@ -444,9 +541,123 @@ def test_attestation_refreshes_ready_sandbox_until_policy_is_loaded(tmp_path: Pa
     request = policy_status.call_args.args[0]
     assert request.name == context.sandbox.name
     assert request.version == 0
+    config_request = sandbox_config.call_args.args[0]
+    assert config_request.sandbox_id == context.sandbox.id
     succeeded = [event for event in events if event["data"]["status"] == "succeeded"]  # type: ignore[index]
     assert len(succeeded) == 1
     assert succeeded[0]["data"]["policy_version"] == 1  # type: ignore[index]
+    assert succeeded[0]["data"]["policy_hash"] == _FAKE_POLICY_HASH  # type: ignore[index]
+    assert succeeded[0]["data"]["policy_source"] == 1  # type: ignore[index]
+    assert succeeded[0]["data"]["assurance"] == "strict"  # type: ignore[index]
+
+
+def _run_attestation(
+    context: _FakeCreatedContext,
+    *,
+    expected_policy: _FakePolicy | None = _FAKE_POLICY,
+    require_sandbox_source: bool = True,
+    **openshell_config: Any,
+):
+    with _fake_optional_modules(lambda **_kwargs: context):
+        provider = _provider(**openshell_config)
+        provider._os_context = context
+        return provider._attest(
+            context,
+            expected_policy=expected_policy,
+            require_sandbox_source=require_sandbox_source,
+        )
+
+
+def test_attestation_fails_closed_when_authoritative_rpc_is_unavailable() -> None:
+    context = _FakeCreatedContext()
+    del context._client._stub.GetSandboxConfig  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="rpc_unavailable"):
+        _run_attestation(context)
+
+
+@pytest.mark.parametrize("field", ["active_version", "revision_version", "config_version", "current_version"])
+def test_attestation_rejects_version_disagreement(field: str) -> None:
+    context = _FakeCreatedContext()
+    status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
+    config = context._client._stub.GetSandboxConfig.return_value  # type: ignore[attr-defined]
+    if field == "active_version":
+        status.active_version = 2
+    elif field == "revision_version":
+        status.revision.version = 2
+    elif field == "config_version":
+        config.version = 2
+    else:
+        context.sandbox.current_policy_version = 2
+
+    with pytest.raises(RuntimeError, match="version_mismatch"):
+        _run_attestation(context)
+
+
+@pytest.mark.parametrize(
+    ("status", "load_error", "reason"),
+    [(3, "", "policy_status_failed"), (2, "credential=do-not-log", "policy_load_error")],
+)
+def test_attestation_rejects_failed_policy_revision(status: int, load_error: str, reason: str) -> None:
+    context = _FakeCreatedContext()
+    revision = context._client._stub.GetSandboxPolicyStatus.return_value.revision  # type: ignore[attr-defined]
+    revision.status = status
+    revision.load_error = load_error
+
+    with pytest.raises(RuntimeError, match=reason) as exc_info:
+        _run_attestation(context)
+    assert "credential=do-not-log" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("surface", ["config", "revision"])
+def test_attestation_rejects_effective_policy_content_mismatch(surface: str) -> None:
+    context = _FakeCreatedContext()
+    if surface == "config":
+        context._client._stub.GetSandboxConfig.return_value.policy = _FakePolicy(version=2)  # type: ignore[attr-defined]
+    else:
+        status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
+        status.revision.policy = _FakePolicy(version=2)
+
+    with pytest.raises(RuntimeError, match="policy_content_mismatch"):
+        _run_attestation(context)
+
+
+@pytest.mark.parametrize("surface", ["config", "revision"])
+def test_attestation_rejects_policy_hash_mismatch(surface: str) -> None:
+    context = _FakeCreatedContext()
+    if surface == "config":
+        context._client._stub.GetSandboxConfig.return_value.policy_hash = "bad"  # type: ignore[attr-defined]
+    else:
+        status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
+        status.revision.policy_hash = "bad"
+
+    with pytest.raises(RuntimeError, match="policy_hash_mismatch"):
+        _run_attestation(context)
+
+
+def test_attestation_rejects_gateway_global_policy_for_owned_sandbox() -> None:
+    context = _FakeCreatedContext(policy_source=2)
+
+    with pytest.raises(RuntimeError, match="policy_source_mismatch"):
+        _run_attestation(context)
+
+
+def test_policy_configured_shared_debug_accepts_matching_global_effective_policy() -> None:
+    context = _FakeCreatedContext(policy_source=2)
+
+    result = _run_attestation(context, require_sandbox_source=False)
+
+    assert result.assurance == "strict"
+    assert result.policy_source == 2
+
+
+def test_shared_debug_without_policy_reports_reduced_assurance() -> None:
+    context = _FakeCreatedContext(policy_source=2)
+
+    result = _run_attestation(context, expected_policy=None, require_sandbox_source=False)
+
+    assert result.assurance == "reduced"
+    assert result.policy_version == 1
 
 
 def test_shared_attachment_requires_explicit_debug_opt_in() -> None:
@@ -464,6 +675,19 @@ def test_shared_attachment_requires_explicit_debug_opt_in() -> None:
         },
     )
     assert config.providers.openshell.shared_sandbox_name == "shared"
+
+    with pytest.raises(ValueError, match="requires attest=true"):
+        SandboxConfig(
+            provider="openshell",
+            providers={
+                "openshell": {
+                    "existing_sandbox_name": "shared",
+                    "allow_shared_sandbox": True,
+                    "policy": "policy.yaml",
+                    "attest": False,
+                }
+            },
+        )
 
 
 def test_shared_attachment_never_deletes_unowned_sandbox() -> None:
@@ -522,7 +746,7 @@ def test_adapter_construction_failure_deletes_sandbox(tmp_path: Path) -> None:
         _fake_optional_modules(lambda **_kwargs: context, FailingAdapter),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
-            return_value="policy-proto",
+            return_value=_FAKE_POLICY,
         ),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
@@ -558,7 +782,7 @@ def test_attestation_success_is_emitted_after_adapter_construction(tmp_path: Pat
         _fake_optional_modules(lambda **_kwargs: context, RecordingAdapter),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
-            return_value="policy-proto",
+            return_value=_FAKE_POLICY,
         ),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
@@ -588,7 +812,7 @@ def test_terminate_before_context_entry_prevents_creation(tmp_path: Path) -> Non
         _fake_optional_modules(lambda **_kwargs: context, UnexpectedAdapter),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
-            return_value="policy-proto",
+            return_value=_FAKE_POLICY,
         ),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
@@ -633,7 +857,7 @@ def test_terminate_during_context_entry_defers_one_exit(tmp_path: Path) -> None:
         _fake_optional_modules(lambda **_kwargs: context, UnexpectedAdapter),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
-            return_value="policy-proto",
+            return_value=_FAKE_POLICY,
         ),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",
@@ -686,7 +910,7 @@ def test_terminate_during_adapter_construction_cannot_publish_session(tmp_path: 
         _fake_optional_modules(lambda **_kwargs: context, BlockingAdapter),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
-            return_value="policy-proto",
+            return_value=_FAKE_POLICY,
         ),
         patch(
             "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._build_sandbox_spec",

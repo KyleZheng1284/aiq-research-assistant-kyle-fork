@@ -134,6 +134,8 @@ class OpenShellProviderConfig(BaseModel):
             raise ValueError(
                 "Attaching to an existing OpenShell sandbox is debug-only and requires allow_shared_sandbox=true."
             )
+        if shared_name and self.policy and not self.attest:
+            raise ValueError("A policy-configured shared OpenShell sandbox requires attest=true.")
         if not shared_name:
             if not self.delete_on_exit:
                 raise ValueError("Per-job OpenShell sandboxes require delete_on_exit=true.")
