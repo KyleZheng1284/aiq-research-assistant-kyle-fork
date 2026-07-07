@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -148,6 +149,8 @@ class DeepAgentsRuntime:
         self._backend: Any | None = None
         self._sandbox_provider: Any | None = None
         self.artifact_manager: Any | None = None
+        self._artifact_finalize_lock = threading.Lock()
+        self._artifact_finalize_attempted = False
         self._skill_sources_by_agent = _resolve_agent_skill_sources(skills)
         self._skill_sources = tuple(
             dict.fromkeys(source for sources in self._skill_sources_by_agent.values() for source in sources)
@@ -214,8 +217,8 @@ class DeepAgentsRuntime:
             return
         try:
             manager.final_harvest()
-        except Exception:  # noqa: BLE001 - harvest is best-effort on the terminal path
-            logger.warning("Final artifact harvest failed for job %s", self._job_id, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - harvest is best-effort on the terminal path
+            logger.warning("Final artifact harvest failed for job %s (%s)", self._job_id, type(exc).__name__)
 
     def close(self) -> None:
         """Release the sandbox provider on a normal terminal job path (idempotent)."""
@@ -228,6 +231,33 @@ class DeepAgentsRuntime:
         provider = self._sandbox_provider
         if provider is not None and hasattr(provider, "terminate"):
             provider.terminate()
+
+    def finalize_artifacts(self, *, interrupted: bool) -> bool:
+        """Run the terminal artifact scan without delaying cancellation.
+
+        Normal success/failure paths perform the idempotent final scan. On cancellation,
+        only scan when the provider operation lock is immediately available; otherwise
+        execution teardown takes priority. Successful execute calls are checkpointed by
+        middleware, so already completed artifacts remain durable in either case.
+        """
+        with self._artifact_finalize_lock:
+            if self._artifact_finalize_attempted:
+                return False
+            self._artifact_finalize_attempted = True
+        if self.artifact_manager is None or self._sandbox_provider is None:
+            return False
+        if not interrupted:
+            self.final_harvest()
+            return True
+        lease = getattr(self._sandbox_provider, "try_operation_lease", None)
+        if not callable(lease):
+            return False
+        with lease() as acquired:
+            if not acquired:
+                logger.info("Skipping terminal harvest for busy cancelled sandbox job %s", self._job_id)
+                return False
+            self.final_harvest()
+            return True
 
     def prepare_state_files(self, files: dict[str, Any]) -> dict[str, Any]:
         """Normalize seeded virtual filesystem files for the configured backend."""

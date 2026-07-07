@@ -153,12 +153,15 @@ is lifted into `providers.modal`.
 ## Artifact runtime
 
 - Generated code writes binaries + a `manifest.json` to `artifact_dir`.
-- Once at the end of the agent run (`agent.run()` -> `ArtifactManager.final_harvest`),
-  the `ArtifactManager` pulls bytes via `download_files`, runs the validation pipeline
+- Successful `execute` calls trigger a manifest-only checkpoint. Terminal finalization runs
+  one manifest + directory scan on success or failure. Cancellation attempts that scan only
+  when the provider operation lease is immediately available; a busy sandbox is terminated
+  immediately, while completed execute outputs remain preserved by earlier checkpoints.
+- The `ArtifactManager` pulls bytes via `download_files`, runs the validation pipeline
   (path-traversal confinement -> extension allowlist -> size cap -> MIME-from-bytes/spoof
-  reject -> quota -> SVG sanitize -> sha256), stores via `ArtifactStore`, then emits an
-  `artifact` SSE event (`to_sse_payload`, metadata + `content_url`, never bytes).
-- Failed or cancelled runs are not harvested in the current implementation.
+  reject -> quota -> SVG sanitize -> sha256), stores metadata in SQL and bytes through the
+  configured artifact blob provider, then emits an
+  `artifact.update` event (durable metadata + `content_url`, never bytes or URL-as-text).
 - Reports reference artifacts as `![caption](artifact://<filename-or-id>)`; the report
   postprocessor rewrites filename refs to durable ids and drops unknown/foreign refs.
 - Endpoints: `GET /v1/jobs/async/job/{job_id}/artifacts` and `.../artifacts/{id}/content`

@@ -51,6 +51,9 @@ and [Production Considerations](../../deployment/production.md#artifact-storage)
   caps (`AIQ_MAX_SANDBOXES_PER_PRINCIPAL` / `AIQ_MAX_SANDBOXES_GLOBAL`, default-off) bound
   concurrency/cost but do not provide filesystem isolation.
 - Custom client-supplied job IDs must not be reused for a new job.
+- Manifest checkpoints preserve completed artifacts after successful sandbox commands. The
+  terminal finalizer harvests once before cleanup on success/failure; cancellation harvests
+  only when the provider is idle and otherwise terminates immediately.
 - The runtime closes provider sessions on success, failure, cancellation, and timeout.
   A named OpenShell sandbox persists when `delete_on_exit` is disabled.
 

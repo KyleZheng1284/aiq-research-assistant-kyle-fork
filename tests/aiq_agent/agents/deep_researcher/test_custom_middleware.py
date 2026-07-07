@@ -25,6 +25,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.messages import SystemMessage
 from langchain_core.messages import ToolMessage
 
+from aiq_agent.agents.deep_researcher.custom_middleware import ArtifactHarvestMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import PlanPersistenceMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRegistryMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRoutingGuardMiddleware
@@ -624,6 +625,75 @@ class TestSourceRegistryMiddleware:
         result = await middleware.awrap_tool_call(request, handler)
 
         assert result.content == content
+
+
+class TestArtifactHarvestMiddleware:
+    """Checkpoint harvesting runs only after successful execute tool calls."""
+
+    @pytest.mark.asyncio
+    async def test_execute_checkpoints_after_handler(self) -> None:
+        manager = MagicMock()
+        middleware = ArtifactHarvestMiddleware(manager)
+        request = MagicMock()
+        request.tool_call = {"name": "execute"}
+        handler = AsyncMock(return_value="ok")
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "ok"
+        manager.harvest_after_execute.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_non_execute_tool_does_not_harvest(self) -> None:
+        manager = MagicMock()
+        middleware = ArtifactHarvestMiddleware(manager)
+        request = MagicMock()
+        request.tool_call = {"name": "read_file"}
+
+        await middleware.awrap_tool_call(request, AsyncMock(return_value="ok"))
+
+        manager.harvest_after_execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handler_failure_does_not_harvest(self) -> None:
+        manager = MagicMock()
+        middleware = ArtifactHarvestMiddleware(manager)
+        request = MagicMock()
+        request.tool_call = {"name": "execute"}
+
+        with pytest.raises(RuntimeError, match="tool failed"):
+            await middleware.awrap_tool_call(request, AsyncMock(side_effect=RuntimeError("tool failed")))
+
+        manager.harvest_after_execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_error_result_does_not_harvest(self) -> None:
+        manager = MagicMock()
+        middleware = ArtifactHarvestMiddleware(manager)
+        request = MagicMock()
+        request.tool_call = {"name": "execute"}
+
+        await middleware.awrap_tool_call(
+            request,
+            AsyncMock(return_value=ToolMessage(content="failed", tool_call_id="tc1", status="error")),
+        )
+
+        manager.harvest_after_execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_failure_logs_only_exception_type(self, caplog: pytest.LogCaptureFixture) -> None:
+        manager = MagicMock()
+        manager.harvest_after_execute.side_effect = RuntimeError("credential=do-not-log")
+        middleware = ArtifactHarvestMiddleware(manager)
+        request = MagicMock()
+        request.tool_call = {"name": "execute"}
+
+        with caplog.at_level(logging.WARNING):
+            result = await middleware.awrap_tool_call(request, AsyncMock(return_value="ok"))
+
+        assert result == "ok"
+        assert "RuntimeError" in caplog.text
+        assert "credential=do-not-log" not in caplog.text
 
 
 class _RecordingBackend:

@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import logging
+from contextlib import nullcontext
 from typing import Any
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -301,3 +303,54 @@ class TestDeepAgentsRuntimeJobId:
             pytest.raises(ImportError, match="langchain-modal"),
         ):
             _ = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig(provider="modal")).backend
+
+
+class TestDeepAgentsRuntimeArtifacts:
+    """Terminal artifact harvesting is safe on normal and interrupted paths."""
+
+    def test_final_harvest_logs_only_exception_type(self, caplog: pytest.LogCaptureFixture) -> None:
+        provider = MagicMock()
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig())
+        runtime.artifact_manager = MagicMock()
+        runtime.artifact_manager.final_harvest.side_effect = RuntimeError("credential=do-not-log")
+
+        with caplog.at_level(logging.WARNING):
+            runtime.final_harvest()
+
+        assert "RuntimeError" in caplog.text
+        assert "credential=do-not-log" not in caplog.text
+
+    def test_normal_finalize_artifacts_harvests(self) -> None:
+        provider = MagicMock()
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig())
+        runtime.artifact_manager = MagicMock()
+
+        assert runtime.finalize_artifacts(interrupted=False) is True
+        assert runtime.finalize_artifacts(interrupted=False) is False
+        runtime.artifact_manager.final_harvest.assert_called_once_with()
+
+    @pytest.mark.parametrize(("lease_acquired", "expected"), [(True, True), (False, False)])
+    def test_interrupted_finalize_harvests_only_when_provider_is_idle(
+        self,
+        lease_acquired: bool,
+        expected: bool,
+    ) -> None:
+        provider = MagicMock()
+        provider.try_operation_lease.return_value = nullcontext(lease_acquired)
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig())
+        runtime.artifact_manager = MagicMock()
+
+        assert runtime.finalize_artifacts(interrupted=True) is expected
+        assert runtime.artifact_manager.final_harvest.call_count == int(lease_acquired)

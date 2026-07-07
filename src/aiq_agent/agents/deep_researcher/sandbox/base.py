@@ -33,6 +33,7 @@ import threading
 from abc import ABC
 from abc import abstractmethod
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
@@ -139,6 +140,16 @@ class SandboxProvider(BaseSandbox, ABC):
         own SDK's typed exceptions rather than fragile string matching.
         """
         return False
+
+    @contextmanager
+    def try_operation_lease(self):
+        """Yield whether the provider is idle without waiting behind an in-flight execute."""
+        acquired = self._lock.acquire(blocking=False)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                self._lock.release()
 
     def close(self) -> None:
         """Release the underlying sandbox session, if any (idempotent).
