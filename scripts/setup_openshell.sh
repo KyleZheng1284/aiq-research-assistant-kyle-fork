@@ -72,6 +72,8 @@ This script never starts, stops, registers, or probes a gateway. Run
 scripts/start_openshell_gateway.sh after provisioning; per-job sandbox creation
 remains owned by the AI-Q runtime.
 
+Canonical operator guide: docs/source/deployment/openshell.md
+
 Options:
   --openshell-version VERSION   Exact OpenShell version, or "latest".
                                 Default: asks in an interactive shell; Enter selects 0.0.72.

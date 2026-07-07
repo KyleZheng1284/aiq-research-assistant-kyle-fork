@@ -33,6 +33,10 @@ Usage: scripts/start_openshell_gateway.sh [options]
 Starts or reuses the official packaged OpenShell gateway service, validates the
 selected registration is authenticated, and performs a mandatory disposable
 sandbox create/delete probe. The script never launches the raw gateway binary.
+Long-running service and credential ownership remains with Homebrew, systemd, or
+the external operator.
+
+Canonical operator guide: docs/source/deployment/openshell.md
 
 Options:
   --gateway-name NAME           Registered gateway name (default: openshell).

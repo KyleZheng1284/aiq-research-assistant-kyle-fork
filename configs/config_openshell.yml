@@ -1,7 +1,5 @@
-# EXPERIMENTAL: AI-Q deep research with one policy-bound OpenShell sandbox per job.
-# Run ./scripts/setup_openshell.sh once for dependencies/image/policy, then run
-# ./scripts/start_openshell_gateway.sh to verify an authenticated gateway with a
-# disposable create/delete probe. The Python runtime owns all per-job sandboxes.
+# EXPERIMENTAL: one policy-bound OpenShell sandbox per deep-research job.
+# Canonical operator guide: docs/source/deployment/openshell.md
 
 general:
   use_uvloop: true

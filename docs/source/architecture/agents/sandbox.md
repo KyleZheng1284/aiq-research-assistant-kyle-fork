@@ -20,7 +20,9 @@ runtime (`.../job/{job_id}/artifacts`), which is also auth-scoped to the job.
 
 > **Developer reference:** the full architecture, provider contract, config schema,
 > artifact pipeline, and troubleshooting live next to the code in
-> [`src/aiq_agent/agents/deep_researcher/sandbox/README.md`](../../../../src/aiq_agent/agents/deep_researcher/sandbox/README.md).
+> [`src/aiq_agent/agents/deep_researcher/sandbox/README.md`](https://github.com/NVIDIA-AI-Blueprints/aiq/blob/develop/src/aiq_agent/agents/deep_researcher/sandbox/README.md).
+> Operators should use the canonical [OpenShell deployment guide](../../deployment/openshell.md)
+> for setup, authenticated gateway lifecycle, supported platforms, acceptance, and cleanup.
 
 ## Current Behavior
 
@@ -61,9 +63,9 @@ and [Production Considerations](../../deployment/production.md#artifact-storage)
 - The runtime closes provider sessions on success, failure, cancellation, and timeout.
 - Per-job OpenShell mode requires `delete_on_exit: true`. A persistent shared sandbox is
   possible only through the explicit debug attachment settings.
-- OpenShell provisioning (`setup_openshell.sh`) is separate from authenticated gateway
-  lifecycle (`start_openshell_gateway.sh`). The launcher rejects plaintext/raw gateways and
-  requires a successful disposable sandbox create/delete probe before AI-Q starts.
+- OpenShell provisioning and authenticated gateway lifecycle have separate owners. See the
+  [OpenShell responsibility table](../../deployment/openshell.md#responsibility-and-lifecycle-ownership)
+  rather than duplicating operational commands here.
 
 ## Current Safeguards
 

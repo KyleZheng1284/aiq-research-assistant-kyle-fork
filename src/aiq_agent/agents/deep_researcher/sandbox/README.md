@@ -233,43 +233,15 @@ creation spec deliberately has no copied host environment or credential provider
 Two ad-hoc deps (never in `pyproject`): the `openshell` SDK and the official
 `langchain-nvidia-openshell` adapter (`OpenShellSandbox`), the OpenShell partner package in
 [`langchain-ai/langchain-nvidia`](https://github.com/langchain-ai/langchain-nvidia/pull/303).
-The adapter is published on PyPI as `langchain-nvidia-openshell` — `./scripts/setup_openshell.sh`
-installs it for you (override the source with `LANGCHAIN_NVIDIA_REPO` to use a git spec or local
-checkout). To install it into your `.venv` manually:
+They remain lazy so selecting another provider does not install or import OpenShell.
+The provider config supports per-job policy creation and an explicit shared-debug attachment;
+policy-configured shared attachment is strictly attested, while policy-free attachment emits
+`assurance=reduced`.
 
-```bash
-uv pip install 'langchain-nvidia-openshell==0.1.0'
-```
-
-Provision once, then start or reuse the authenticated gateway through its explicit lifecycle
-owner. The launcher rejects raw/plaintext/insecure registrations and requires a successful
-disposable sandbox create/delete probe:
-
-```bash
-./scripts/setup_openshell.sh --policy offline
-./scripts/start_openshell_gateway.sh
-./scripts/start_e2e.sh --config_file configs/config_openshell.yml
-# or: ./scripts/start_e2e.sh --start-openshell-gateway --config_file configs/config_openshell.yml
-```
-
-The setup script prints the environment variables needed by any later shell that starts
-AI-Q. It installs dependencies, builds the reusable image, and generates the policy; it never
-starts, stops, registers, or kills a gateway. The launcher reuses an authenticated registered
-gateway or starts the official packaged Homebrew/systemd service. AI-Q creates the physical
-sandbox per job. If you start the backend in a different terminal/session, export the printed
-values before running the launcher and `start_e2e.sh` (or put them in your local env file):
-
-```bash
-export AIQ_OPENSHELL_IMAGE="aiq-openshell-demo:latest"
-export AIQ_OPENSHELL_POLICY_FILE="$PWD/configs/openshell/generated/aiq-openshell-policy.yaml"
-```
-
-For a local host that cannot enforce Landlock, an explicit non-production demo can use
-`--landlock-compatibility best_effort` together with `require_hard_landlock: false` in the
-AI-Q config. `--create-shared-debug-sandbox` creates the old named attachment target only
-when passed to `start_openshell_gateway.sh`; configure `existing_sandbox_name` and
-`allow_shared_sandbox: true` to attach to it. When a policy file is supplied for shared debug,
-AI-Q strictly attests it; omitting the file emits `assurance=reduced`.
+Use the canonical [OpenShell deployment guide](../../../../../docs/source/deployment/openshell.md)
+for installation, platform support, authenticated gateway ownership, policy/config pairing,
+startup, live acceptance, and troubleshooting. Operator commands are intentionally not
+duplicated in this implementation reference.
 
 Inference is routed host-side (e.g. NVIDIA Build or an internal inference hub set in the
 config); sandbox policy egress never requires or receives the inference key.
@@ -346,6 +318,8 @@ pytest tests/aiq_agent/agents/deep_researcher/sandbox/ -q
 
 Core provider/artifact tests use fake SDK objects and run without a live Modal/OpenShell
 gateway. The exact checked-policy/protobuf schema assertion is optional when the SDK is absent.
+The opt-in gateway acceptance suite and its environment contract are documented in the
+[OpenShell deployment guide](../../../../../docs/source/deployment/openshell.md#acceptance-tests).
 
 ## Troubleshooting
 
@@ -353,15 +327,8 @@ gateway. The exact checked-policy/protobuf schema assertion is optional when the
   the workspace plugin packages aren't installed. Install them (don't re-run `setup.sh`,
   which recreates `.venv`):
   `uv pip install -e ./frontends/aiq_api -e ./sources/tavily_web_search -e "./sources/knowledge_layer[llamaindex,foundational_rag]" -e ./sources/exa_web_search -e ./sources/google_scholar_paper_search`
-- **`langchain-nvidia-openshell was not found in the package registry`**: use the adapter
-  source override supported by the setup script: set
-  `LANGCHAIN_NVIDIA_REPO=<git-spec-or-index>` or pass
-  `--langchain-nvidia /path/to/checkout`.
-- **OpenShell policy rejected as broader than `network_allow`**: add the intended hostname
-  to the public allowlist or remove it from the policy. AI-Q never silently accepts policy
-  egress broader than the public declaration.
-- **`unbound variable` in `setup_openshell.sh` on macOS**: the system bash is 3.2; run under
-  bash 5 (`brew install bash` then `/opt/homebrew/bin/bash ./scripts/setup_openshell.sh ...`).
+- **OpenShell installation, gateway, policy, readiness, or cleanup failures**: follow the
+  canonical [OpenShell troubleshooting contract](../../../../../docs/source/deployment/openshell.md#inspection-and-troubleshooting).
 - **`network.mode` rejected at startup**: the selected provider doesn't declare the
   matching capability (`supports_network_policy` for `blocked`, `supports_network_allowlist`
   for `allowlist`). Choose a capable provider or relax `network.mode` (e.g. to `open`).

@@ -51,99 +51,21 @@ Starts the agent in CLI mode with browser-based authentication.
 
 ### `setup_openshell.sh` - OpenShell Sandbox Setup
 
-Sets up the experimental NVIDIA OpenShell path for AI-Q. Run this once before using
-`configs/config_openshell.yml` with `start_cli.sh` or `start_e2e.sh`. It installs
-the `openshell` SDK and the `langchain-nvidia-openshell` adapter, builds the reusable
-sandbox image, and generates a network policy. It does not start, stop, or register a
-gateway. `start_openshell_gateway.sh` owns gateway startup/readiness and proves the selected
-authenticated gateway can create and delete the required sandbox. AI-Q then creates,
-attests, and deletes a policy-bound physical sandbox for every job. Inference is unaffected
-(it stays host-side); only generated code runs in the sandbox.
-
-Production setup defaults to `landlock.compatibility: hard_requirement`. For a local demo
-host that cannot enforce Landlock, pass `--landlock-compatibility best_effort` and explicitly
-set `require_hard_landlock: false` in the AI-Q config. The legacy named shared sandbox is
-created only by the gateway launcher with `--create-shared-debug-sandbox` and remains a
-debug-only, non-isolated mode.
+`setup_openshell.sh` installs the pinned SDK/adapter, generates a policy, and builds
+the reusable image. `start_openshell_gateway.sh` validates an authenticated registered
+gateway and performs a disposable create/delete probe. AI-Q then owns one attested
+physical sandbox per job.
 
 ```bash
-./scripts/setup_openshell.sh --policy offline
-./scripts/start_openshell_gateway.sh
+./scripts/setup_openshell.sh --openshell-version 0.0.72 --policy offline
+./scripts/start_openshell_gateway.sh --gateway-name openshell
 ./scripts/start_e2e.sh --config_file configs/config_openshell.yml
-# or explicitly have E2E invoke the authenticated launcher/probe:
-./scripts/start_e2e.sh --start-openshell-gateway --config_file configs/config_openshell.yml
-# or direct serve:
-dotenv -f deploy/.env run .venv/bin/nat serve --config_file configs/config_openshell.yml --host 0.0.0.0 --port 8000
 ```
 
-Useful version examples:
-
-```bash
-./scripts/setup_openshell.sh --openshell-version 0.0.72
-./scripts/setup_openshell.sh --openshell-version latest
-./scripts/setup_openshell.sh --list-openshell-versions
-```
-
-In the interactive version prompt, pressing Enter selects `0.0.72`.
-
-Deterministic live acceptance (no LLM or external research API involved):
-
-```bash
-.venv/bin/python scripts/smoke_openshell_isolation.py --gateway openshell
-```
-
-The probe fails unless the gateway service itself reports OpenShell `0.0.72`. It creates two
-jobs concurrently, proves they have distinct physical sandbox IDs and strict effective-policy
-source/content/hash attestation, cancels one, proves the other still executes, and then proves
-both were deleted. It also deletes a sandbox after an intentional command failure, injects a
-credential-like exception canary and proves it is absent from captured AI-Q logs/events, and
-rejects a shared-debug attachment whose claimed policy differs from the effective policy.
-Success is seven explicit lines:
-
-```text
-PASS gateway version: 0.0.72
-PASS distinct attested sandboxes: A=<name>@r<revision>, B=<name>@r<revision>
-PASS cancellation isolation: A deleted; B remained usable
-PASS terminal cleanup: both probe sandboxes deleted
-PASS failure cleanup: failed job sandbox deleted
-PASS log redaction: credential canary absent from captured logs and events
-PASS shared-policy rejection: mismatched attachment denied and probe deleted
-```
-
-On a non-production local host that intentionally uses the generated `best_effort` policy:
-
-```bash
-.venv/bin/python scripts/smoke_openshell_isolation.py \
-  --gateway openshell \
-  --policy configs/openshell/generated/aiq-openshell-policy.yaml \
-  --allow-best-effort-landlock
-```
-
-The setup installs the `openshell` SDK plus the official `langchain-nvidia-openshell`
-adapter (`OpenShellSandbox`), published on PyPI. The script installs it from PyPI by
-default; set `LANGCHAIN_NVIDIA_REPO` or pass `--langchain-nvidia` to use another
-`uv pip install` spec or a local checkout.
-
-Useful policy examples:
-
-```bash
-./scripts/setup_openshell.sh --policy offline
-./scripts/setup_openshell.sh --policy research
-./scripts/setup_openshell.sh --policy python-packages
-./scripts/setup_openshell.sh --policy custom --allow github,pypi,nvidia,tavily
-```
-
-Verify and clean up:
-
-```bash
-.venv/bin/openshell status
-.venv/bin/openshell gateway list -o json  # selected gateway must be HTTPS + mTLS/OIDC/edge auth
-.venv/bin/openshell sandbox list
-# Manage a local packaged service through its owner, never with broad process killing:
-brew services restart openshell                 # macOS
-systemctl --user restart openshell-gateway      # Linux
-```
-
+For supported platforms, production versus local-demo policy pairing, remote gateways,
+live pytest acceptance, and troubleshooting, use the canonical
+[OpenShell deployment guide](../docs/source/deployment/openshell.md). This README is only
+the script-discovery surface.
 
 ### `start_server_in_debug_mode.sh` - Server Mode
 
