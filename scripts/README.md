@@ -53,11 +53,11 @@ Starts the agent in CLI mode with browser-based authentication.
 
 `setup_openshell.sh` installs the pinned SDK/adapter, generates a policy, and builds
 the reusable image. `start_openshell_gateway.sh` validates an authenticated registered
-gateway and performs a disposable create/delete probe. AI-Q then owns one attested
-physical sandbox per job.
+gateway and performs a disposable version/policy/selector/execution/cleanup probe. AI-Q
+then owns one attested physical sandbox per job.
 
 ```bash
-./scripts/setup_openshell.sh --openshell-version 0.0.72 --policy offline
+./scripts/setup_openshell.sh --policy offline
 ./scripts/start_openshell_gateway.sh --gateway-name openshell
 ./scripts/start_e2e.sh --config_file configs/config_openshell.yml
 ```

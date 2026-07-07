@@ -45,11 +45,11 @@ alone is never treated as attestation. An optional `expected_policy_version` pro
 revision pin. Any creation or attestation failure closes the owning SDK context so the partially
 created sandbox is deleted.
 
-OpenShell 0.0.72 leaves both generic `current_policy_version` and authoritative
-`active_version` at zero for an initial per-sandbox policy. AI-Q accepts that compatibility case
-only when the gateway reports exactly 0.0.72 and the LOADED revision plus effective config agree
-on the same positive version, source, protobuf content, and deterministic hash. Positive status
-versions and every later gateway release remain subject to exact version agreement.
+Zero generic `current_policy_version` or `active_version` values are treated as unreported only
+when the LOADED revision plus effective config agree on the same positive version, source,
+protobuf content, and deterministic hash. Every positive reported version remains subject to
+exact agreement. An effective policy that remains Pending beyond `policy_load_timeout_seconds`
+fails with `policy_status_inconsistent`; AI-Q never treats it as successful attestation.
 
 OpenShell shared attachment remains available only as an explicit debug escape hatch:
 `existing_sandbox_name` plus `allow_shared_sandbox: true`. It is not a job isolation boundary
@@ -157,6 +157,7 @@ sandbox:
       policy: configs/openshell/generated/aiq-openshell-policy.yaml
       delete_on_exit: true
       attest: true
+      policy_load_timeout_seconds: 30
       cleanup_timeout_seconds: 30
       # expected_policy_version: 1
       require_hard_landlock: true
@@ -229,6 +230,8 @@ AI-Q refuses startup if the YAML does not match the installed SDK schema, the po
 host or hostless/CIDR override outside the declared public network contract, production Landlock
 mode is not fail-closed, or the gateway cannot prove the submitted policy is effective. The
 creation spec deliberately has no copied host environment or credential providers.
+Owned sandboxes carry `aiq=deep-research` and a normalized `aiq-job-id` in both OpenShell
+gateway metadata and runtime template metadata so operators can use label selectors reliably.
 
 Two ad-hoc deps (never in `pyproject`): the `openshell` SDK and the official
 `langchain-nvidia-openshell` adapter (`OpenShellSandbox`), the OpenShell partner package in

@@ -45,21 +45,17 @@ for gateway-host prerequisites and upstream runtime support.
 
 ## Version Compatibility
 
-The tested combination is:
+`setup_openshell.sh` installs one exact OpenShell CLI/SDK version and reasserts
+that pin after installing the DeepAgents adapter. The strict gateway launcher
+then requires the CLI, SDK, and gateway versions to match. An operator may select
+another exact release with `--openshell-version`, but a version is production
+accepted only after the pytest-owned live suite passes against that release on
+Linux with hard Landlock enforcement.
 
-- OpenShell CLI, Python SDK, and gateway: `0.0.72`.
-- DeepAgents adapter: `langchain-nvidia-openshell==0.1.0`.
-
-The CLI, SDK, and gateway must remain compatible. The setup option
-`--openshell-version latest` is useful for evaluation, but it is not a production
-certification. Accept a new version only after the OpenShell unit regressions and
-the pytest-owned live suite pass against that exact gateway.
-
-OpenShell `0.0.72` can report zero for both the generic current policy version and
-the policy-status active version while its loaded revision and effective config
-agree on a positive version. AI-Q permits this compatibility case only when the
-gateway reports exactly `0.0.72`; positive versions and every later gateway
-release must agree exactly.
+Runtime security decisions are capability-based, not version-specific. A zero
+generic current or active policy version is treated as unreported only when the
+positive loaded revision and effective config agree exactly. Every positive
+reported version must match.
 
 ## Responsibility and Lifecycle Ownership
 
@@ -67,7 +63,7 @@ release must agree exactly.
 |---|---|---|
 | `setup_openshell.sh` | SDK/adapter install, policy generation, image build | Start, stop, register, select, probe, or kill gateways |
 | Homebrew/systemd/external operator | Long-running gateway service and credentials | Delegate process ownership to AI-Q setup |
-| `start_openshell_gateway.sh` | Validate registration/auth, optionally start a packaged service, select the gateway, create/delete a readiness probe | Launch raw gateway binaries, stop externally managed services, persist credentials |
+| `start_openshell_gateway.sh` | Validate registration/auth, optionally start a packaged service, select the gateway, and run the strict disposable capability probe | Launch raw gateway binaries, stop externally managed services, persist credentials |
 | AI-Q runtime | Per-job create, readiness, attestation, execution, and terminal deletion | Reuse a shared sandbox without explicit debug opt-in |
 | Live pytest fixtures | Acceptance-test resources and verified teardown | Leave resources for manual cleanup |
 
@@ -90,6 +86,10 @@ Both policy layers are enforced:
   policy and `require_hard_landlock: true` in the AI-Q config.
 - A local demo using `best_effort` requires both the policy value
   `best_effort` and `require_hard_landlock: false` in a local config copy.
+- Custom policies must explicitly include OpenShell's proxy filesystem baseline,
+  including read-only `/proc`. Otherwise the supervisor creates an enriched
+  revision whose content and hash correctly fail AI-Q's exact attestation. The
+  generated policy from `setup_openshell.sh` already includes this baseline.
 
 Any mismatch fails closed before the execution adapter is available. Keep policy
 files and local config copies out of commits when they contain environment-specific
@@ -105,7 +105,7 @@ The gateway launcher, AI-Q runtime, and live suite use these non-secret settings
 | `AIQ_OPENSHELL_GATEWAY_NAME` | active gateway | Registered gateway name |
 | `AIQ_OPENSHELL_POLICY_FILE` | `configs/openshell/generated/aiq-openshell-policy.yaml` | Policy submitted and attested |
 | `AIQ_OPENSHELL_IMAGE` | `aiq-openshell-demo:latest` | Prebuilt sandbox image |
-| `AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION` | `0.0.72` | Exact accepted gateway version |
+| `AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION` | installed SDK version | Optional exact live-test override |
 | `AIQ_OPENSHELL_LIVE_ALLOW_BEST_EFFORT` | unset | Explicit non-production macOS/demo opt-in |
 
 ## Linux Production Acceptance
@@ -119,13 +119,12 @@ From the AI-Q repository root, provision the pinned SDK, hard policy, and image:
 
 ```bash
 ./scripts/setup_openshell.sh \
-  --openshell-version 0.0.72 \
   --policy offline \
   --landlock-compatibility hard_requirement
 ```
 
-Select the authenticated registration and prove create/readiness/delete
-capability. Omit `--reuse-existing` only when the gateway is a local packaged
+Select the authenticated registration and prove version, policy, selector,
+execution, and deletion capabilities. Omit `--reuse-existing` only when the gateway is a local packaged
 service that the launcher may start through systemd.
 
 ```bash
@@ -159,7 +158,6 @@ AIQ_OPENSHELL_LIVE_TESTS=1 \
 AIQ_OPENSHELL_GATEWAY_NAME=openshell \
 AIQ_OPENSHELL_POLICY_FILE=configs/openshell/generated/aiq-openshell-policy.yaml \
 AIQ_OPENSHELL_IMAGE=aiq-openshell-demo:latest \
-AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION=0.0.72 \
 .venv/bin/python -m pytest -m integration -vv \
   tests/aiq_agent/agents/deep_researcher/sandbox/test_openshell_live.py
 ```
@@ -178,7 +176,6 @@ Bash behavior:
 ```bash
 brew install bash
 /opt/homebrew/bin/bash ./scripts/setup_openshell.sh \
-  --openshell-version 0.0.72 \
   --policy offline \
   --landlock-compatibility best_effort
 ```
@@ -211,7 +208,6 @@ opt-in:
   --gateway openshell \
   --policy configs/openshell/generated/aiq-openshell-policy.yaml \
   --image aiq-openshell-demo:latest \
-  --expected-gateway-version 0.0.72 \
   --allow-best-effort-landlock
 ```
 
@@ -232,7 +228,7 @@ to substitute a local gateway if the remote service is unavailable:
   --policy-file configs/openshell/generated/aiq-openshell-policy.yaml
 ```
 
-The disposable create/readiness/delete probe is mandatory. After it passes,
+The disposable strict capability probe is mandatory. After it passes,
 export `AIQ_OPENSHELL_GATEWAY_NAME=enterprise` and run the live suite. Never fall
 back to a plaintext registration, insecure TLS, or a local raw gateway.
 
@@ -260,6 +256,8 @@ The human-readable contract is:
 
 - One running deep-research job creates one physical OpenShell sandbox.
 - Two concurrent jobs create two distinct sandbox names and physical IDs.
+- Active jobs are discoverable with `--selector aiq=deep-research`, with a
+  distinct `aiq-job-id` gateway label for each job.
 - Attestation succeeds before the execution adapter is exposed.
 - Success, command failure, timeout, and cancellation delete owned sandboxes.
 - Cancelling one job does not delete or replace another job's sandbox.
@@ -287,7 +285,7 @@ The suite contains three independently reported tests:
 
 - `test_live_per_job_isolation_attestation_and_cancellation` proves distinct
   sandboxes, authoritative source/content/hash/revision attestation, isolated
-  cancellation, continued execution, and terminal deletion.
+  cancellation, selector membership, continued execution, and terminal deletion.
 - `test_live_failure_cleanup_and_log_redaction` proves cleanup after a deterministic
   failed command and verifies that a credential-shaped exception canary reaches
   neither logs nor events.
@@ -317,18 +315,23 @@ Inspect only registered resources and sanitized AI-Q lifecycle events:
 .venv/bin/openshell status
 .venv/bin/openshell gateway list -o json
 .venv/bin/openshell sandbox list
+.venv/bin/openshell sandbox list --selector aiq=deep-research -o json
 ```
 
 The selected gateway registration must be HTTPS and report `mtls`, `oidc`, or
-trusted edge authentication. During a job, `sandbox list` should show one owned
+trusted edge authentication. During a job, the selector must show one owned
 sandbox per active deep-research job. After termination, each owned name must be
-absent. Use the sandbox name from sanitized `sandbox.attestation` or
+absent from direct and selector listings. Use the sandbox name from sanitized `sandbox.attestation` or
 `sandbox.cleanup` events; do not expose full SDK payloads to logs.
 
 | Failure | Safe action |
 |---|---|
 | Generated policy or image is missing | Run `setup_openshell.sh` and reuse the exact paths it prints. |
-| Gateway version differs | Install/select the tested `0.0.72` combination or treat the run as an uncertified evaluation. |
+| CLI, SDK, and gateway versions differ | Install the same exact OpenShell release for all three surfaces and rerun the strict launcher. |
+| `request_labels_unsupported` | The installed Python SDK cannot persist gateway labels required for AI-Q ownership and selectors; install a supported release. |
+| `policy_status_inconsistent` | The effective policy matches but its revision never became `LOADED`. This is an OpenShell lifecycle failure, not a Landlock-mode mismatch. Do not disable attestation. |
+| `policy_content_mismatch` | Regenerate the policy with `setup_openshell.sh`, or add the required OpenShell proxy filesystem baseline (including read-only `/proc`) to a custom policy. Do not weaken exact attestation. |
+| `selector_mismatch` | The probe was not discoverable through gateway metadata. Do not rely on Docker/template labels as a substitute. |
 | Registration is plaintext or unauthenticated | Register an HTTPS gateway with mTLS, OIDC, or trusted edge authentication. Do not bypass the launcher check. |
 | Docker daemon is unavailable | Start the operator-owned Docker service and rerun provisioning/probe. |
 | Podman is selected | Follow upstream OpenShell guidance; do not report the path as PR #298-certified. |
