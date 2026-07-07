@@ -109,6 +109,11 @@ class OpenShellProviderConfig(BaseModel):
     )
     image: str = Field(default="aiq-openshell-demo:latest", description="OpenShell image identifier")
     ready_timeout_seconds: float = Field(default=300.0, description="Seconds to wait for the sandbox to become ready")
+    policy_load_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description="Seconds to wait for the authoritative policy revision to become loaded.",
+    )
     cleanup_timeout_seconds: float = Field(
         default=30.0,
         gt=0,
@@ -136,6 +141,14 @@ class OpenShellProviderConfig(BaseModel):
         """Reject non-finite teardown deadlines that would defeat bounded finalization."""
         if not math.isfinite(value):
             raise ValueError("cleanup_timeout_seconds must be finite")
+        return value
+
+    @field_validator("policy_load_timeout_seconds")
+    @classmethod
+    def _policy_load_timeout_must_be_finite(cls, value: float) -> float:
+        """Reject non-finite attestation deadlines that would defeat fail-closed startup."""
+        if not math.isfinite(value):
+            raise ValueError("policy_load_timeout_seconds must be finite")
         return value
 
     @model_validator(mode="after")

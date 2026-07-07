@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Start or reuse an authenticated OpenShell gateway and prove create/delete capability.
+# Start or reuse an authenticated OpenShell gateway and prove strict AI-Q capabilities.
 
 set -euo pipefail
 
@@ -19,12 +19,10 @@ PYTHON_BIN="${PYTHON_BIN:-}"
 START_SERVICE=true
 CREATE_SHARED_DEBUG_SANDBOX=false
 STATUS_ATTEMPTS="${AIQ_OPENSHELL_STATUS_ATTEMPTS:-60}"
-PROBE_ATTEMPTS="${AIQ_OPENSHELL_PROBE_ATTEMPTS:-120}"
-DELETE_ATTEMPTS="${AIQ_OPENSHELL_DELETE_ATTEMPTS:-30}"
 POLL_DELAY="${AIQ_OPENSHELL_POLL_DELAY:-1}"
-
-PROBE_NAME="aiq-readiness-$$-${RANDOM:-0}"
-PROBE_STARTED=false
+READY_TIMEOUT_SECONDS="${AIQ_OPENSHELL_READY_TIMEOUT_SECONDS:-120}"
+POLICY_LOAD_TIMEOUT_SECONDS="${AIQ_OPENSHELL_POLICY_LOAD_TIMEOUT_SECONDS:-30}"
+READINESS_CHECKER="$SCRIPT_DIR/check_openshell_readiness.py"
 
 usage() {
     cat <<'EOF'
@@ -32,7 +30,7 @@ Usage: scripts/start_openshell_gateway.sh [options]
 
 Starts or reuses the official packaged OpenShell gateway service, validates the
 selected registration is authenticated, and performs a mandatory disposable
-sandbox create/delete probe. The script never launches the raw gateway binary.
+policy/selector/execution/cleanup probe. The script never launches the raw gateway binary.
 Long-running service and credential ownership remains with Homebrew, systemd, or
 the external operator.
 
@@ -131,6 +129,9 @@ resolve_dependencies() {
     if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
         fail "Python 3 is required to validate structured gateway metadata"
     fi
+    if [[ ! -f "$READINESS_CHECKER" ]]; then
+        fail "OpenShell readiness checker not found"
+    fi
 }
 
 validate_gateway_registration() {
@@ -208,61 +209,16 @@ sandbox_is_ready() {
     "$OPENSHELL_BIN" sandbox list | grep -F "$1" | grep -F "Ready" >/dev/null 2>&1
 }
 
-delete_probe() {
-    local attempt
-    local deleted=true
-    if [[ "$PROBE_STARTED" != "true" ]]; then
-        return 0
+run_strict_readiness_check() {
+    if ! "$PYTHON_BIN" "$READINESS_CHECKER" \
+        --gateway-name "$GATEWAY_NAME" \
+        --image-name "$IMAGE_NAME" \
+        --policy-file "$POLICY_FILE" \
+        --openshell-bin "$OPENSHELL_BIN" \
+        --ready-timeout-seconds "$READY_TIMEOUT_SECONDS" \
+        --policy-load-timeout-seconds "$POLICY_LOAD_TIMEOUT_SECONDS"; then
+        fail "OpenShell strict readiness check failed"
     fi
-    if ! "$OPENSHELL_BIN" sandbox delete "$PROBE_NAME" >/dev/null 2>&1; then
-        deleted=false
-    fi
-    for attempt in $(seq 1 "$DELETE_ATTEMPTS"); do
-        if ! sandbox_is_listed "$PROBE_NAME"; then
-            PROBE_STARTED=false
-            return 0
-        fi
-        sleep "$POLL_DELAY"
-    done
-    [[ "$deleted" == "true" ]] || return 1
-    return 1
-}
-
-cleanup_on_exit() {
-    local status=$?
-    trap - EXIT
-    if ! delete_probe; then
-        echo "ERROR: Readiness probe sandbox cleanup could not be verified" >&2
-        status=1
-    fi
-    exit "$status"
-}
-trap cleanup_on_exit EXIT
-
-run_create_delete_probe() {
-    local attempt
-    PROBE_STARTED=true
-    if ! "$OPENSHELL_BIN" sandbox create \
-        --name "$PROBE_NAME" \
-        --from "$IMAGE_NAME" \
-        --policy "$POLICY_FILE" \
-        --label aiq=readiness-probe \
-        --no-auto-providers \
-        --no-tty \
-        -- true >/dev/null 2>&1; then
-        fail "Gateway sandbox create probe failed"
-    fi
-    for attempt in $(seq 1 "$PROBE_ATTEMPTS"); do
-        if sandbox_is_ready "$PROBE_NAME"; then
-            if ! delete_probe; then
-                fail "Gateway sandbox delete probe failed"
-            fi
-            echo "OpenShell gateway create/delete probe succeeded: $GATEWAY_NAME"
-            return
-        fi
-        sleep "$POLL_DELAY"
-    done
-    fail "Gateway sandbox probe did not become Ready"
 }
 
 create_shared_debug_sandbox() {
@@ -292,7 +248,7 @@ main() {
     resolve_dependencies
     validate_gateway_registration
     wait_for_gateway
-    run_create_delete_probe
+    run_strict_readiness_check
     create_shared_debug_sandbox
 }
 

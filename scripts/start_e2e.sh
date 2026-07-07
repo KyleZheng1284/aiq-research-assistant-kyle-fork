@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --config_file <path>  Path to config file (default: configs/config_web_default_llamaindex.yml)"
             echo "  --port PORT           Backend server port (default: 8000)"
-            echo "  --start-openshell-gateway  Start/verify an authenticated gateway and run its create/delete probe"
+            echo "  --start-openshell-gateway  Start/verify an authenticated gateway and run its strict capability probe"
             echo "  --help, -h            Show this help message"
             echo ""
             echo "Examples:"

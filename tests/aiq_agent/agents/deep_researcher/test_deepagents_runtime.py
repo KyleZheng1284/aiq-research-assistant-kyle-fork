@@ -313,6 +313,7 @@ class TestDeepAgentsRuntimeJobId:
             openshell_image="aiq:test",
             attest=True,
             expected_policy_version=3,
+            policy_load_timeout_seconds=17,
             network="allowlist",
             network_allow=("api.github.com",),
         )
@@ -329,6 +330,7 @@ class TestDeepAgentsRuntimeJobId:
         assert resolved.providers.openshell.image == "aiq:test"
         assert resolved.providers.openshell.attest is True
         assert resolved.providers.openshell.expected_policy_version == 3
+        assert resolved.providers.openshell.policy_load_timeout_seconds == 17
         assert resolved.providers.openshell.delete_on_exit is True
 
     def test_public_allowlist_requires_hosts(self) -> None:

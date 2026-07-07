@@ -407,27 +407,25 @@ EOF
     log "Reasserting deepagents>=0.6.5 (AI-Q runtime floor) after adapter install"
     uv pip install "deepagents>=0.6.5"
 
+    # Adapter dependency resolution must not silently change the operator-selected
+    # OpenShell SDK/CLI version. Reapply the exact pin after every dependent package.
+    log "Reasserting exact OpenShell version after adapter install: openshell==$OPENSHELL_VERSION"
+    uv pip install "openshell==$OPENSHELL_VERSION"
+
     local installed
     installed="$("$VENV_DIR/bin/python" - <<'PY'
 import openshell
 print(getattr(openshell, "__version__", "unknown"))
 PY
 )"
-    # The adapter pins openshell>=0.0.68 and may upgrade the package above the requested
-    # version during its own install; only a version BELOW the requested floor is an error
-    # (an exact-match check would spuriously fail on that allowed adapter-driven upgrade).
+    # CLI, SDK, and gateway compatibility is validated again by the strict readiness
+    # checker. Provisioning still guarantees that the selected local SDK is exact.
     if ! "$VENV_DIR/bin/python" - "$OPENSHELL_VERSION" "$installed" <<'PY'
 import sys
-
-
-def parts(v):
-    return tuple(int(p) for p in v.split(".")[:3] if p.isdigit())
-
-
-sys.exit(0 if parts(sys.argv[2]) >= parts(sys.argv[1]) else 1)
+sys.exit(0 if sys.argv[2] == sys.argv[1] else 1)
 PY
     then
-        fail "Installed openshell $installed is older than the requested floor $OPENSHELL_VERSION"
+        fail "Installed openshell $installed does not match the requested version $OPENSHELL_VERSION"
     fi
     "$VENV_DIR/bin/python" - <<'PY'
 import langchain_nvidia_openshell  # noqa: F401
@@ -742,12 +740,14 @@ version: 1
 
 filesystem_policy:
   include_workdir: true
+  # Declare the proxy baseline up front so OpenShell does not create an enriched
+  # revision whose content/hash differs from the policy AI-Q submitted.
   read_only:
     - /usr
     - /lib
     - /etc
     - /var/log
-    - /proc/self
+    - /proc
     - /dev/urandom
   read_write:
     - /sandbox
@@ -866,7 +866,7 @@ Use these exports in shells where you run AI-Q:
   export AIQ_OPENSHELL_IMAGE="$IMAGE_NAME"
   export AIQ_OPENSHELL_POLICY_FILE="$POLICY_FILE"
 
-Start or verify an authenticated gateway and run its create/delete probe:
+Start or verify an authenticated gateway and run its strict capability probe:
 
   ./scripts/start_openshell_gateway.sh
 

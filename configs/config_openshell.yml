@@ -158,6 +158,7 @@ functions:
       - registry.npmjs.org
     timeout: 1200
     idle_timeout: 1800
+    policy_load_timeout_seconds: 30
     delete_on_exit: true
     attest: true
     require_hard_landlock: true

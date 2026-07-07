@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.metadata
 import json
 import logging
 import os
@@ -43,7 +44,7 @@ class LiveConfig:
     gateway: str | None
     policy_path: Path
     image: str
-    expected_gateway_version: str
+    expected_gateway_version: str | None
     allow_best_effort: bool
 
 
@@ -79,7 +80,7 @@ def live_config() -> LiveConfig:
         gateway=os.getenv("AIQ_OPENSHELL_GATEWAY_NAME") or None,
         policy_path=policy_path.resolve(),
         image=os.getenv("AIQ_OPENSHELL_IMAGE", "aiq-openshell-demo:latest"),
-        expected_gateway_version=os.getenv("AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION", "0.0.72"),
+        expected_gateway_version=os.getenv("AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION") or None,
         allow_best_effort=_env_enabled("AIQ_OPENSHELL_LIVE_ALLOW_BEST_EFFORT"),
     )
 
@@ -216,7 +217,8 @@ def resources(live_runtime: LiveRuntime) -> ResourceTracker:
 def require_gateway_version(live_runtime: LiveRuntime) -> str:
     with live_runtime.client() as client:
         version = client.health().version
-    assert version == live_runtime.config.expected_gateway_version, "The OpenShell gateway version is not accepted."
+    expected = live_runtime.config.expected_gateway_version or importlib.metadata.version("openshell")
+    assert version == expected, "The OpenShell gateway and Python SDK versions must match exactly."
     return version
 
 
@@ -266,12 +268,15 @@ def direct_sandbox_factory(
 
     def create(job_id: str) -> str:
         with live_runtime.client() as client:
+            labels = {"aiq": "shared-debug-test"}
             sandbox_ref = client.create(
                 spec=live_runtime.build_sandbox_spec(
                     policy=live_runtime.expected_policy,
                     image=live_runtime.config.image,
                     job_id=job_id,
-                )
+                    labels=labels,
+                ),
+                labels=labels,
             )
             name = resources.direct_sandbox(sandbox_ref.name)
             client.wait_ready(name)
@@ -316,12 +321,8 @@ def _assert_authoritative_policy(runtime: LiveRuntime, client: Any, name: str) -
     assert config.version == revision.version
     if status.active_version:
         assert status.active_version == revision.version
-    else:
-        assert runtime.config.expected_gateway_version == "0.0.72"
     if sandbox.current_policy_version:
         assert sandbox.current_policy_version == revision.version
-    else:
-        assert runtime.config.expected_gateway_version == "0.0.72"
     assert config.policy_source == runtime.sandbox_pb2.POLICY_SOURCE_SANDBOX
     assert config.policy == runtime.expected_policy
     assert revision.policy == runtime.expected_policy
@@ -358,6 +359,14 @@ def test_live_per_job_isolation_attestation_and_cancellation(
     assert names[0] != names[1]
 
     with live_runtime.client() as client:
+        selected = client.list(label_selector="aiq=deep-research")
+        selected_by_name = {item.name: item for item in selected}
+        assert set(names) <= selected_by_name.keys()
+        for index, name in enumerate(names):
+            assert dict(selected_by_name[name].labels) == {
+                "aiq": "deep-research",
+                "aiq-job-id": f"aiq-isolation-{'a' if index == 0 else 'b'}-{suffix}",
+            }
         first, first_revision = _assert_authoritative_policy(live_runtime, client, names[0])
         second, second_revision = _assert_authoritative_policy(live_runtime, client, names[1])
         assert first.id != second.id
@@ -366,6 +375,9 @@ def test_live_per_job_isolation_attestation_and_cancellation(
 
         providers[0].terminate()
         _assert_deleted(live_runtime, client, names[0])
+        selected_names = {item.name for item in client.list(label_selector="aiq=deep-research")}
+        assert names[0] not in selected_names
+        assert names[1] in selected_names
         assert client.get(names[1]).id == second.id
         result = providers[1].execute("printf %s still-alive", timeout=30)
         assert result.exit_code == 0
@@ -373,6 +385,7 @@ def test_live_per_job_isolation_attestation_and_cancellation(
 
         providers[1].close()
         _assert_deleted(live_runtime, client, names[1])
+        assert names[1] not in {item.name for item in client.list(label_selector="aiq=deep-research")}
 
 
 def test_live_failure_cleanup_and_log_redaction(

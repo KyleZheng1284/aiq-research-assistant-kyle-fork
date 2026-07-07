@@ -44,8 +44,8 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--expected-gateway-version",
-        default=os.getenv("AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION", "0.0.72"),
-        help="Fail unless the live gateway reports this exact version",
+        default=os.getenv("AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION"),
+        help="Optional exact gateway version; default requires it to match the installed SDK",
     )
     parser.add_argument(
         "--allow-best-effort-landlock",
@@ -64,7 +64,10 @@ def _environment(args: argparse.Namespace, source: Mapping[str, str] | None = No
         env.pop("AIQ_OPENSHELL_GATEWAY_NAME", None)
     env["AIQ_OPENSHELL_POLICY_FILE"] = args.policy
     env["AIQ_OPENSHELL_IMAGE"] = args.image
-    env["AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION"] = args.expected_gateway_version
+    if args.expected_gateway_version:
+        env["AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION"] = args.expected_gateway_version
+    else:
+        env.pop("AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION", None)
     if args.allow_best_effort_landlock:
         env["AIQ_OPENSHELL_LIVE_ALLOW_BEST_EFFORT"] = "1"
     return env

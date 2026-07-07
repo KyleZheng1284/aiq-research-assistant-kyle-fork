@@ -192,6 +192,7 @@ def _fake_optional_modules(context_factory, adapter_cls: type = _FakeAdapter):
         SANDBOX_PHASE_READY=2,
         SANDBOX_PHASE_ERROR=3,
         POLICY_STATUS_UNSPECIFIED=0,
+        POLICY_STATUS_PENDING=1,
         POLICY_STATUS_LOADED=2,
         POLICY_STATUS_FAILED=3,
         GetSandboxPolicyStatusRequest=lambda **kwargs: SimpleNamespace(**kwargs),
@@ -419,12 +420,44 @@ def test_per_job_session_uses_policy_spec_and_attests_before_return(
     assert backend.id == context.id
     assert context.enter_calls == 1
     assert kwargs["spec"] == "job-spec"
+    assert kwargs["labels"] == {"aiq": "deep-research", "aiq-job-id": "job-123"}
     assert kwargs["delete_on_exit"] is True
     assert "sandbox" not in kwargs
     assert provider.physical_sandbox_name == "generated"
     assert "sensitive-gateway-name" not in caplog.text
     context._client._stub.GetSandboxPolicyStatus.assert_called_once()  # type: ignore[attr-defined]
     context._client._stub.GetSandboxConfig.assert_called_once()  # type: ignore[attr-defined]
+
+
+def test_per_job_session_fails_before_creation_when_request_labels_are_unsupported(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+
+    def context_factory(
+        *,
+        cluster: str | None,
+        ready_timeout_seconds: float,
+        spec: object,
+        delete_on_exit: bool,
+    ) -> _FakeCreatedContext:
+        del cluster, ready_timeout_seconds, spec, delete_on_exit
+        raise AssertionError("unsupported SDK must fail before creating a sandbox")
+
+    with (
+        _fake_optional_modules(context_factory),
+        patch(
+            "aiq_agent.agents.deep_researcher.sandbox.providers.openshell._parse_policy_proto",
+            return_value=_FAKE_POLICY,
+        ),
+    ):
+        provider = OpenShellSandboxProvider(
+            SandboxConfig(provider="openshell", providers={"openshell": {"policy": str(policy_path)}}),
+            "job-123",
+        )
+        with pytest.raises(RuntimeError, match="request_labels_unsupported"):
+            provider._create_session()
+
+    assert provider._os_context is None
 
 
 def test_two_jobs_create_distinct_specs_without_named_attachment(tmp_path: Path) -> None:
@@ -437,8 +470,9 @@ def test_two_jobs_create_distinct_specs_without_named_attachment(tmp_path: Path)
         created.append(kwargs)
         return _FakeCreatedContext(name=f"generated-{len(created)}")
 
-    def build_spec(*, policy: Any, image: str, job_id: str) -> str:
+    def build_spec(*, policy: Any, image: str, job_id: str, labels: dict[str, str]) -> str:
         del policy, image
+        assert labels == {"aiq": "deep-research", "aiq-job-id": job_id}
         spec_jobs.append(job_id)
         return f"spec-{job_id}"
 
@@ -556,6 +590,33 @@ def test_attestation_refreshes_ready_sandbox_until_policy_is_loaded(tmp_path: Pa
     assert succeeded[0]["data"]["assurance"] == "strict"  # type: ignore[index]
 
 
+def test_attestation_polls_pending_revision_until_loaded() -> None:
+    context = _FakeCreatedContext(policy_version=0)
+    status_rpc = context._client._stub.GetSandboxPolicyStatus  # type: ignore[attr-defined]
+    loaded = status_rpc.return_value
+    pending = SimpleNamespace(
+        revision=SimpleNamespace(**{**vars(loaded.revision), "status": 1}),
+        active_version=0,
+    )
+    status_rpc.side_effect = [pending, loaded]
+
+    result = _run_attestation(context, policy_load_timeout_seconds=1.0)
+
+    assert result.policy_version == 1
+    assert status_rpc.call_count == 2
+    assert context._client._stub.GetSandboxConfig.call_count == 2  # type: ignore[attr-defined]
+
+
+def test_attestation_classifies_effective_policy_that_remains_pending() -> None:
+    context = _FakeCreatedContext(policy_version=0)
+    status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
+    status.revision.status = 1
+    status.active_version = 0
+
+    with pytest.raises(RuntimeError, match="policy_status_inconsistent"):
+        _run_attestation(context, policy_load_timeout_seconds=0.001)
+
+
 def _run_attestation(
     context: _FakeCreatedContext,
     *,
@@ -599,7 +660,7 @@ def test_attestation_rejects_version_disagreement(field: str) -> None:
         _run_attestation(context)
 
 
-def test_attestation_accepts_openshell_0072_zero_active_version_compatibility() -> None:
+def test_attestation_accepts_unreported_optional_versions() -> None:
     context = _FakeCreatedContext(policy_version=0)
     status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
     status.active_version = 0
@@ -607,27 +668,17 @@ def test_attestation_accepts_openshell_0072_zero_active_version_compatibility() 
     result = _run_attestation(context)
 
     assert result.policy_version == 1
-    context._client.health.assert_called_once_with()  # type: ignore[attr-defined]
+    context._client.health.assert_not_called()  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize("gateway_version", ["0.0.71", "0.0.73", ""])
-def test_attestation_rejects_zero_active_version_outside_openshell_0072(gateway_version: str) -> None:
-    context = _FakeCreatedContext(policy_version=0)
-    status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
-    status.active_version = 0
-    context._client.health.return_value.version = gateway_version  # type: ignore[attr-defined]
-
-    with pytest.raises(RuntimeError, match="version_mismatch"):
-        _run_attestation(context)
-
-
-def test_attestation_rejects_zero_active_version_with_positive_current_version() -> None:
+def test_attestation_accepts_unreported_active_version_with_matching_current_version() -> None:
     context = _FakeCreatedContext(policy_version=1)
     status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
     status.active_version = 0
 
-    with pytest.raises(RuntimeError, match="version_mismatch"):
-        _run_attestation(context)
+    result = _run_attestation(context)
+
+    assert result.policy_version == 1
 
 
 @pytest.mark.parametrize(
@@ -1128,6 +1179,12 @@ def test_context_exit_failure_marks_cleanup_failed() -> None:
 def test_cleanup_timeout_must_be_positive_and_finite(timeout: float) -> None:
     with pytest.raises(ValueError, match="cleanup_timeout_seconds"):
         SandboxConfig(provider="openshell", providers={"openshell": {"cleanup_timeout_seconds": timeout}})
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_policy_load_timeout_must_be_positive_and_finite(timeout: float) -> None:
+    with pytest.raises(ValueError, match="policy_load_timeout_seconds"):
+        SandboxConfig(provider="openshell", providers={"openshell": {"policy_load_timeout_seconds": timeout}})
 
 
 def test_deferred_context_cleanup_timeout_is_terminal() -> None:

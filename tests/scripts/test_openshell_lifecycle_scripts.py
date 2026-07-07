@@ -67,6 +67,19 @@ def _run_launcher(
     extra_env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     binary, log, state = _fake_openshell(tmp_path)
+    python_wrapper = tmp_path / "python"
+    python_wrapper.write_text(
+        """#!/bin/bash
+set -euo pipefail
+if [[ "${1:-}" == *check_openshell_readiness.py ]]; then
+    echo "readiness-checker $*" >>"$FAKE_LOG"
+    exit "${FAKE_READINESS_EXIT:-0}"
+fi
+exec "$REAL_PYTHON" "$@"
+""",
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o755)
     policy = tmp_path / "policy.yaml"
     policy.write_text("version: 1\n", encoding="utf-8")
     env = os.environ.copy()
@@ -75,7 +88,8 @@ def _run_launcher(
     env.update(
         {
             "OPENSHELL_BIN": str(binary),
-            "PYTHON_BIN": sys.executable,
+            "PYTHON_BIN": str(python_wrapper),
+            "REAL_PYTHON": sys.executable,
             "FAKE_LOG": str(log),
             "FAKE_STATE": str(state),
             "FAKE_GATEWAYS_JSON": json.dumps([gateway]),
@@ -104,7 +118,7 @@ def _run_launcher(
     return result, log.read_text(encoding="utf-8") if log.exists() else ""
 
 
-def test_authenticated_gateway_runs_mandatory_create_delete_probe(tmp_path: Path) -> None:
+def test_authenticated_gateway_runs_mandatory_strict_readiness_check(tmp_path: Path) -> None:
     result, calls = _run_launcher(
         tmp_path,
         gateway={
@@ -119,8 +133,8 @@ def test_authenticated_gateway_runs_mandatory_create_delete_probe(tmp_path: Path
     assert result.returncode == 0, result.stderr
     assert "gateway list -o json" in calls
     assert "gateway select enterprise" in calls
-    assert "sandbox create" in calls
-    assert "sandbox delete" in calls
+    assert "readiness-checker" in calls
+    assert "--gateway-name enterprise" in calls
     assert "gateway add" not in calls
 
 
@@ -159,7 +173,7 @@ def test_raw_gateway_launcher_is_rejected_independent_of_probe_mode(tmp_path: Pa
     assert calls == ""
 
 
-def test_failed_readiness_probe_still_deletes_sandbox(tmp_path: Path) -> None:
+def test_failed_strict_readiness_check_stops_launcher(tmp_path: Path) -> None:
     result, calls = _run_launcher(
         tmp_path,
         gateway={
@@ -169,12 +183,12 @@ def test_failed_readiness_probe_still_deletes_sandbox(tmp_path: Path) -> None:
             "auth": "mtls",
             "active": True,
         },
-        extra_env={"FAKE_NEVER_READY": "true"},
+        extra_env={"FAKE_READINESS_EXIT": "1"},
     )
 
     assert result.returncode != 0
-    assert "sandbox create" in calls
-    assert "sandbox delete" in calls
+    assert "readiness-checker" in calls
+    assert "strict readiness check failed" in result.stderr.lower()
 
 
 def test_setup_is_provisioning_only_and_migrates_old_lifecycle_flags() -> None:
@@ -192,6 +206,14 @@ def test_setup_is_provisioning_only_and_migrates_old_lifecycle_flags() -> None:
     )
     assert result.returncode != 0
     assert "start_openshell_gateway.sh" in result.stderr
+
+
+def test_setup_policy_declares_canonical_openshell_proxy_baseline() -> None:
+    source = _SETUP_SCRIPT.read_text(encoding="utf-8")
+    policy_template = source.split("emit_policy_header()", maxsplit=1)[1].split("emit_policy_entry()", maxsplit=1)[0]
+
+    assert "    - /proc\n" in policy_template
+    assert "/proc/self" not in policy_template
 
 
 def test_e2e_gateway_start_is_explicit_opt_in() -> None:

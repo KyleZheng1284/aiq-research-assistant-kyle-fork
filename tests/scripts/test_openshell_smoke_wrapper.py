@@ -70,10 +70,15 @@ def test_wrapper_translates_arguments_and_preserves_environment(
     assert env["AIQ_OPENSHELL_LIVE_ALLOW_BEST_EFFORT"] == "1"
 
 
-def test_wrapper_uses_generated_policy_and_single_pytest_target(wrapper: ModuleType) -> None:
+def test_wrapper_uses_generated_policy_and_single_pytest_target(
+    wrapper: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION", raising=False)
     args = wrapper._args([])
 
     assert args.policy == "configs/openshell/generated/aiq-openshell-policy.yaml"
+    assert args.expected_gateway_version is None
     assert wrapper._command()[-1] == _LIVE_TEST
     assert wrapper._command().count(_LIVE_TEST) == 1
 

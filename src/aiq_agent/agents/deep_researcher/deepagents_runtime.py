@@ -115,6 +115,12 @@ class DeepResearchSandboxConfig(FunctionBaseConfig, name="deep_research_sandbox"
         default=300.0,
         description="Seconds to wait for the OpenShell sandbox to become ready.",
     )
+    policy_load_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Seconds to wait for the authoritative OpenShell policy revision to become loaded.",
+    )
     delete_on_exit: bool = Field(default=True, description="Delete the OpenShell sandbox when the session closes.")
     attest: bool = Field(default=True, description="Fail closed unless the OpenShell policy revision is loaded.")
     expected_policy_version: int | None = Field(
@@ -571,6 +577,7 @@ def _create_sandbox_backend(config: DeepResearchSandboxConfig, job_id: str) -> A
                 "policy": config.policy,
                 "image": config.openshell_image,
                 "ready_timeout_seconds": config.ready_timeout_seconds,
+                "policy_load_timeout_seconds": config.policy_load_timeout_seconds,
                 "delete_on_exit": config.delete_on_exit,
                 "attest": config.attest,
                 "expected_policy_version": config.expected_policy_version,
