@@ -43,6 +43,7 @@ from aiq_agent.common import render_prompt_template
 
 from .custom_middleware import ArtifactHarvestMiddleware
 from .custom_middleware import EmptyContentFixMiddleware
+from .custom_middleware import ExecuteTimeoutClampMiddleware
 from .custom_middleware import PlanPersistenceMiddleware
 from .custom_middleware import SourceRegistryMiddleware
 from .custom_middleware import SourceRoutingGuardMiddleware
@@ -492,6 +493,17 @@ def build_deep_research_graph(
     enable_source_router: bool = True,
 ) -> Any:
     """Build the full DeepAgents graph for one deep research run."""
+    # Cross-cutting middleware applied to every agent (researcher, subagents, orchestrator).
+    # Agent-supplied execute timeouts are unreliable (LLMs pass milliseconds or arbitrarily
+    # large values); clamp them to the configured sandbox lifetime so a single execute never
+    # exceeds the provider's hard cap and silently fails every code run.
+    cross_cutting_middleware = runtime_visibility_middleware(runtime)
+    execute_ceiling = runtime.execute_timeout_seconds
+    if execute_ceiling:
+        cross_cutting_middleware = [
+            ExecuteTimeoutClampMiddleware(max_timeout_seconds=execute_ceiling),
+            *cross_cutting_middleware,
+        ]
     context = DeepResearchGraphContext(
         llm_provider=llm_provider,
         state=state,
@@ -505,7 +517,7 @@ def build_deep_research_graph(
         max_research_concurrency=max_research_concurrency,
         enable_source_router=enable_source_router,
         backend=runtime.backend,
-        visibility_middleware=runtime_visibility_middleware(runtime),
+        visibility_middleware=cross_cutting_middleware,
     )
     researcher_model = context.llm_provider.get(LLMRole.RESEARCHER)
     researcher_skill_sources = context.skill_sources(RESEARCHER_AGENT)

@@ -181,6 +181,19 @@ class DeepAgentsRuntime:
         """Return true when any agent has configured skill sources."""
         return bool(self._skill_sources)
 
+    @property
+    def execute_timeout_seconds(self) -> int | None:
+        """Per-call ``execute`` timeout ceiling (seconds), sourced from the sandbox config.
+
+        Agent-supplied execute timeouts are unreliable (LLMs pass milliseconds where the
+        backend expects seconds, or an arbitrary large value), so callers clamp to this
+        configured sandbox lifetime to keep a single execute under the provider's hard cap.
+        Returns None when no sandbox is configured (execute is unavailable anyway).
+        """
+        if self._sandbox is None:
+            return None
+        return getattr(self._sandbox, "timeout", None)
+
     def skill_sources_for(self, agent_name: str) -> list[str] | None:
         """Return DeepAgents source paths for an agent/subagent name."""
         sources = self._skill_sources_by_agent.get(agent_name)

@@ -26,6 +26,7 @@ from langchain_core.messages import SystemMessage
 from langchain_core.messages import ToolMessage
 
 from aiq_agent.agents.deep_researcher.custom_middleware import ArtifactHarvestMiddleware
+from aiq_agent.agents.deep_researcher.custom_middleware import ExecuteTimeoutClampMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import PlanPersistenceMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRegistryMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRoutingGuardMiddleware
@@ -115,6 +116,85 @@ class TestSourceRoutingGuardMiddleware:
 
         handler.assert_awaited_once_with(request)
         assert result is expected
+
+
+class TestExecuteTimeoutClampMiddleware:
+    """Tests for clamping the sandbox execute tool's per-call timeout."""
+
+    @staticmethod
+    def _request(tool_name: str, *, args: dict | None = None) -> MagicMock:
+        request = MagicMock()
+        request.tool_call = {"name": tool_name, "args": args if args is not None else {}, "id": "tc1"}
+
+        def _override(*, tool_call):
+            overridden = MagicMock()
+            overridden.tool_call = tool_call
+            return overridden
+
+        request.override.side_effect = _override
+        return request
+
+    @pytest.mark.asyncio
+    async def test_clamps_oversized_timeout(self):
+        """An agent timeout above the ceiling is reduced to the configured maximum."""
+        middleware = ExecuteTimeoutClampMiddleware(max_timeout_seconds=1200)
+        handler = AsyncMock(return_value=ToolMessage(content="ok", tool_call_id="tc1"))
+        request = self._request("execute", args={"command": "python x.py", "timeout": 120000})
+
+        await middleware.awrap_tool_call(request, handler)
+
+        request.override.assert_called_once()
+        forwarded = handler.await_args.args[0]
+        assert forwarded.tool_call["args"]["timeout"] == 1200
+        assert forwarded.tool_call["args"]["command"] == "python x.py"
+
+    @pytest.mark.asyncio
+    async def test_timeout_within_ceiling_passthrough(self):
+        """A reasonable timeout is left untouched (no override)."""
+        middleware = ExecuteTimeoutClampMiddleware(max_timeout_seconds=1200)
+        handler = AsyncMock(return_value=ToolMessage(content="ok", tool_call_id="tc1"))
+        request = self._request("execute", args={"command": "python x.py", "timeout": 60})
+
+        await middleware.awrap_tool_call(request, handler)
+
+        request.override.assert_not_called()
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_nonpositive_timeout_passthrough(self):
+        """A non-positive timeout means 'no timeout' to the backend and is not clamped."""
+        middleware = ExecuteTimeoutClampMiddleware(max_timeout_seconds=1200)
+        handler = AsyncMock(return_value=ToolMessage(content="ok", tool_call_id="tc1"))
+        request = self._request("execute", args={"command": "python x.py", "timeout": 0})
+
+        await middleware.awrap_tool_call(request, handler)
+
+        request.override.assert_not_called()
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_missing_timeout_passthrough(self):
+        """execute calls without a timeout arg are forwarded unchanged."""
+        middleware = ExecuteTimeoutClampMiddleware(max_timeout_seconds=1200)
+        handler = AsyncMock(return_value=ToolMessage(content="ok", tool_call_id="tc1"))
+        request = self._request("execute", args={"command": "python x.py"})
+
+        await middleware.awrap_tool_call(request, handler)
+
+        request.override.assert_not_called()
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_non_execute_tool_passthrough(self):
+        """A large timeout on a non-execute tool is ignored by this middleware."""
+        middleware = ExecuteTimeoutClampMiddleware(max_timeout_seconds=1200)
+        handler = AsyncMock(return_value=ToolMessage(content="ok", tool_call_id="tc1"))
+        request = self._request("ls", args={"path": "/shared", "timeout": 120000})
+
+        await middleware.awrap_tool_call(request, handler)
+
+        request.override.assert_not_called()
+        handler.assert_awaited_once_with(request)
 
 
 class TestToolNameSanitizationMiddleware:
