@@ -511,23 +511,13 @@ export const createDeepResearchClient = (options: DeepResearchStreamOptions): De
 
       case 'artifact.update': {
         // artifact.update has nested structure: { id, timestamp, data: { type, content, url?, output_category? }, metadata?: { workflow } }
-        const artifactWrapper = rawData as {
-          data?: {
-            type: ArtifactType
-            content?: string | TodoItem[]
-            url?: string
-            content_url?: string
-            output_category?: string
-          }
-          type?: ArtifactType
-          content?: string | TodoItem[]
-          url?: string
-          content_url?: string
-          output_category?: string
-          metadata?: { workflow?: string }
-        }
+        // Reuse the exported ArtifactUpdateEvent data contract (durable metadata fields
+        // included) instead of re-declaring a narrower shape; `path`/`output_category` are
+        // the two extra keys this parser also reads.
+        type ArtifactData = ArtifactUpdateEvent['data']['data'] & { path?: string; output_category?: string }
+        const artifactWrapper = rawData as { data?: ArtifactData; metadata?: { workflow?: string } } & Partial<ArtifactData>
         // Handle both nested (data.type) and flat (type) structures
-        const artifactData = artifactWrapper.data || artifactWrapper
+        const artifactData = (artifactWrapper.data || artifactWrapper) as ArtifactData
         const artifactWorkflow = artifactWrapper.metadata?.workflow
 
         switch (artifactData.type) {
@@ -544,30 +534,24 @@ export const createDeepResearchClient = (options: DeepResearchStreamOptions): De
             break
           case 'file': {
             // Generated artifacts carry durable metadata; legacy text-file events carry content.
-            const raw = artifactData as Record<string, unknown>
-            const artifactId = typeof raw.artifact_id === 'string' ? raw.artifact_id : undefined
+            const artifactId = artifactData.artifact_id
             // Fall back to artifactId (not a shared 'unknown') when no path/url is present, so two
             // distinct pathless artifacts don't collapse onto one filename key downstream.
-            const filePath = (raw.file_path || raw.path || artifactData.url) as string | undefined
+            const filePath = artifactData.file_path || artifactData.path || artifactData.url
             const fileName = filePath ? filePath.split('/').pop() || filePath : artifactId || 'unknown'
             callbacks.onFileUpdate?.({
               filename: fileName,
+              // content is typed as string | TodoItem[]; only a string is a real file body.
               content: typeof artifactData.content === 'string' ? artifactData.content : undefined,
               artifactId,
-              contentUrl: artifactId
-                ? artifactContentPath(jobId, artifactId)
-                : typeof raw.content_url === 'string'
-                  ? raw.content_url
-                  : typeof raw.url === 'string'
-                    ? raw.url
-                    : undefined,
-              kind: typeof raw.kind === 'string' ? raw.kind : undefined,
-              mimeType: typeof raw.mime_type === 'string' ? raw.mime_type : undefined,
-              sizeBytes: typeof raw.size_bytes === 'number' ? raw.size_bytes : undefined,
-              sha256: typeof raw.sha256 === 'string' ? raw.sha256 : undefined,
-              title: typeof raw.title === 'string' ? raw.title : undefined,
-              caption: typeof raw.caption === 'string' ? raw.caption : undefined,
-              inline: typeof raw.inline === 'boolean' ? raw.inline : undefined,
+              contentUrl: artifactId ? artifactContentPath(jobId, artifactId) : artifactData.content_url || artifactData.url,
+              kind: artifactData.kind,
+              mimeType: artifactData.mime_type,
+              sizeBytes: artifactData.size_bytes,
+              sha256: artifactData.sha256,
+              title: artifactData.title,
+              caption: artifactData.caption,
+              inline: artifactData.inline,
             })
             break
           }
