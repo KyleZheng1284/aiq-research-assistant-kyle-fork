@@ -12,7 +12,7 @@
  */
 
 import { apiConfig } from './config'
-import { artifactContentPath } from '@/shared/components/MarkdownRenderer/artifact-url'
+import { artifactContentPath } from '@/shared/utils/artifact-url'
 
 // ============================================================
 // Types
@@ -545,9 +545,11 @@ export const createDeepResearchClient = (options: DeepResearchStreamOptions): De
           case 'file': {
             // Generated artifacts carry durable metadata; legacy text-file events carry content.
             const raw = artifactData as Record<string, unknown>
-            const filePath = (raw.file_path || raw.path || artifactData.url || 'unknown') as string
-            const fileName = filePath.split('/').pop() || filePath
             const artifactId = typeof raw.artifact_id === 'string' ? raw.artifact_id : undefined
+            // Fall back to artifactId (not a shared 'unknown') when no path/url is present, so two
+            // distinct pathless artifacts don't collapse onto one filename key downstream.
+            const filePath = (raw.file_path || raw.path || artifactData.url) as string | undefined
+            const fileName = filePath ? filePath.split('/').pop() || filePath : artifactId || 'unknown'
             callbacks.onFileUpdate?.({
               filename: fileName,
               content: typeof artifactData.content === 'string' ? artifactData.content : undefined,

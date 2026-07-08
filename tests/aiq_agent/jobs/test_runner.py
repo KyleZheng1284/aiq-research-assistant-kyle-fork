@@ -2490,3 +2490,29 @@ class TestTerminalTeardown:
 
         runtime.finalize_artifacts.assert_called_once_with(interrupted=False)
         assert order == ["harvest", "close"]
+
+    def test_harvest_persists_artifacts_without_releasing_sandbox(self):
+        from aiq_api.jobs.runner import _harvest_sandbox_artifacts
+
+        # Runs before the terminal status: artifacts must be persisted, but the
+        # unbounded close()/terminate() must NOT run here (deferred to finally),
+        # so a hanging SDK cleanup cannot strand a finished job in RUNNING.
+        runtime = MagicMock(spec=["close", "terminate", "finalize_artifacts"])
+        _harvest_sandbox_artifacts(runtime, job_id="job-1", interrupted=False)
+
+        runtime.finalize_artifacts.assert_called_once_with(interrupted=False)
+        runtime.close.assert_not_called()
+        runtime.terminate.assert_not_called()
+
+    def test_harvest_none_runtime_is_noop(self):
+        from aiq_api.jobs.runner import _harvest_sandbox_artifacts
+
+        _harvest_sandbox_artifacts(None, job_id="job-1", interrupted=False)
+
+    def test_harvest_never_raises_when_finalize_fails(self):
+        from aiq_api.jobs.runner import _harvest_sandbox_artifacts
+
+        runtime = MagicMock(spec=["finalize_artifacts"])
+        runtime.finalize_artifacts.side_effect = RuntimeError("artifact scan failed")
+        # Artifact capture cannot replace or block the job result.
+        _harvest_sandbox_artifacts(runtime, job_id="job-1", interrupted=False)

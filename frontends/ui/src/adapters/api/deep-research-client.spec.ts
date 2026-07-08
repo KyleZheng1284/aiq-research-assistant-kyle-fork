@@ -106,4 +106,30 @@ describe('deep research REST client', () => {
       expect.objectContaining({ filename: 'report.md', content: '# Report' })
     )
   })
+
+  test('maps url-only artifacts (no artifact_id) via the content_url/url fallback', () => {
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const onFileUpdate = vi.fn()
+    const client = createDeepResearchClient({ jobId: 'job-1', callbacks: { onFileUpdate } })
+    client.connect()
+
+    // No artifact_id: filename derives from the url and contentUrl falls back to content_url.
+    FakeEventSource.latest?.emit('artifact.update', {
+      data: {
+        type: 'file',
+        url: 'https://example.com/exports/data.csv',
+        content_url: 'https://example.com/exports/data.csv',
+        mime_type: 'text/csv',
+      },
+    })
+
+    expect(onFileUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        filename: 'data.csv',
+        artifactId: undefined,
+        contentUrl: 'https://example.com/exports/data.csv',
+        mimeType: 'text/csv',
+      })
+    )
+  })
 })

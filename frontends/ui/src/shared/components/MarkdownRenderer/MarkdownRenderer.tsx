@@ -9,7 +9,7 @@ import remarkGfm from 'remark-gfm'
 import { Text, CodeSnippet, Anchor } from '@/adapters/ui'
 import type { MarkdownRendererProps } from './types'
 import { getLanguageFromClassName } from './utils'
-import { ARTIFACT_SCHEME, isArtifactRef, resolveArtifactUrl } from './artifact-url'
+import { ARTIFACT_SCHEME, isArtifactRef, resolveArtifactUrl } from '@/shared/utils/artifact-url'
 
 // react-markdown's default sanitizer strips non-standard URL schemes, which would blank the
 // src of `artifact://<id>` images before the `img` renderer can resolve them. Preserve that

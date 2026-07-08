@@ -154,7 +154,7 @@ is lifted into `providers.modal`.
 
 - Generated code writes binaries + a `manifest.json` to `artifact_dir`.
 - Successful `execute` calls trigger a manifest-only checkpoint. Terminal finalization runs
-  one manifest + directory scan on success or failure. Cancellation attempts that scan only
+  one manifest + directory scan on success or failure. On cancellation, that scan runs only
   when the provider operation lease is immediately available; a busy sandbox is terminated
   immediately, while completed execute outputs remain preserved by earlier checkpoints.
 - The `ArtifactManager` pulls bytes via `download_files`, runs the validation pipeline

@@ -192,6 +192,25 @@ class TestHarvest:
         assert [artifact.filename for artifact in captured] == ["chart.png"]
         assert manager.backend.execute_calls == []
 
+    def test_final_harvest_after_checkpoint_does_not_reemit(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        png_path = f"{_ARTIFACT_DIR}/chart.png"
+        csv_path = f"{_ARTIFACT_DIR}/chart.csv"
+        files = {
+            f"{_ARTIFACT_DIR}/manifest.json": _manifest_bytes(png_path),
+            png_path: _PNG,
+            csv_path: b"state,pop\nCA,39431263\n",
+        }
+        manager, emitted = _make_manager(store, files)
+
+        checkpointed = manager.harvest_after_execute()
+        assert [artifact.filename for artifact in checkpointed] == ["chart.png"]
+
+        finalized = manager.final_harvest()
+        # chart.png was already captured at checkpoint; only the scan-discovered CSV is new.
+        assert [artifact.filename for artifact in finalized] == ["chart.csv"]
+        assert len(emitted) == 2
+
     def test_scan_fallback_without_manifest(self, tmp_path: Any) -> None:
         store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
         png_path = f"{_ARTIFACT_DIR}/chart.png"

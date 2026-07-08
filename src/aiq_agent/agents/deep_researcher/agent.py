@@ -184,7 +184,12 @@ class DeepResearcherAgent:
     def _extract_final_markdown(self, result: dict | Any, files: dict[str, Any] | None = None) -> str | None:
         """Extract final Markdown from output files."""
         output_paths = ("/shared/output.md", "/output.md")
-        files = result.get("files", None) if isinstance(result, dict) else getattr(result, "files", None) or files or {}
+        # Resolve result files first, then fall back to the passed-in files (state.files) and
+        # finally an empty dict. Without the explicit grouping, `or files or {}` bound only to
+        # the else branch, so a dict result lacking a usable "files" key silently discarded the
+        # fallback and skipped straight to inline salvage even when output files existed.
+        result_files = result.get("files", None) if isinstance(result, dict) else getattr(result, "files", None)
+        files = result_files or files or {}
         if isinstance(files, dict):
             for output_path in output_paths:
                 output_entry = files.get(output_path)

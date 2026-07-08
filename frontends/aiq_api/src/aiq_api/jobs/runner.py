@@ -798,10 +798,12 @@ async def run_agent_job(
                     # Signal event stream completion
                     event_stream.on_complete()
 
-                    # Finalize before SUCCESS so clients cannot stop streaming before
-                    # the terminal artifact scan and emitted metadata are durable.
+                    # Harvest artifacts (durable, idempotent) before SUCCESS so clients cannot
+                    # stop streaming before the terminal metadata is persisted. Resource release
+                    # is deferred to the finally block: the provider's close() is unbounded, so
+                    # awaiting it here could strand a finished job in RUNNING if SDK cleanup hangs.
                     await asyncio.to_thread(
-                        _teardown_sandbox,
+                        _harvest_sandbox_artifacts,
                         sandbox_runtime,
                         job_id=job_id,
                         interrupted=False,
@@ -864,7 +866,7 @@ async def run_agent_job(
         if event_store is None:
             event_store = BatchingEventStore(EventStore(db_url, job_id))
 
-        await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=False)
+        await asyncio.to_thread(_harvest_sandbox_artifacts, sandbox_runtime, job_id=job_id, interrupted=False)
         _store_terminal_event_best_effort(
             event_store,
             {
@@ -915,12 +917,13 @@ def _store_terminal_event_best_effort(event_store, event: dict) -> None:
         )
 
 
-def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: bool) -> None:
-    """Harvest artifacts and release sandbox resources on a terminal path.
+def _harvest_sandbox_artifacts(sandbox_runtime: Any | None, *, job_id: str, interrupted: bool) -> None:
+    """Persist captured artifacts on a terminal path without releasing the sandbox.
 
-    Interrupted jobs (cancel/timeout) call ``terminate()`` so a still-running ``execute`` is
-    forcibly preempted; normal paths call ``close()`` gracefully. Both are idempotent. This runs
-    off the event loop (``asyncio.to_thread``) so the SDK session close cannot block the worker.
+    Callable before the terminal job status so artifact metadata is durable, yet it never invokes
+    the provider's unbounded ``close()``/``terminate()``. Resource release stays in
+    ``_teardown_sandbox`` (run from ``finally``) so a hanging SDK cleanup cannot strand a finished
+    job in ``RUNNING`` with a stream that never terminates. The harvest is idempotent.
     """
     if sandbox_runtime is None:
         return
@@ -934,6 +937,18 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
                 job_id,
                 exc.__class__.__name__,
             )
+
+
+def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: bool) -> None:
+    """Harvest artifacts and release sandbox resources on a terminal path.
+
+    Interrupted jobs (cancel/timeout) call ``terminate()`` so a still-running ``execute`` is
+    forcibly preempted; normal paths call ``close()`` gracefully. Both are idempotent. This runs
+    off the event loop (``asyncio.to_thread``) so the SDK session close cannot block the worker.
+    """
+    if sandbox_runtime is None:
+        return
+    _harvest_sandbox_artifacts(sandbox_runtime, job_id=job_id, interrupted=interrupted)
     teardown = getattr(sandbox_runtime, "terminate", None) if interrupted else None
     if teardown is None:
         teardown = getattr(sandbox_runtime, "close", None)
@@ -941,8 +956,11 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
         return
     try:
         teardown()
-    except Exception:  # noqa: BLE001 - cleanup must never raise on the terminal path
-        logger.warning("Sandbox cleanup failed for job %s", job_id, exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - cleanup must never raise on the terminal path
+        # Secret-safe: log only the exception type. A provider cleanup error can carry a
+        # credential or internal hostname, which must never reach the logs (matches the
+        # finalize_artifacts handler above).
+        logger.warning("Sandbox cleanup failed for job %s exception=%s", job_id, exc.__class__.__name__)
 
 
 def _create_agent_instance(

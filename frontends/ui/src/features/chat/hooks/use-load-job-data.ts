@@ -575,7 +575,10 @@ export const useLoadJobData = (): UseLoadJobDataReturn => {
             },
 
             onFileUpdate: (file) => {
-              buffer.files.set(file.filename, file)
+              // Merge like the live store: a later metadata-only event must not drop
+              // content from an earlier event for the same filename during replay.
+              const prev = buffer.files.get(file.filename)
+              buffer.files.set(file.filename, prev ? { ...prev, ...file } : file)
             },
 
             onOutputUpdate: (content, outputCategory) => {

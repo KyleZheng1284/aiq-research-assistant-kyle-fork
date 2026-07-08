@@ -488,7 +488,13 @@ export const useDeepResearch = (): UseDeepResearchReturn => {
           },
 
           onFileUpdate: (file) => {
-            if (buf.active) { buf.files.set(file.filename, file); return }
+            if (buf.active) {
+              // Merge like the live store (addDeepResearchFile): a later metadata-only
+              // event must not drop content from an earlier event for the same filename.
+              const prev = buf.files.get(file.filename)
+              buf.files.set(file.filename, prev ? { ...prev, ...file } : file)
+              return
+            }
             if (!isActiveJob()) return
             resetTimeout(); addDeepResearchFile(file)
             // report.md artifact arrives 1-2 min before the final_report output event —
