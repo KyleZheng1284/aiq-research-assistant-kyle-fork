@@ -11,7 +11,7 @@ an orchestrator using the [`deepagents`](https://docs.langchain.com/oss/python/d
 
 **Location:** `src/aiq_agent/agents/deep_researcher/agent.py`
 
-For optional DeepAgents sandbox execution (Modal) and operational notes, see
+For optional DeepAgents sandbox execution (Modal or OpenShell) and operational notes, see
 [Deep Research Sandbox](./sandbox.md).
 
 ## Purpose

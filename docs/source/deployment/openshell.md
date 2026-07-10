@@ -11,6 +11,36 @@ It owns the setup, deployment, acceptance, and troubleshooting contract. The
 architecture and implementation pages describe invariants and extension points;
 they intentionally link here for operational steps.
 
+OpenShell is the primary path for current sandbox-enabled deep-research
+validation. It does not replace AI-Q's non-sandbox workflow defaults, and it
+remains experimental until the Linux hard-Landlock acceptance gate passes.
+
+## AI-Q Environment Prerequisite
+
+Run all commands in this guide from the AI-Q repository root using the standard
+AI-Q virtual environment:
+
+```bash
+./scripts/setup.sh
+source .venv/bin/activate
+```
+
+`setup.sh` installs the locked AI-Q dependencies, API frontends, data sources,
+pre-commit hooks, and UI packages. A new shell must run
+`source .venv/bin/activate` again before validation, tests, or E2E startup.
+
+### Setup Command Overview
+
+| Command | Purpose |
+|---|---|
+| `./scripts/setup.sh` | Create `.venv` and install the standard AI-Q backend, frontend, data-source, and development dependencies |
+| `source .venv/bin/activate` | Select the repository Python environment in the current shell |
+| `./scripts/setup_openshell.sh --policy offline` | Install the pinned OpenShell SDK/adapter, generate a production hard-Landlock policy, and build the sandbox image |
+| `./scripts/setup_openshell.sh --local-demo --policy offline` | Generate the explicit `best_effort` local-demo policy instead of the production policy |
+| `./scripts/start_openshell_gateway.sh` | Start or reuse the packaged authenticated gateway and run the disposable strict capability probe |
+| `nat validate --config_file configs/config_openshell.yml` | Validate the AI-Q workflow and its OpenShell policy/config pairing before startup |
+| `./scripts/start_e2e.sh --start-openshell-gateway --config_file configs/config_openshell.yml` | Re-run gateway readiness, then start the AI-Q backend and UI |
+
 ## Purpose and Security Boundary
 
 OpenShell executes code generated during deep research. AI-Q orchestration,
@@ -34,14 +64,32 @@ own the gateway service, registration, credentials, version, and availability.
 |---|---|---|---|---|
 | Linux + Docker | Production acceptance | `hard_requirement` | systemd or external operator | Tested path after the live suite passes |
 | macOS + Docker Desktop | Local demo | `best_effort` permitted explicitly | Homebrew | Demo only |
-| Linux + Podman | Operator-managed evaluation | `hard_requirement` | external operator/system service | Supported upstream, not automated or certified by PR #298 |
+| Linux + Podman | Operator-managed evaluation | `hard_requirement` | external operator/system service | Supported upstream, not automated or certified by AI-Q acceptance |
 | Remote authenticated gateway | Managed deployment | Gateway-host dependent | external operator | Accepted only after the AI-Q live suite passes |
 | Windows/WSL | -- | -- | -- | Outside current AI-Q setup-script support |
 
-OpenShell supports Docker and rootless Podman upstream. AI-Q's provisioning
-script and PR #298 acceptance certify only the exercised Docker path. Follow the
+OpenShell supports Docker and rootless Podman upstream. AI-Q's provisioning and
+acceptance automation certify only the exercised Docker path. Follow the
 [official OpenShell installation documentation](https://docs.nvidia.com/openshell/latest/about/installation)
 for gateway-host prerequisites and upstream runtime support.
+
+## Known Limitations
+
+- OpenShell integration remains experimental until the Linux/Docker live suite
+  passes with Landlock `hard_requirement`; macOS `best_effort` results are local
+  functional evidence only.
+- Docker is the only AI-Q-automated runtime path. Podman is supported upstream
+  but not automated or production-accepted by AI-Q; Windows/WSL is unsupported.
+- `best_effort` permits execution when Landlock is unavailable, so macOS/Docker
+  Desktop does not provide the production filesystem-confinement guarantee.
+- OpenShell does not currently satisfy AI-Q's optional CPU/memory resource-limit
+  capability. Configuring those limits fails closed rather than silently
+  ignoring them.
+- Shared named-sandbox attachment is debug-only and is not a tenant or job
+  isolation boundary.
+- The authenticated gateway is an operator-owned external service. AI-Q can
+  validate or start a packaged local service, but E2E shutdown intentionally
+  does not stop the gateway.
 
 ## Version Compatibility
 
@@ -52,10 +100,17 @@ another exact release with `--openshell-version`, but a version is production
 accepted only after the pytest-owned live suite passes against that release on
 Linux with hard Landlock enforcement.
 
-Runtime security decisions are capability-based, not version-specific. A zero
-generic current or active policy version is treated as unreported only when the
-positive loaded revision and effective config agree exactly. Every positive
-reported version must match.
+AI-Q currently requires and defaults to OpenShell `0.0.80`. It is the first
+released version that acknowledges the initial sandbox-scoped policy revision as
+`LOADED` after successful policy-engine construction and exposes immutable
+request-level labels/selectors through the Python SDK. Earlier releases can leave
+the revision `PENDING` with `current_policy_version=0` or omit ownership labels,
+so they fail AI-Q's strict readiness checks.
+
+The release floor is necessary but not sufficient: runtime security decisions
+remain capability-based. On the supported `0.0.80` stack, the current, active,
+revision, and effective-config versions must all be positive and agree. Any
+missing capability or version/content/hash/source mismatch fails closed.
 
 ## Responsibility and Lifecycle Ownership
 
@@ -85,15 +140,16 @@ Both policy layers are enforced:
 - Production requires both `landlock.compatibility: hard_requirement` in the
   policy and `require_hard_landlock: true` in the AI-Q config.
 - A local demo using `best_effort` requires both the policy value
-  `best_effort` and `require_hard_landlock: false` in a local config copy.
+  `best_effort` and `AIQ_OPENSHELL_REQUIRE_HARD_LANDLOCK=false` when validating
+  or running the standard OpenShell config.
 - Custom policies must explicitly include OpenShell's proxy filesystem baseline,
   including read-only `/proc`. Otherwise the supervisor creates an enriched
   revision whose content and hash correctly fail AI-Q's exact attestation. The
   generated policy from `setup_openshell.sh` already includes this baseline.
 
-Any mismatch fails closed before the execution adapter is available. Keep policy
-files and local config copies out of commits when they contain environment-specific
-details. Never put credentials in either file.
+Any mismatch fails closed before the execution adapter is available. Keep
+environment-specific generated policies out of commits, and never put
+credentials in policy or workflow configuration files.
 
 ## Environment Contract
 
@@ -106,6 +162,7 @@ The gateway launcher, AI-Q runtime, and live suite use these non-secret settings
 | `AIQ_OPENSHELL_POLICY_FILE` | `configs/openshell/generated/aiq-openshell-policy.yaml` | Policy submitted and attested |
 | `AIQ_OPENSHELL_IMAGE` | `aiq-openshell-demo:latest` | Prebuilt sandbox image |
 | `AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION` | installed SDK version | Optional exact live-test override |
+| `AIQ_OPENSHELL_REQUIRE_HARD_LANDLOCK` | `true` | Set `false` only for an explicit local `best_effort` demo |
 | `AIQ_OPENSHELL_LIVE_ALLOW_BEST_EFFORT` | unset | Explicit non-production macOS/demo opt-in |
 
 ## Linux Production Acceptance
@@ -119,6 +176,7 @@ From the AI-Q repository root, provision the pinned SDK, hard policy, and image:
 
 ```bash
 ./scripts/setup_openshell.sh \
+  --openshell-version 0.0.80 \
   --policy offline \
   --landlock-compatibility hard_requirement
 ```
@@ -134,21 +192,32 @@ service that the launcher may start through systemd.
   --policy-file configs/openshell/generated/aiq-openshell-policy.yaml
 ```
 
+The readiness probe proves that the submitted policy is effective, but it does
+not independently require hard Landlock. Production acceptance therefore uses
+the `hard_requirement` policy generated above and the matching
+`require_hard_landlock: true` AI-Q config.
+
 Export the same image and policy for the AI-Q process:
 
 ```bash
 export AIQ_OPENSHELL_GATEWAY_NAME=openshell
 export AIQ_OPENSHELL_IMAGE=aiq-openshell-demo:latest
 export AIQ_OPENSHELL_POLICY_FILE="$PWD/configs/openshell/generated/aiq-openshell-policy.yaml"
+export AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION=0.0.80
 ```
 
 Validate and start AI-Q with the production pairing in
 `configs/config_openshell.yml`:
 
 ```bash
-.venv/bin/nat validate --config_file configs/config_openshell.yml
+source .venv/bin/activate
+nat validate --config_file configs/config_openshell.yml
 ./scripts/start_e2e.sh --config_file configs/config_openshell.yml
 ```
+
+Because the gateway was already verified above, `--start-openshell-gateway` is
+not needed here. It is an optional convenience that reruns the same strict probe
+before E2E startup.
 
 In a separate shell with the same exported settings, run the required acceptance
 suite:
@@ -158,6 +227,7 @@ AIQ_OPENSHELL_LIVE_TESTS=1 \
 AIQ_OPENSHELL_GATEWAY_NAME=openshell \
 AIQ_OPENSHELL_POLICY_FILE=configs/openshell/generated/aiq-openshell-policy.yaml \
 AIQ_OPENSHELL_IMAGE=aiq-openshell-demo:latest \
+AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION=0.0.80 \
 .venv/bin/python -m pytest -m integration -vv \
   tests/aiq_agent/agents/deep_researcher/sandbox/test_openshell_live.py
 ```
@@ -176,20 +246,19 @@ Bash behavior:
 ```bash
 brew install bash
 /opt/homebrew/bin/bash ./scripts/setup_openshell.sh \
+  --openshell-version 0.0.80 \
+  --local-demo \
   --policy offline \
-  --landlock-compatibility best_effort
 ```
 
-Create an untracked local config and set only its OpenShell
-`require_hard_landlock` field to `false`:
+Then validate the standard config, validate the gateway, and start AI-Q with the
+explicit local-demo environment override:
 
 ```bash
-cp configs/config_openshell.yml configs/config_openshell.local.yml
-```
+source .venv/bin/activate
+AIQ_OPENSHELL_REQUIRE_HARD_LANDLOCK=false \
+  nat validate --config_file configs/config_openshell.yml
 
-Then validate the gateway and start AI-Q:
-
-```bash
 ./scripts/start_openshell_gateway.sh \
   --gateway-name openshell \
   --image-name aiq-openshell-demo:latest \
@@ -197,7 +266,10 @@ Then validate the gateway and start AI-Q:
 
 AIQ_OPENSHELL_POLICY_FILE=configs/openshell/generated/aiq-openshell-policy.yaml \
 AIQ_OPENSHELL_IMAGE=aiq-openshell-demo:latest \
-./scripts/start_e2e.sh --config_file configs/config_openshell.local.yml
+AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION=0.0.80 \
+AIQ_OPENSHELL_REQUIRE_HARD_LANDLOCK=false \
+./scripts/start_e2e.sh --config_file configs/config_openshell.yml \
+  2>&1 | tee e2e-openshell-0.0.80.log
 ```
 
 Run the same mechanics through the convenience wrapper with the explicit demo
@@ -208,6 +280,7 @@ opt-in:
   --gateway openshell \
   --policy configs/openshell/generated/aiq-openshell-policy.yaml \
   --image aiq-openshell-demo:latest \
+  --expected-gateway-version 0.0.80 \
   --allow-best-effort-landlock
 ```
 
@@ -263,7 +336,8 @@ The human-readable contract is:
 - Cancelling one job does not delete or replace another job's sandbox.
 - `sandbox.attestation` reports sanitized status, policy version, hash, source,
   assurance, and reason code.
-- `sandbox.cleanup` reports sanitized completion and stable failure reason codes.
+- `sandbox.cleanup` reports `started`, `succeeded`, or `failed`, with stable
+  `reason_codes` on failure.
 - Credentials, policy contents, SDK response bodies, and exception messages are
   not emitted in lifecycle events or failure logs.
 
@@ -271,12 +345,28 @@ The final job state is separate from physical cleanup: verify the cleanup event
 and absence from the gateway rather than assuming a terminal job status deleted
 the resource.
 
+## Artifact Capture
+
+`configs/config_openshell.yml` enables durable sandbox artifact capture. Successful
+`execute` calls checkpoint declared artifacts, and terminal finalization performs
+one idempotent scan before sandbox cleanup. Metadata is stored in the job database;
+bytes use the configured SQL or S3-compatible artifact blob provider. Clients
+receive `artifact.update` metadata with a `content_url`, never raw bytes in SSE.
+
+For validation, storage configuration, event payloads, and report rendering, see
+the developer [artifact runtime](https://github.com/NVIDIA-AI-Blueprints/aiq/blob/develop/src/aiq_agent/agents/deep_researcher/sandbox/README.md#artifact-runtime)
+and [production artifact storage](./production.md#artifact-storage) guides.
+
 ## Acceptance Tests
 
 The canonical acceptance entry point is pytest:
 
 ```bash
 AIQ_OPENSHELL_LIVE_TESTS=1 \
+AIQ_OPENSHELL_GATEWAY_NAME=openshell \
+AIQ_OPENSHELL_POLICY_FILE=configs/openshell/generated/aiq-openshell-policy.yaml \
+AIQ_OPENSHELL_IMAGE=aiq-openshell-demo:latest \
+AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION=0.0.80 \
 .venv/bin/python -m pytest -m integration -vv \
   tests/aiq_agent/agents/deep_researcher/sandbox/test_openshell_live.py
 ```
@@ -334,8 +424,8 @@ absent from direct and selector listings. Use the sandbox name from sanitized `s
 | `selector_mismatch` | The probe was not discoverable through gateway metadata. Do not rely on Docker/template labels as a substitute. |
 | Registration is plaintext or unauthenticated | Register an HTTPS gateway with mTLS, OIDC, or trusted edge authentication. Do not bypass the launcher check. |
 | Docker daemon is unavailable | Start the operator-owned Docker service and rerun provisioning/probe. |
-| Podman is selected | Follow upstream OpenShell guidance; do not report the path as PR #298-certified. |
-| Landlock policy/config mismatch | Pair `hard_requirement` with `require_hard_landlock: true`, or use both demo settings explicitly. |
+| Podman is selected | Follow upstream OpenShell guidance; do not report the path as AI-Q production-accepted. |
+| Landlock policy/config mismatch | Pair `hard_requirement` with the default config, or set `AIQ_OPENSHELL_REQUIRE_HARD_LANDLOCK=false` only with an explicit `best_effort` demo policy. |
 | Policy is broader than `network_allow` | Remove the endpoint or add its exact normalized hostname to the declared upper bound. Do not add CIDR exceptions. |
 | Sandbox never becomes Ready | Inspect the owning gateway/runtime service, image availability, and sanitized sandbox status; do not dump SDK bodies. |
 | Probe or job deletion cannot be verified | Treat acceptance as failed, identify the exact sandbox, and retry explicit deletion through the registered gateway. |
