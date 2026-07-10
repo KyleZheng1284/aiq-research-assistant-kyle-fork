@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+from pathlib import PurePosixPath
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelResponse
@@ -43,6 +44,12 @@ _SOURCE_ROUTING_PATH = "/shared/source_routing.json"
 # route-local key. The guard reads raw state, so it must accept both forms or it
 # blocks the orchestrator forever on sandboxed runs.
 _SOURCE_ROUTING_STATE_KEYS = (_SOURCE_ROUTING_PATH, "/source_routing.json")
+_UNRESOLVED_SANDBOX_PATH_TOKENS = (
+    "<sandbox_artifact_dir>",
+    "<sandbox_workdir>",
+    "{{ sandbox_artifact_dir }}",
+    "{{ sandbox_workdir }}",
+)
 
 
 class SourceRoutingGuardMiddleware(AgentMiddleware):
@@ -155,6 +162,41 @@ class ExecuteTimeoutClampMiddleware(AgentMiddleware):
         )
         modified = {**tool_call, "args": {**args, "timeout": self.max_timeout_seconds}}
         return await handler(request.override(tool_call=modified))
+
+
+class FilesystemToolCallGuardMiddleware(AgentMiddleware):
+    """Normalize safe filesystem aliases and reject unresolved sandbox path templates."""
+
+    async def awrap_tool_call(self, request, handler):
+        """Repair ``read_file(path=...)`` and fail before executing placeholder paths."""
+        tool_call = request.tool_call
+        if not isinstance(tool_call, dict):
+            return await handler(request)
+        args = tool_call.get("args")
+        if not isinstance(args, dict):
+            return await handler(request)
+
+        if tool_call.get("name") == "read_file" and isinstance(args.get("path"), str):
+            normalized_args = {key: value for key, value in args.items() if key != "path"}
+            normalized_args.setdefault("file_path", args["path"])
+            modified = {**tool_call, "args": normalized_args}
+            return await handler(request.override(tool_call=modified))
+
+        if tool_call.get("name") == "execute" and isinstance(args.get("command"), str):
+            command = args["command"]
+            unresolved = next((token for token in _UNRESOLVED_SANDBOX_PATH_TOKENS if token in command), None)
+            if unresolved is not None:
+                return ToolMessage(
+                    content=(
+                        f"Command not executed: unresolved sandbox path placeholder {unresolved}. "
+                        "Use the exact sandbox_workdir or sandbox_artifact_dir path from your instructions."
+                    ),
+                    tool_call_id=tool_call.get("id", "filesystem-tool-call-guard"),
+                    name="execute",
+                    status="error",
+                )
+
+        return await handler(request)
 
 
 # Common hallucinated tool name mappings
@@ -563,10 +605,34 @@ class ArtifactHarvestMiddleware(AgentMiddleware):
         result_status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
         if tool_name == "execute" and result_status != "error":
             try:
-                await asyncio.to_thread(self.artifact_manager.harvest_after_execute)
+                captured = await asyncio.to_thread(self.artifact_manager.harvest_after_execute)
             except Exception as exc:  # noqa: BLE001 - artifact capture must not fail the agent
                 logger.warning("Artifact checkpoint harvest failed (%s)", type(exc).__name__)
+            else:
+                result = self._append_checkpoint_result(result, captured)
         return result
+
+    @staticmethod
+    def _append_checkpoint_result(result: object, captured: object) -> object:
+        """Tell the model the exact safe filenames captured from a valid manifest."""
+        if not isinstance(result, ToolMessage) or not isinstance(result.content, str):
+            return result
+        if not isinstance(captured, (list, tuple)) or not captured:
+            return result
+
+        lines = ["Artifact checkpoint captured these exact filenames:"]
+        for artifact in captured[:10]:
+            filename = PurePosixPath(str(getattr(artifact, "filename", ""))).name
+            if not filename:
+                continue
+            if bool(getattr(artifact, "inline", False)):
+                lines.append(f"- {filename} (inline): embed as ![caption](artifact://{filename})")
+            else:
+                lines.append(f"- {filename} (downloadable; not marked inline)")
+        if len(lines) == 1:
+            return result
+        content = result.content.rstrip() + "\n\n" + "\n".join(lines)
+        return result.model_copy(update={"content": content})
 
 
 class PlanPersistenceMiddleware(AgentMiddleware):

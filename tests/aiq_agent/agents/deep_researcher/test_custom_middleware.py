@@ -27,6 +27,7 @@ from langchain_core.messages import ToolMessage
 
 from aiq_agent.agents.deep_researcher.custom_middleware import ArtifactHarvestMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ExecuteTimeoutClampMiddleware
+from aiq_agent.agents.deep_researcher.custom_middleware import FilesystemToolCallGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import PlanPersistenceMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRegistryMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRoutingGuardMiddleware
@@ -194,6 +195,63 @@ class TestExecuteTimeoutClampMiddleware:
         await middleware.awrap_tool_call(request, handler)
 
         request.override.assert_not_called()
+        handler.assert_awaited_once_with(request)
+
+
+class TestFilesystemToolCallGuardMiddleware:
+    """Filesystem calls are normalized and unresolved path templates fail before execution."""
+
+    @staticmethod
+    def _request(tool_name: str, args: dict) -> MagicMock:
+        request = MagicMock()
+        request.tool_call = {"name": tool_name, "args": args, "id": "tc1"}
+
+        def _override(*, tool_call):
+            overridden = MagicMock()
+            overridden.tool_call = tool_call
+            return overridden
+
+        request.override.side_effect = _override
+        return request
+
+    @pytest.mark.asyncio
+    async def test_normalizes_read_file_path_alias(self) -> None:
+        middleware = FilesystemToolCallGuardMiddleware()
+        request = self._request("read_file", {"path": "/shared/output.md", "offset": 1})
+        handler = AsyncMock(return_value=ToolMessage(content="ok", tool_call_id="tc1"))
+
+        await middleware.awrap_tool_call(request, handler)
+
+        forwarded = handler.await_args.args[0]
+        assert forwarded.tool_call["args"] == {"file_path": "/shared/output.md", "offset": 1}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("placeholder", ["<sandbox_artifact_dir>", "{{ sandbox_workdir }}"])
+    async def test_rejects_unresolved_execute_path_placeholder(self, placeholder: str) -> None:
+        middleware = FilesystemToolCallGuardMiddleware()
+        request = self._request("execute", {"command": f"python3 make_chart.py {placeholder}"})
+        handler = AsyncMock(return_value=ToolMessage(content="ok", tool_call_id="tc1"))
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        handler.assert_not_awaited()
+        assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        assert placeholder in result.content
+
+    @pytest.mark.asyncio
+    async def test_allows_concrete_execute_paths(self) -> None:
+        middleware = FilesystemToolCallGuardMiddleware()
+        request = self._request(
+            "execute",
+            {"command": "python3 /sandbox/job/make_chart.py /sandbox/job/aiq-artifacts"},
+        )
+        expected = ToolMessage(content="ok", tool_call_id="tc1")
+        handler = AsyncMock(return_value=expected)
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result is expected
         handler.assert_awaited_once_with(request)
 
 
@@ -774,6 +832,23 @@ class TestArtifactHarvestMiddleware:
         assert result == "ok"
         assert "RuntimeError" in caplog.text
         assert "credential=do-not-log" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_returns_exact_inline_filename_to_model(self) -> None:
+        manager = MagicMock()
+        manager.harvest_after_execute.return_value = [
+            SimpleNamespace(filename="capex_by_quarter.png", inline=True),
+            SimpleNamespace(filename="capex_by_quarter.csv", inline=False),
+        ]
+        middleware = ArtifactHarvestMiddleware(manager)
+        request = MagicMock()
+        request.tool_call = {"name": "execute"}
+        handler = AsyncMock(return_value=ToolMessage(content="command succeeded", tool_call_id="tc1"))
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert "artifact://capex_by_quarter.png" in result.content
+        assert "capex_by_quarter.csv (downloadable; not marked inline)" in result.content
 
 
 class _RecordingBackend:
