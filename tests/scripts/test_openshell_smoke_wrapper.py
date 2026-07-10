@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_WRAPPER = _REPO_ROOT / "scripts" / "smoke_openshell_isolation.py"
+_WRAPPER = _REPO_ROOT / "scripts" / "openshell" / "smoke_openshell_isolation.py"
 _LIVE_TEST = "tests/aiq_agent/agents/deep_researcher/sandbox/test_openshell_live.py"
 
 
@@ -75,6 +75,7 @@ def test_wrapper_uses_generated_policy_and_single_pytest_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION", raising=False)
+    monkeypatch.delenv("AIQ_OPENSHELL_POLICY_FILE", raising=False)
     args = wrapper._args([])
 
     assert args.policy == "configs/openshell/generated/aiq-openshell-policy.yaml"

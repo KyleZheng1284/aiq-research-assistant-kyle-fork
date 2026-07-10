@@ -11,9 +11,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_GATEWAY_SCRIPT = _REPO_ROOT / "scripts" / "start_openshell_gateway.sh"
-_SETUP_SCRIPT = _REPO_ROOT / "scripts" / "setup_openshell.sh"
+_GATEWAY_SCRIPT = _REPO_ROOT / "scripts" / "openshell" / "start_openshell_gateway.sh"
+_SETUP_SCRIPT = _REPO_ROOT / "scripts" / "openshell" / "setup_openshell.sh"
 _E2E_SCRIPT = _REPO_ROOT / "scripts" / "start_e2e.sh"
 
 
@@ -75,6 +77,10 @@ if [[ "${1:-}" == *check_openshell_readiness.py ]]; then
     echo "readiness-checker $*" >>"$FAKE_LOG"
     exit "${FAKE_READINESS_EXIT:-0}"
 fi
+if [[ "${1:-}" == *check_versions.py ]]; then
+    echo "version-inspector $*" >>"$FAKE_LOG"
+    exit "${FAKE_VERSION_EXIT:-0}"
+fi
 exec "$REAL_PYTHON" "$@"
 """,
         encoding="utf-8",
@@ -133,6 +139,7 @@ def test_authenticated_gateway_runs_mandatory_strict_readiness_check(tmp_path: P
     assert result.returncode == 0, result.stderr
     assert "gateway list -o json" in calls
     assert "gateway select enterprise" in calls
+    assert calls.count("version-inspector") == 2
     assert "readiness-checker" in calls
     assert "--gateway-name enterprise" in calls
     assert "gateway add" not in calls
@@ -191,11 +198,34 @@ def test_failed_strict_readiness_check_stops_launcher(tmp_path: Path) -> None:
     assert "strict readiness check failed" in result.stderr.lower()
 
 
+def test_component_mismatch_stops_before_gateway_or_readiness_probe(tmp_path: Path) -> None:
+    result, calls = _run_launcher(
+        tmp_path,
+        gateway={
+            "name": "enterprise",
+            "endpoint": "https://127.0.0.1:8080",
+            "type": "local",
+            "auth": "mtls",
+            "active": True,
+        },
+        extra_env={"FAKE_VERSION_EXIT": "1"},
+    )
+
+    assert result.returncode != 0
+    assert "component version check failed" in result.stderr.lower()
+    assert "version-inspector" in calls
+    assert "readiness-checker" not in calls
+    assert "sandbox create" not in calls
+
+
 def test_setup_is_provisioning_only_and_migrates_old_lifecycle_flags() -> None:
     source = _SETUP_SCRIPT.read_text(encoding="utf-8")
     assert "pkill" not in source
     assert "start_or_verify_gateway" not in source
     assert '"$OPENSHELL_BIN" sandbox create' not in source
+    assert "--reinstall-package" not in source
+    assert "uv sync --dev --inexact" in source
+    assert 'uv pip install "deepagents' not in source
 
     result = subprocess.run(
         [str(_SETUP_SCRIPT), "--gateway-name", "old"],
@@ -214,6 +244,21 @@ def test_setup_policy_declares_canonical_openshell_proxy_baseline() -> None:
 
     assert "    - /proc\n" in policy_template
     assert "/proc/self" not in policy_template
+
+
+@pytest.mark.parametrize("version", ["latest", "0.0.72", "0.0.81"])
+def test_setup_rejects_uncertified_openshell_versions(version: str) -> None:
+    result = subprocess.run(
+        [str(_SETUP_SCRIPT), "--openshell-version", version, "--skip-build", "--policy", "offline"],
+        cwd=_REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "not certified" in result.stderr
+    assert "0.0.80" in result.stderr
 
 
 def test_setup_resolves_docker_desktop_cli_and_credential_helper_together() -> None:
@@ -246,7 +291,9 @@ def test_e2e_gateway_start_is_explicit_opt_in() -> None:
     assert "--start-openshell-gateway" in result.stdout
     assert "START_OPENSHELL_GATEWAY=false" in source
     assert 'if [[ "$START_OPENSHELL_GATEWAY" != "true" ]]' in source
-    assert '"$PROJECT_ROOT/scripts/start_openshell_gateway.sh"' in source
+    assert '"$PROJECT_ROOT/scripts/openshell/start_openshell_gateway.sh"' in source
+    assert '"$PROJECT_ROOT/scripts/openshell/check_versions.py"' in source
+    assert source.index("check_openshell_component_versions\n") < source.index("start_backend\n")
     assert 'PYTHON_BIN="$VENV_DIR/bin/python"' in source
     assert 'NAT_BIN="$VENV_DIR/bin/nat"' in source
     assert '"$NAT_BIN" serve' in source

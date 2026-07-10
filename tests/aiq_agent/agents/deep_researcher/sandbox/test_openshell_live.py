@@ -58,7 +58,6 @@ class LiveRuntime:
     openshell_pb2: Any
     sandbox_pb2: Any
     expected_policy: Any
-    expected_policy_hash: str
     policy_data: dict[str, Any]
     network: dict[str, object]
     build_sandbox_spec: Callable[..., Any]
@@ -104,7 +103,6 @@ def live_runtime(live_config: LiveConfig) -> LiveRuntime:
         pytest.fail("Opted-in OpenShell live tests require the SDK and DeepAgents adapter.")
 
     from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _build_sandbox_spec
-    from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _deterministic_policy_hash
     from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _parse_policy_proto
     from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _policy_network_hosts
     from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _read_policy_data
@@ -114,7 +112,6 @@ def live_runtime(live_config: LiveConfig) -> LiveRuntime:
         require_hard_landlock=not live_config.allow_best_effort,
     )
     expected_policy = _parse_policy_proto(policy_data, policy_path=str(live_config.policy_path))
-    expected_policy_hash = _deterministic_policy_hash(expected_policy)
     hosts = tuple(sorted(_policy_network_hosts(policy_data)))
     network: dict[str, object] = {"mode": "allowlist", "allow": hosts} if hosts else {"mode": "blocked"}
 
@@ -125,7 +122,6 @@ def live_runtime(live_config: LiveConfig) -> LiveRuntime:
         openshell_pb2=openshell_pb2,
         sandbox_pb2=sandbox_pb2,
         expected_policy=expected_policy,
-        expected_policy_hash=expected_policy_hash,
         policy_data=policy_data,
         network=network,
         build_sandbox_spec=_build_sandbox_spec,
@@ -285,7 +281,7 @@ def direct_sandbox_factory(
     return create
 
 
-def _attestation_success(events: list[dict[str, object]], runtime: LiveRuntime) -> bool:
+def _attestation_success(events: list[dict[str, object]], runtime: LiveRuntime, authoritative_hash: str) -> bool:
     for event in events:
         if event.get("type") != "sandbox.attestation":
             continue
@@ -295,7 +291,7 @@ def _attestation_success(events: list[dict[str, object]], runtime: LiveRuntime) 
         return (
             isinstance(data.get("policy_version"), int)
             and data["policy_version"] > 0
-            and data.get("policy_hash") == runtime.expected_policy_hash
+            and data.get("policy_hash") == authoritative_hash
             and data.get("policy_source") == runtime.sandbox_pb2.POLICY_SOURCE_SANDBOX
             and data.get("assurance") == "strict"
             and data.get("reason_code") is None
@@ -303,7 +299,7 @@ def _attestation_success(events: list[dict[str, object]], runtime: LiveRuntime) 
     return False
 
 
-def _assert_authoritative_policy(runtime: LiveRuntime, client: Any, name: str) -> tuple[Any, int]:
+def _assert_authoritative_policy(runtime: LiveRuntime, client: Any, name: str) -> tuple[Any, int, str]:
     sandbox = client.get(name)
     stub = client._stub
     status = stub.GetSandboxPolicyStatus(
@@ -324,9 +320,9 @@ def _assert_authoritative_policy(runtime: LiveRuntime, client: Any, name: str) -
     assert config.policy_source == runtime.sandbox_pb2.POLICY_SOURCE_SANDBOX
     assert config.policy == runtime.expected_policy
     assert revision.policy == runtime.expected_policy
-    assert config.policy_hash == runtime.expected_policy_hash
-    assert revision.policy_hash == runtime.expected_policy_hash
-    return sandbox, revision.version
+    assert config.policy_hash
+    assert revision.policy_hash == config.policy_hash
+    return sandbox, revision.version, config.policy_hash
 
 
 def test_live_per_job_isolation_attestation_and_cancellation(
@@ -365,11 +361,12 @@ def test_live_per_job_isolation_attestation_and_cancellation(
                 "aiq": "deep-research",
                 "aiq-job-id": f"aiq-isolation-{'a' if index == 0 else 'b'}-{suffix}",
             }
-        first, first_revision = _assert_authoritative_policy(live_runtime, client, names[0])
-        second, second_revision = _assert_authoritative_policy(live_runtime, client, names[1])
+        first, first_revision, first_hash = _assert_authoritative_policy(live_runtime, client, names[0])
+        second, second_revision, second_hash = _assert_authoritative_policy(live_runtime, client, names[1])
         assert first.id != second.id
         assert first_revision > 0 and second_revision > 0
-        assert all(_attestation_success(job_events, live_runtime) for job_events in events)
+        assert _attestation_success(events[0], live_runtime, first_hash)
+        assert _attestation_success(events[1], live_runtime, second_hash)
 
         providers[0].terminate()
         _assert_deleted(live_runtime, client, names[0])

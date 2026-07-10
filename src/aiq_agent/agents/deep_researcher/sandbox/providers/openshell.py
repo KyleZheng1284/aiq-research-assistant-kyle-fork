@@ -19,18 +19,14 @@ Governed, policy-enforced execution on local Docker/Podman/Kubernetes/microVM vi
 the OpenShell gateway. The deepagents ``BaseSandbox`` adapter is the official
 ``langchain-nvidia-openshell`` partner package (``OpenShellSandbox``), the same
 adapter AI-Q PR #274 integrates. Both the ``openshell`` SDK and the adapter are
-intentionally NOT declared in ``pyproject``; they are optional, ad-hoc
-dependencies imported lazily, so this provider is never force-installed.
-
-Until ``langchain-ai/langchain-nvidia`` PR #303 publishes the adapter to PyPI,
-install it from a git spec (see ``scripts/setup_openshell.sh`` /
-``LANGCHAIN_NVIDIA_REPO``).
+intentionally NOT declared in ``pyproject``; they are optional dependencies
+imported lazily, so this provider is never force-installed. The canonical
+operator workflow lives in ``docs/source/deployment/openshell.md``.
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
 import inspect
 import logging
 import os
@@ -113,8 +109,8 @@ def _classify_fs_error(text: str) -> str:
 
 _OPENSHELL_IMPORT_HINT = (
     "The OpenShell sandbox provider requires the `openshell>=0.0.80,<0.1` SDK and the "
-    "`langchain-nvidia-openshell` adapter (published on PyPI). They are optional, ad-hoc "
-    "dependencies. Install them with `./scripts/setup_openshell.sh` (which installs "
+    "`langchain-nvidia-openshell` adapter (published on PyPI). They are optional, separately installed "
+    "dependencies. Install them with `./scripts/openshell/setup_openshell.sh` (which installs "
     "`langchain-nvidia-openshell` from PyPI; override the source via `LANGCHAIN_NVIDIA_REPO`), "
     "and configure an OpenShell gateway before enabling this provider."
 )
@@ -287,36 +283,6 @@ def _validate_policy_network(policy_data: dict[str, Any], *, mode: str, allow: t
         unexpected = policy_hosts - configured_hosts
         if unexpected:
             raise ValueError(f"OpenShell policy grants hosts outside sandbox.network.allow: {sorted(unexpected)}")
-
-
-def _serialize_proto(message: Any) -> bytes:
-    """Serialize one protobuf message deterministically, with a test-double fallback."""
-    try:
-        return message.SerializeToString(deterministic=True)
-    except TypeError:
-        return message.SerializeToString()
-
-
-def _has_message_field(message: Any, field: str) -> bool:
-    """Return protobuf message-field presence without assuming a concrete SDK class."""
-    try:
-        return bool(message.HasField(field))
-    except (AttributeError, ValueError):
-        return getattr(message, field, None) is not None
-
-
-def _deterministic_policy_hash(policy: Any) -> str:
-    """Compute OpenShell's canonical SHA-256 policy hash."""
-    hasher = hashlib.sha256()
-    hasher.update(int(getattr(policy, "version", 0)).to_bytes(4, byteorder="little", signed=False))
-    for field in ("filesystem", "landlock", "process"):
-        if _has_message_field(policy, field):
-            hasher.update(_serialize_proto(getattr(policy, field)))
-    policies = getattr(policy, "network_policies", {})
-    for key in sorted(policies):
-        hasher.update(str(key).encode())
-        hasher.update(_serialize_proto(policies[key]))
-    return hasher.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -678,7 +644,6 @@ class OpenShellSandboxProvider(SandboxProvider):
                 policy_source = getattr(config_response, "policy_source", sandbox_pb2.POLICY_SOURCE_UNSPECIFIED)
                 policy_hash = getattr(config_response, "policy_hash", "")
                 revision_hash = getattr(revision, "policy_hash", "")
-                expected_hash = _deterministic_policy_hash(expected_policy) if expected_policy is not None else None
                 pending_effective_policy = (
                     revision_status == openshell_pb2.POLICY_STATUS_PENDING
                     and revision_version > 0
@@ -688,8 +653,8 @@ class OpenShellSandboxProvider(SandboxProvider):
                         or (
                             config_policy == expected_policy
                             and revision_policy == expected_policy
-                            and policy_hash == expected_hash
-                            and revision_hash == expected_hash
+                            and bool(policy_hash)
+                            and policy_hash == revision_hash
                             and policy_source != sandbox_pb2.POLICY_SOURCE_UNSPECIFIED
                             and (not require_sandbox_source or policy_source == sandbox_pb2.POLICY_SOURCE_SANDBOX)
                         )
@@ -754,7 +719,6 @@ class OpenShellSandboxProvider(SandboxProvider):
                         assurance=assurance,
                         reason_code="policy_content_mismatch",
                     )
-                expected_hash = _deterministic_policy_hash(expected_policy)
                 if not policy_hash or not revision_hash:
                     self._fail_attestation(
                         phase=phase,
@@ -762,12 +726,7 @@ class OpenShellSandboxProvider(SandboxProvider):
                         assurance=assurance,
                         reason_code="policy_hash_missing",
                     )
-                if (
-                    policy_hash != revision_hash
-                    or policy_hash != expected_hash
-                    or _deterministic_policy_hash(config_policy) != expected_hash
-                    or _deterministic_policy_hash(revision_policy) != expected_hash
-                ):
+                if policy_hash != revision_hash:
                     self._fail_attestation(
                         phase=phase,
                         policy_version=effective_version,

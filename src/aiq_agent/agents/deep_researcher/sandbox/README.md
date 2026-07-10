@@ -307,7 +307,7 @@ Custom endpoints use path-style bucket addressing for MinIO compatibility.
 - In-container OpenShell log verbosity (opt-in): `agent.execute()` calls and their output are
   already logged on the AI-Q side (the `execute` tool-call events). To also see what runs
   inside the OpenShell container, rebuild the sandbox image with a higher `RUST_LOG`:
-  `./scripts/setup_openshell.sh --sandbox-log-level debug` (or `--build-arg
+  `./scripts/openshell/setup_openshell.sh --sandbox-log-level debug` (or `--build-arg
   OPENSHELL_SANDBOX_LOG_LEVEL=debug`). Default `warn` keeps OpenShell's stock behavior.
   Read the generated sandbox name from AI-Q's attestation/cleanup events, then use
   `openshell logs <sandbox-name>`, the OpenShell TUI, or inside

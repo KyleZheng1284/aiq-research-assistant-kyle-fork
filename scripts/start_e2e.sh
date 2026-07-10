@@ -121,7 +121,7 @@ check_dependencies() {
 
     if [ ! -x "$PYTHON_BIN" ]; then
         echo "AI-Q virtual environment not found at $VENV_DIR"
-        echo "Run ./scripts/setup.sh or ./scripts/setup_openshell.sh first."
+        echo "Run ./scripts/setup.sh or ./scripts/openshell/setup_openshell.sh first."
         exit 1
     fi
 
@@ -131,11 +131,20 @@ check_dependencies() {
     fi
     if [ ! -x "$NAT_BIN" ]; then
         echo "NAT CLI not found at $NAT_BIN"
-        echo "Run ./scripts/setup.sh or ./scripts/setup_openshell.sh first."
+        echo "Run ./scripts/setup.sh or ./scripts/openshell/setup_openshell.sh first."
         exit 1
     fi
 
     echo "Python dependencies installed ($PYTHON_BIN)"
+}
+
+check_openshell_component_versions() {
+    if ! grep -Eq '^[[:space:]]*provider:[[:space:]]*openshell([[:space:]]|$)' "$PROJECT_ROOT/$CONFIG_FILE"; then
+        return
+    fi
+    echo "Checking the certified OpenShell component stack..."
+    "$PYTHON_BIN" "$PROJECT_ROOT/scripts/openshell/check_versions.py" \
+        --gateway-name "${AIQ_OPENSHELL_GATEWAY_NAME:-openshell}"
 }
 
 check_ui_dependencies() {
@@ -187,7 +196,7 @@ start_openshell_gateway() {
         return
     fi
     echo "Starting/verifying authenticated OpenShell gateway..."
-    "$PROJECT_ROOT/scripts/start_openshell_gateway.sh"
+    "$PROJECT_ROOT/scripts/openshell/start_openshell_gateway.sh"
 }
 
 wait_for_backend() {
@@ -242,6 +251,9 @@ main() {
     echo ""
 
     start_openshell_gateway
+    echo ""
+
+    check_openshell_component_versions
     echo ""
 
     if check_ui_dependencies; then

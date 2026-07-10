@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC_ROOT = _REPO_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
@@ -107,7 +107,6 @@ def _verify_policy(
     client: Any,
     sandbox: Any,
     expected_policy: Any,
-    expected_hash: str,
     timeout_seconds: float,
     openshell_pb2: Any,
     sandbox_pb2: Any,
@@ -146,8 +145,8 @@ def _verify_policy(
                 == sandbox_pb2.POLICY_SOURCE_SANDBOX
                 and getattr(config, "policy", None) == expected_policy
                 and getattr(revision, "policy", None) == expected_policy
-                and getattr(config, "policy_hash", "") == expected_hash
-                and getattr(revision, "policy_hash", "") == expected_hash
+                and bool(getattr(config, "policy_hash", ""))
+                and getattr(config, "policy_hash", "") == getattr(revision, "policy_hash", "")
             )
             time.sleep(min(0.5, remaining))
             continue
@@ -163,7 +162,11 @@ def _verify_policy(
             raise ReadinessError("policy_source_mismatch")
         if getattr(config, "policy", None) != expected_policy or getattr(revision, "policy", None) != expected_policy:
             raise ReadinessError("policy_content_mismatch")
-        if getattr(config, "policy_hash", "") != expected_hash or getattr(revision, "policy_hash", "") != expected_hash:
+        config_hash = getattr(config, "policy_hash", "")
+        revision_hash = getattr(revision, "policy_hash", "")
+        if not config_hash or not revision_hash:
+            raise ReadinessError("policy_hash_missing")
+        if config_hash != revision_hash:
             raise ReadinessError("policy_hash_mismatch")
         return
 
@@ -180,7 +183,6 @@ def run_check(config: ReadinessConfig) -> tuple[str, str]:
 
     from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _accepts_keyword
     from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _build_sandbox_spec
-    from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _deterministic_policy_hash
     from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _parse_policy_proto
     from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _read_policy_data
 
@@ -193,7 +195,6 @@ def run_check(config: ReadinessConfig) -> tuple[str, str]:
     selector = "aiq=readiness-probe"
     policy_data = _read_policy_data(str(config.policy), require_hard_landlock=False)
     expected_policy = _parse_policy_proto(policy_data, policy_path=str(config.policy))
-    expected_hash = _deterministic_policy_hash(expected_policy)
     spec = _build_sandbox_spec(
         policy=expected_policy,
         image=config.image,
@@ -235,7 +236,6 @@ def run_check(config: ReadinessConfig) -> tuple[str, str]:
                 client=client,
                 sandbox=sandbox,
                 expected_policy=expected_policy,
-                expected_hash=expected_hash,
                 timeout_seconds=config.policy_load_timeout_seconds,
                 openshell_pb2=openshell_pb2,
                 sandbox_pb2=sandbox_pb2,

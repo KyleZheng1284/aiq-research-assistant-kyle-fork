@@ -3,7 +3,7 @@
 `aiq-research-policy.yaml` is the checked-in, production-oriented policy sample
 used by schema and regression tests. It is not the runtime default.
 
-Run `scripts/setup_openshell.sh` to generate the canonical runtime policy at:
+Run `scripts/openshell/setup_openshell.sh` to generate the canonical runtime policy at:
 
 ```text
 configs/openshell/generated/aiq-openshell-policy.yaml

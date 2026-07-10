@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VENV_DIR="$REPO_ROOT/.venv"
 
 GATEWAY_NAME="${AIQ_OPENSHELL_GATEWAY_NAME:-openshell}"
@@ -23,10 +23,11 @@ POLL_DELAY="${AIQ_OPENSHELL_POLL_DELAY:-1}"
 READY_TIMEOUT_SECONDS="${AIQ_OPENSHELL_READY_TIMEOUT_SECONDS:-120}"
 POLICY_LOAD_TIMEOUT_SECONDS="${AIQ_OPENSHELL_POLICY_LOAD_TIMEOUT_SECONDS:-30}"
 READINESS_CHECKER="$SCRIPT_DIR/check_openshell_readiness.py"
+VERSION_INSPECTOR="$SCRIPT_DIR/check_versions.py"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/start_openshell_gateway.sh [options]
+Usage: scripts/openshell/start_openshell_gateway.sh [options]
 
 Starts or reuses the official packaged OpenShell gateway service, validates the
 selected registration is authenticated, and performs a mandatory disposable
@@ -105,7 +106,7 @@ resolve_dependencies() {
             ;;
     esac
     if [[ ! -f "$POLICY_FILE" ]]; then
-        fail "Policy file not found: $POLICY_FILE; run scripts/setup_openshell.sh first"
+        fail "Policy file not found: $POLICY_FILE; run scripts/openshell/setup_openshell.sh first"
     fi
 
     if [[ -z "$OPENSHELL_BIN" ]]; then
@@ -116,7 +117,7 @@ resolve_dependencies() {
         fi
     fi
     if [[ -z "$OPENSHELL_BIN" || ! -x "$OPENSHELL_BIN" ]]; then
-        fail "OpenShell CLI not found; run scripts/setup_openshell.sh first"
+        fail "OpenShell CLI not found; run scripts/openshell/setup_openshell.sh first"
     fi
 
     if [[ -z "$PYTHON_BIN" ]]; then
@@ -131,6 +132,9 @@ resolve_dependencies() {
     fi
     if [[ ! -f "$READINESS_CHECKER" ]]; then
         fail "OpenShell readiness checker not found"
+    fi
+    if [[ ! -f "$VERSION_INSPECTOR" ]]; then
+        fail "OpenShell version inspector not found"
     fi
 }
 
@@ -171,7 +175,7 @@ start_packaged_service() {
     case "$(uname -s)" in
         Darwin)
             command -v brew >/dev/null 2>&1 || fail "Homebrew is required to start the packaged OpenShell service"
-            brew services start openshell >/dev/null
+            brew services start nvidia/openshell/openshell >/dev/null
             ;;
         Linux)
             command -v systemctl >/dev/null 2>&1 || fail "systemctl is required to start the packaged OpenShell service"
@@ -199,6 +203,16 @@ wait_for_gateway() {
         sleep "$POLL_DELAY"
     done
     fail "Authenticated gateway '$GATEWAY_NAME' did not become ready"
+}
+
+check_component_versions() {
+    if [[ "${1:-}" == "skip-live" ]]; then
+        "$PYTHON_BIN" "$VERSION_INSPECTOR" --gateway-name "$GATEWAY_NAME" --skip-live \
+            || fail "OpenShell component version check failed"
+    else
+        "$PYTHON_BIN" "$VERSION_INSPECTOR" --gateway-name "$GATEWAY_NAME" \
+            || fail "OpenShell component version check failed"
+    fi
 }
 
 sandbox_is_listed() {
@@ -247,7 +261,9 @@ create_shared_debug_sandbox() {
 main() {
     resolve_dependencies
     validate_gateway_registration
+    check_component_versions skip-live
     wait_for_gateway
+    check_component_versions
     run_strict_readiness_check
     create_shared_debug_sandbox
 }

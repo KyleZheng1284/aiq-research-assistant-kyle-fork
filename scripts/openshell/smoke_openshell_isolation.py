@@ -18,7 +18,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIVE_TEST = Path("tests/aiq_agent/agents/deep_researcher/sandbox/test_openshell_live.py")
 
 

@@ -38,7 +38,6 @@ from aiq_agent.agents.deep_researcher.sandbox.base import SandboxTerminatedError
 from aiq_agent.agents.deep_researcher.sandbox.config import SandboxConfig
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import OpenShellSandboxProvider
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _build_sandbox_spec
-from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _deterministic_policy_hash
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _parse_policy_proto
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _read_policy_data
 from aiq_agent.agents.deep_researcher.sandbox.providers.openshell import _validate_policy_network
@@ -82,7 +81,7 @@ class _FakePolicy:
 
 
 _FAKE_POLICY = _FakePolicy()
-_FAKE_POLICY_HASH = _deterministic_policy_hash(_FAKE_POLICY)
+_FAKE_POLICY_HASH = "authoritative-openshell-hash"
 
 
 class _FakeOpenShellSandbox:
@@ -147,13 +146,13 @@ class _FakeCreatedContext(_FakeOpenShellSandbox):
             version=revision_version,
             status=2,
             load_error="",
-            policy_hash=_deterministic_policy_hash(policy),
+            policy_hash=_FAKE_POLICY_HASH,
             policy=policy,
         )
         status = SimpleNamespace(revision=revision, active_version=revision_version)
         config = SimpleNamespace(
             version=revision_version,
-            policy_hash=_deterministic_policy_hash(policy),
+            policy_hash=_FAKE_POLICY_HASH,
             policy=policy,
             policy_source=policy_source,
         )
@@ -367,13 +366,6 @@ def test_allowlist_rejects_allowed_ip_overrides(cidr: str) -> None:
     with pytest.raises(ValueError, match="CIDR"):
         _validate_policy_network(policy, mode="allowlist", allow=("api.github.com",))
     _validate_policy_network(policy, mode="open", allow=())
-
-
-def test_deterministic_policy_hash_matches_openshell_0072_contract() -> None:
-    assert (
-        _FAKE_POLICY_HASH
-        == "b9ae64d4c78cc3620a039abe77aeb8742b88937561e4467faf6cc4312fbf7e99"  # pragma: allowlist secret
-    )
 
 
 def test_per_job_session_uses_policy_spec_and_attests_before_return(
@@ -736,6 +728,19 @@ def test_attestation_rejects_policy_hash_mismatch(surface: str) -> None:
         status.revision.policy_hash = "bad"
 
     with pytest.raises(RuntimeError, match="policy_hash_mismatch"):
+        _run_attestation(context)
+
+
+@pytest.mark.parametrize("surface", ["config", "revision"])
+def test_attestation_rejects_missing_authoritative_policy_hash(surface: str) -> None:
+    context = _FakeCreatedContext()
+    if surface == "config":
+        context._client._stub.GetSandboxConfig.return_value.policy_hash = ""  # type: ignore[attr-defined]
+    else:
+        status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
+        status.revision.policy_hash = ""
+
+    with pytest.raises(RuntimeError, match="policy_hash_missing"):
         _run_attestation(context)
 
 

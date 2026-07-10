@@ -17,7 +17,7 @@ from unittest.mock import patch
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_CHECKER = _REPO_ROOT / "scripts" / "check_openshell_readiness.py"
+_CHECKER = _REPO_ROOT / "scripts" / "openshell" / "check_openshell_readiness.py"
 
 
 @pytest.fixture(scope="module")
@@ -218,7 +218,6 @@ def _provider_helpers(client: _Client):
     with (
         patch(f"{prefix}._read_policy_data", return_value={"version": 1}),
         patch(f"{prefix}._parse_policy_proto", return_value=policy),
-        patch(f"{prefix}._deterministic_policy_hash", return_value="hash"),
         patch(f"{prefix}._build_sandbox_spec", return_value="spec"),
     ):
         yield policy
@@ -325,6 +324,42 @@ def test_probe_classifies_effective_policy_that_remains_pending(checker: ModuleT
         patch.object(checker.importlib.metadata, "version", return_value="1.2.3"),
         patch.object(checker, "_version_from_cli", return_value="1.2.3"),
         pytest.raises(checker.ReadinessError, match="policy_status_inconsistent"),
+    ):
+        checker.run_check(_config(checker, tmp_path))
+
+    assert client.delete_calls == 1
+
+
+@pytest.mark.parametrize("surface", ["config", "revision"])
+def test_probe_rejects_missing_authoritative_policy_hash(
+    checker: ModuleType,
+    tmp_path: Path,
+    surface: str,
+) -> None:
+    client = _Client()
+    target = client._stub.config if surface == "config" else client._stub.status.revision
+    target.policy_hash = ""
+    with (
+        _provider_helpers(client),
+        _fake_runtime(client),
+        patch.object(checker.importlib.metadata, "version", return_value="1.2.3"),
+        patch.object(checker, "_version_from_cli", return_value="1.2.3"),
+        pytest.raises(checker.ReadinessError, match="policy_hash_missing"),
+    ):
+        checker.run_check(_config(checker, tmp_path))
+
+    assert client.delete_calls == 1
+
+
+def test_probe_rejects_unequal_authoritative_policy_hashes(checker: ModuleType, tmp_path: Path) -> None:
+    client = _Client()
+    client._stub.status.revision.policy_hash = "other-hash"
+    with (
+        _provider_helpers(client),
+        _fake_runtime(client),
+        patch.object(checker.importlib.metadata, "version", return_value="1.2.3"),
+        patch.object(checker, "_version_from_cli", return_value="1.2.3"),
+        pytest.raises(checker.ReadinessError, match="policy_hash_mismatch"),
     ):
         checker.run_check(_config(checker, tmp_path))
 

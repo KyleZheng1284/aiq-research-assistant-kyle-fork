@@ -19,26 +19,29 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VENV_DIR="$REPO_ROOT/.venv"
 
-# OpenShell 0.0.80 is the first released version with the policy-revision acknowledgement
-# and immutable request-label SDK support required by AI-Q's strict attestation and ownership
-# selectors. Keep the default and supported floor aligned until a newer release passes acceptance.
-MIN_OPENSHELL_VERSION="0.0.80"
-DEFAULT_OPENSHELL_VERSION="0.0.80"
+OPENSHELL_RELEASE_TAG="$(awk -F'"' '
+    $0 == "[tool.aiq.openshell]" { in_contract = 1; next }
+    in_contract && /^\[/ { in_contract = 0 }
+    in_contract && /^release-tag = / { print $2; exit }
+' "$REPO_ROOT/pyproject.toml")"
+OPENSHELL_ADAPTER_VERSION="$(awk -F'"' '
+    $0 == "[tool.aiq.openshell]" { in_contract = 1; next }
+    in_contract && /^\[/ { in_contract = 0 }
+    in_contract && /^adapter-version = / { print $2; exit }
+' "$REPO_ROOT/pyproject.toml")"
+[[ "$OPENSHELL_RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || { echo "ERROR: invalid OpenShell release contract" >&2; exit 1; }
+[[ "$OPENSHELL_ADAPTER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || { echo "ERROR: invalid OpenShell adapter contract" >&2; exit 1; }
+DEFAULT_OPENSHELL_VERSION="${OPENSHELL_RELEASE_TAG#v}"
 OPENSHELL_VERSION="${AIQ_OPENSHELL_VERSION:-}"
-OPENSHELL_VERSION_USER_SUPPLIED=false
-if [[ -n "$OPENSHELL_VERSION" ]]; then
-    OPENSHELL_VERSION_USER_SUPPLIED=true
-fi
-OPENSHELL_LATEST_VERSION=""
-OPENSHELL_AVAILABLE_VERSIONS=""
-PYTHON_BIN=""
 # Official OpenShell deepagents adapter: the `langchain-nvidia-openshell` partner
 # package, now published on PyPI. Override with LANGCHAIN_NVIDIA_REPO to use a git
 # spec or a local checkout (e.g. to test an unreleased adapter build).
-DEFAULT_LANGCHAIN_NVIDIA_INSTALL_SPEC="langchain-nvidia-openshell==0.1.0"
+DEFAULT_LANGCHAIN_NVIDIA_INSTALL_SPEC="langchain-nvidia-openshell==$OPENSHELL_ADAPTER_VERSION"
 LANGCHAIN_NVIDIA_REPO="${LANGCHAIN_NVIDIA_REPO:-$DEFAULT_LANGCHAIN_NVIDIA_INSTALL_SPEC}"
 IMAGE_NAME="${AIQ_OPENSHELL_IMAGE:-aiq-openshell-demo:latest}"
 # Sandbox log verbosity baked into the image (RUST_LOG). Default `warn` is OpenShell's
@@ -60,26 +63,24 @@ SUPPORTED_POLICIES="offline,research,python-packages,ai-dev,custom"
 
 usage() {
     cat <<EOF
-Usage: scripts/setup_openshell.sh [options]
+Usage: scripts/openshell/setup_openshell.sh [options]
 
 Sets up OpenShell for AI-Q:
   1. Detects macOS/Linux.
-  2. Checks available OpenShell releases and selects an exact version.
-  3. Installs the selected OpenShell Python package version.
+  2. Loads the AI-Q-certified exact OpenShell release contract.
+  3. Installs the certified OpenShell Python package version.
   4. Installs the langchain-nvidia-openshell deepagents adapter.
   5. Generates an initial OpenShell policy.
   6. Resolves Docker and builds the reusable AI-Q sandbox image.
 
 This script never starts, stops, registers, or probes a gateway. Run
-scripts/start_openshell_gateway.sh after provisioning; per-job sandbox creation
+scripts/openshell/start_openshell_gateway.sh after provisioning; per-job sandbox creation
 remains owned by the AI-Q runtime.
 
 Canonical operator guide: docs/source/deployment/openshell.md
 
 Options:
-  --openshell-version VERSION   Exact OpenShell version, or "latest".
-                                Default: asks in an interactive shell; Enter selects 0.0.80.
-                                Non-interactive default: 0.0.80.
+  --openshell-version VERSION   Certified exact OpenShell version only (0.0.80).
   --policy CHOICE               Sandbox network policy.
                                 Choices: $SUPPORTED_POLICIES
                                 Default: asks in an interactive shell, offline otherwise.
@@ -100,15 +101,15 @@ Options:
   --skip-build                  Do not build the sandbox image.
   --list-policies               Print supported policy choices.
   --list-services               Print supported services for --allow.
-  --list-openshell-versions     Print released OpenShell versions >= 0.0.80.
+  --list-openshell-versions     Print the certified OpenShell version.
   -h, --help                    Show this help.
 
 Examples:
-  scripts/setup_openshell.sh
-  scripts/setup_openshell.sh --policy python-packages
-  scripts/setup_openshell.sh --policy custom --allow github,pypi,nvidia,tavily
-  scripts/setup_openshell.sh --openshell-version 0.0.80 --policy offline
-  scripts/setup_openshell.sh --local-demo --policy offline
+  scripts/openshell/setup_openshell.sh
+  scripts/openshell/setup_openshell.sh --policy python-packages
+  scripts/openshell/setup_openshell.sh --policy custom --allow github,pypi,nvidia,tavily
+  scripts/openshell/setup_openshell.sh --openshell-version 0.0.80 --policy offline
+  scripts/openshell/setup_openshell.sh --local-demo --policy offline
 EOF
 }
 
@@ -126,7 +127,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --openshell-version)
             OPENSHELL_VERSION="$2"
-            OPENSHELL_VERSION_USER_SUPPLIED=true
             shift 2
             ;;
         --policy)
@@ -175,7 +175,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --create-shared-debug-sandbox|--sandbox-name|--gateway-name|--gateway-port|--gateway-bin|--no-restart-gateway|--skip-sandbox)
-            fail "Gateway and debug-sandbox lifecycle moved to scripts/start_openshell_gateway.sh"
+            fail "Gateway and debug-sandbox lifecycle moved to scripts/openshell/start_openshell_gateway.sh"
             ;;
         --list-policies)
             echo "$SUPPORTED_POLICIES" | tr ',' '\n'
@@ -237,132 +237,12 @@ EOF
     fi
 }
 
-resolve_python() {
-    if [[ -n "$PYTHON_BIN" && -x "$PYTHON_BIN" ]]; then
-        return
-    fi
-    PYTHON_BIN="$(uv python find 2>/dev/null || true)"
-    if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
-        PYTHON_BIN="$(command -v python3 || command -v python || true)"
-    fi
-    if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
-        fail "Python was not found. Install Python 3.11+ or run ./scripts/setup.sh first."
-    fi
-}
-
-fetch_openshell_versions() {
-    resolve_python
-    log "Checking available OpenShell versions"
-    local output
-    if ! output="$("$PYTHON_BIN" - "$MIN_OPENSHELL_VERSION" <<'PY'
-import json
-import re
-import sys
-import urllib.request
-
-min_version = sys.argv[1]
-version_re = re.compile(r"^\d+\.\d+\.\d+$")
-
-def parse(version: str) -> tuple[int, int, int]:
-    return tuple(int(part) for part in version.split("."))
-
-try:
-    with urllib.request.urlopen("https://pypi.org/pypi/openshell/json", timeout=15) as response:
-        payload = json.load(response)
-except Exception as exc:
-    raise SystemExit(f"failed to fetch OpenShell versions from PyPI: {exc}")
-
-minimum = parse(min_version)
-versions = []
-for version, files in payload.get("releases", {}).items():
-    if not version_re.match(version):
-        continue
-    if not files:
-        continue
-    parsed = parse(version)
-    if parsed >= minimum:
-        versions.append((parsed, version))
-
-if not versions:
-    raise SystemExit(f"no OpenShell releases found at or above {min_version}")
-
-versions.sort()
-print(versions[-1][1])
-print(",".join(version for _, version in versions))
-PY
-)"; then
-        fail "$output"
-    fi
-
-    OPENSHELL_LATEST_VERSION="$(printf '%s\n' "$output" | sed -n '1p')"
-    OPENSHELL_AVAILABLE_VERSIONS="$(printf '%s\n' "$output" | sed -n '2p')"
-
-    if [[ -z "$OPENSHELL_LATEST_VERSION" || -z "$OPENSHELL_AVAILABLE_VERSIONS" ]]; then
-        fail "Could not determine available OpenShell versions from PyPI."
-    fi
-    echo "OpenShell version range: $MIN_OPENSHELL_VERSION through $OPENSHELL_LATEST_VERSION"
-}
-
-version_is_available() {
-    case ",$OPENSHELL_AVAILABLE_VERSIONS," in
-        *",$1,"*)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-version_prompt_text() {
-    echo "OpenShell version [press Enter for ${DEFAULT_OPENSHELL_VERSION}; type latest for ${OPENSHELL_LATEST_VERSION}]: "
-}
-
-choose_openshell_version_interactively() {
-    local candidate
-    while true; do
-        read -r -p "$(version_prompt_text)" candidate
-        candidate="${candidate:-$DEFAULT_OPENSHELL_VERSION}"
-        if [[ "$candidate" == "latest" ]]; then
-            candidate="$OPENSHELL_LATEST_VERSION"
-        fi
-        if version_is_available "$candidate"; then
-            OPENSHELL_VERSION="$candidate"
-            return
-        fi
-        echo "OpenShell version '$candidate' was not found between $MIN_OPENSHELL_VERSION and $OPENSHELL_LATEST_VERSION."
-        echo "Try an exact released version, '$DEFAULT_OPENSHELL_VERSION', or 'latest'."
-    done
-}
-
 resolve_openshell_version() {
-    fetch_openshell_versions
-
-    if [[ -n "$OPENSHELL_VERSION" ]]; then
-        if [[ "$OPENSHELL_VERSION" == "latest" ]]; then
-            OPENSHELL_VERSION="$OPENSHELL_LATEST_VERSION"
-        fi
-        if version_is_available "$OPENSHELL_VERSION"; then
-            echo "OpenShell version selected: $OPENSHELL_VERSION"
-            return
-        fi
-
-        if [[ -t 0 && "$OPENSHELL_VERSION_USER_SUPPLIED" == "true" ]]; then
-            echo "OpenShell version '$OPENSHELL_VERSION' was not found between $MIN_OPENSHELL_VERSION and $OPENSHELL_LATEST_VERSION."
-            choose_openshell_version_interactively
-            echo "OpenShell version selected: $OPENSHELL_VERSION"
-            return
-        fi
-        fail "OpenShell version '$OPENSHELL_VERSION' was not found between $MIN_OPENSHELL_VERSION and $OPENSHELL_LATEST_VERSION."
-    fi
-
-    if [[ -t 0 ]]; then
-        choose_openshell_version_interactively
-    else
+    if [[ -z "$OPENSHELL_VERSION" ]]; then
         OPENSHELL_VERSION="$DEFAULT_OPENSHELL_VERSION"
-        if ! version_is_available "$OPENSHELL_VERSION"; then
-            fail "Default OpenShell version '$OPENSHELL_VERSION' was not found on PyPI."
-        fi
+    fi
+    if [[ "$OPENSHELL_VERSION" == "latest" || "$OPENSHELL_VERSION" != "$DEFAULT_OPENSHELL_VERSION" ]]; then
+        fail "OpenShell '$OPENSHELL_VERSION' is not certified for this AI-Q release. Use exact version $DEFAULT_OPENSHELL_VERSION; certify upgrades in a separate development change."
     fi
     echo "OpenShell version selected: $OPENSHELL_VERSION"
 }
@@ -398,31 +278,35 @@ install_openshell_python() {
     # NOTE: expand editable_args only when non-empty; macOS bash 3.2 errors on
     # "${arr[@]}" for an empty array under `set -u`.
     local adapter_install_args=()
-    if [[ ${#editable_args[@]} -eq 0 ]]; then
-        adapter_install_args=(--reinstall-package langchain-nvidia-openshell)
-    else
+    if [[ ${#editable_args[@]} -gt 0 ]]; then
         adapter_install_args=("${editable_args[@]}")
     fi
-    if ! uv pip install "${adapter_install_args[@]}" "$adapter_install_spec"; then
+    local adapter_install_failed=false
+    if [[ ${#adapter_install_args[@]} -eq 0 ]]; then
+        uv pip install "$adapter_install_spec" || adapter_install_failed=true
+    else
+        uv pip install "${adapter_install_args[@]}" "$adapter_install_spec" || adapter_install_failed=true
+    fi
+    if [[ "$adapter_install_failed" == "true" ]]; then
         cat <<EOF
 ERROR: Could not install the langchain-nvidia-openshell adapter.
 
 The adapter is published on PyPI as langchain-nvidia-openshell. The default install
 resolves from PyPI; if your environment cannot reach it, point LANGCHAIN_NVIDIA_REPO at
 an alternate uv install spec or a local checkout, then rerun. Examples:
-  LANGCHAIN_NVIDIA_REPO=langchain-nvidia-openshell scripts/setup_openshell.sh
-  scripts/setup_openshell.sh --langchain-nvidia /path/to/langchain-nvidia
+  LANGCHAIN_NVIDIA_REPO=langchain-nvidia-openshell==$OPENSHELL_ADAPTER_VERSION scripts/openshell/setup_openshell.sh
+  scripts/openshell/setup_openshell.sh --langchain-nvidia /path/to/langchain-nvidia
 EOF
         exit 1
     fi
 
-    # The adapter still declares deepagents<0.6, so its install downgrades the 0.6.x that
-    # AI-Q's deep-research runtime requires (pyproject: deepagents>=0.6.5). The adapter's
-    # code only uses the stable deepagents BaseSandbox/protocol surface (the same imports
-    # AI-Q's own sandbox package uses on 0.6.x), so reasserting the floor AI-Q needs is
-    # safe. This is the OpenShell setup script, so keeping AI-Q runnable is the goal.
-    log "Reasserting deepagents>=0.6.5 (AI-Q runtime floor) after adapter install"
-    uv pip install "deepagents>=0.6.5"
+    # Adapter 0.1.0 still declares deepagents<0.6 and can otherwise downgrade AI-Q's
+    # locked DeepAgents 0.6.x runtime. Restore the complete AI-Q lock while retaining
+    # optional packages that are intentionally absent from the base project metadata.
+    # This keeps repeated setup deterministic without pretending the upstream adapter
+    # metadata is compatible; `pip check` remains a documented upstream limitation.
+    log "Restoring locked AI-Q dependencies while retaining optional OpenShell packages"
+    uv sync --dev --inexact
 
     # Adapter dependency resolution must not silently change the operator-selected
     # OpenShell SDK/CLI version. Reapply the exact pin after every dependent package.
@@ -510,7 +394,7 @@ Install or link Docker CLI, then rerun:
 
 If Docker is installed but not on PATH, rerun with:
 
-  scripts/setup_openshell.sh --docker-bin /path/to/docker
+  scripts/openshell/setup_openshell.sh --docker-bin /path/to/docker
 EOF
     else
         cat <<'EOF'
@@ -523,7 +407,7 @@ Install Docker for your Linux distribution, then rerun. For example:
 
 If Docker is installed but not on PATH, rerun with:
 
-  scripts/setup_openshell.sh --docker-bin /path/to/docker
+  scripts/openshell/setup_openshell.sh --docker-bin /path/to/docker
 EOF
     fi
     exit 1
@@ -562,7 +446,7 @@ DOCKER_HOST is set to:
 
 Start that Docker daemon or update DOCKER_HOST, then rerun:
 
-  scripts/setup_openshell.sh
+  scripts/openshell/setup_openshell.sh
 EOF
         exit 1
     fi
@@ -586,7 +470,7 @@ Docker Desktop appears to be installed at:
 
 Start Docker Desktop, wait until it reports that Docker is running, then rerun:
 
-  scripts/setup_openshell.sh
+  scripts/openshell/setup_openshell.sh
 
 If you use a remote Docker daemon, set DOCKER_HOST before rerunning.
 EOF
@@ -597,7 +481,7 @@ Docker CLI was found, but the Docker daemon is not reachable.
 No Colima socket was selected and Docker Desktop was not found in /Applications
 or ~/Applications. Install and start Docker Desktop for macOS, then rerun:
 
-  scripts/setup_openshell.sh
+  scripts/openshell/setup_openshell.sh
 
 If you use Colima, start it first. For example:
 
@@ -758,7 +642,7 @@ emit_policy_header() {
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Generated by scripts/setup_openshell.sh.
+# Generated by scripts/openshell/setup_openshell.sh.
 
 version: 1
 
@@ -880,6 +764,14 @@ build_image() {
         -f "$REPO_ROOT/deploy/openshell/Dockerfile.aiq-demo" "$REPO_ROOT/deploy/openshell"
 }
 
+diagnose_gateway_components() {
+    log "Inspecting packaged gateway components"
+    if ! "$VENV_DIR/bin/python" "$SCRIPT_DIR/check_versions.py" \
+        --gateway-name "${AIQ_OPENSHELL_GATEWAY_NAME:-openshell}" --skip-live; then
+        echo "Provisioning completed, but gateway remediation is required before readiness or AI-Q startup."
+    fi
+}
+
 print_next_steps() {
     local runtime_config="configs/config_openshell.yml"
     local runtime_env=""
@@ -911,7 +803,7 @@ Validate the AI-Q config:
 Start or verify an authenticated gateway and run its strict capability probe:
 
   source .venv/bin/activate
-  ./scripts/start_openshell_gateway.sh
+  ./scripts/openshell/start_openshell_gateway.sh
 
 Start CLI mode after the gateway probe succeeds:
 
@@ -932,8 +824,7 @@ main() {
     detect_os
     require_uv
     if [[ "$LIST_OPENSHELL_VERSIONS" == "true" ]]; then
-        fetch_openshell_versions
-        echo "$OPENSHELL_AVAILABLE_VERSIONS" | tr ',' '\n'
+        echo "$DEFAULT_OPENSHELL_VERSION"
         exit 0
     fi
     resolve_openshell_version
@@ -946,6 +837,7 @@ main() {
     verify_docker_runtime
     generate_policy
     build_image
+    diagnose_gateway_components
     print_next_steps
 }
 
