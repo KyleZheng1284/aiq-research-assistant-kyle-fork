@@ -25,6 +25,7 @@ from langchain_core.tools import tool
 
 from aiq_agent.agents.deep_researcher.custom_middleware import ArtifactHarvestMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import FilesystemToolCallGuardMiddleware
+from aiq_agent.agents.deep_researcher.custom_middleware import RequiredOutputFileMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRegistryMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRoutingGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import TodoSuppressionMiddleware
@@ -243,6 +244,7 @@ def test_subagents_route_tools_and_writer_skills():
     assert any(isinstance(item, ToolVisibilityMiddleware) for item in by_name["planner-agent"]["middleware"])
     assert any(isinstance(item, ToolVisibilityMiddleware) for item in by_name["writer-agent"]["middleware"])
     assert any(isinstance(item, TodoSuppressionMiddleware) for item in by_name["writer-agent"]["middleware"])
+    assert any(isinstance(item, RequiredOutputFileMiddleware) for item in by_name["writer-agent"]["middleware"])
 
 
 def test_skill_filesystem_permissions_filter_unassigned_skill_collections():

@@ -46,6 +46,7 @@ from .custom_middleware import EmptyContentFixMiddleware
 from .custom_middleware import ExecuteTimeoutClampMiddleware
 from .custom_middleware import FilesystemToolCallGuardMiddleware
 from .custom_middleware import PlanPersistenceMiddleware
+from .custom_middleware import RequiredOutputFileMiddleware
 from .custom_middleware import SourceRegistryMiddleware
 from .custom_middleware import SourceRoutingGuardMiddleware
 from .custom_middleware import TodoSuppressionMiddleware
@@ -470,6 +471,7 @@ def build_deep_research_subagents(context: DeepResearchGraphContext) -> list[dic
             middleware=[
                 *context.middleware_set.writer,
                 TodoSuppressionMiddleware(),
+                RequiredOutputFileMiddleware(),
             ],
             prompt_values={"parent_report_context_available": context.parent_report_context_available},
             skills=context.skill_sources(WRITER_AGENT),

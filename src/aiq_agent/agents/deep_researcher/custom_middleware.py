@@ -22,8 +22,10 @@ from pathlib import Path
 from pathlib import PurePosixPath
 
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import hook_config
 from langchain.agents.middleware.types import ModelResponse
 from langchain_core.messages import AIMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.messages import SystemMessage
 from langchain_core.messages import ToolMessage
 
@@ -197,6 +199,95 @@ class FilesystemToolCallGuardMiddleware(AgentMiddleware):
                 )
 
         return await handler(request)
+
+
+class RequiredOutputFileMiddleware(AgentMiddleware):
+    """Verify a model's file-backed completion marker before ending its run.
+
+    A model can claim that it wrote a file without making the filesystem tool call.
+    Keep recovery local to that agent: request one corrective model turn, then fail
+    with a stable reason code instead of restarting the surrounding workflow.
+    """
+
+    def __init__(
+        self,
+        *,
+        paths: tuple[str, ...] = ("/shared/output.md", "/output.md"),
+        completion_marker: str = "Wrote /shared/output.md",
+        max_retries: int = 1,
+        reason_code: str = "writer_output_missing",
+    ) -> None:
+        """Configure the accepted state paths and bounded corrective turns."""
+        if not paths:
+            raise ValueError("paths must not be empty")
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        self.paths = paths
+        self.completion_marker = completion_marker
+        self.max_retries = max_retries
+        self.reason_code = reason_code
+        self._retry_message = (
+            "The required final output file is missing or empty. Do not repeat research or regenerate artifacts. "
+            f"Call write_file with file_path={paths[0]} and the complete final Markdown, confirm the tool "
+            f"succeeds, and only then return `{completion_marker}`."
+        )
+
+    @staticmethod
+    def _files_from_state(state: object) -> object:
+        return state.get("files", {}) if isinstance(state, dict) else getattr(state, "files", {})
+
+    @staticmethod
+    def _entry_has_content(entry: object) -> bool:
+        if isinstance(entry, dict):
+            entry = entry.get("content")
+        if isinstance(entry, bytes):
+            return bool(entry.strip())
+        if isinstance(entry, str):
+            return bool(entry.strip())
+        if isinstance(entry, list):
+            return any(isinstance(line, str) and line.strip() for line in entry)
+        return False
+
+    def _required_output_exists(self, state: object) -> bool:
+        files = self._files_from_state(state)
+        return isinstance(files, dict) and any(self._entry_has_content(files.get(path)) for path in self.paths)
+
+    def _retry_count(self, messages: list[object]) -> int:
+        return sum(isinstance(message, HumanMessage) and message.content == self._retry_message for message in messages)
+
+    def _check_after_model(self, state: object) -> dict[str, object] | None:
+        messages = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        if not isinstance(messages, list) or not messages:
+            return None
+        last_message = messages[-1]
+        if not isinstance(last_message, AIMessage) or last_message.tool_calls:
+            return None
+        if last_message.text.strip() != self.completion_marker:
+            return None
+        if self._required_output_exists(state):
+            return None
+
+        retry_count = self._retry_count(messages)
+        if retry_count >= self.max_retries:
+            raise RuntimeError(self.reason_code)
+
+        logger.warning(
+            "Agent reported file-backed completion before the required output existed; requesting corrective turn"
+        )
+        return {
+            "messages": [HumanMessage(content=self._retry_message)],
+            "jump_to": "model",
+        }
+
+    @hook_config(can_jump_to=["model"])
+    def after_model(self, state, runtime):
+        """Verify synchronous writer completion and request one local repair when needed."""
+        return self._check_after_model(state)
+
+    @hook_config(can_jump_to=["model"])
+    async def aafter_model(self, state, runtime):
+        """Verify asynchronous writer completion and request one local repair when needed."""
+        return self._check_after_model(state)
 
 
 # Common hallucinated tool name mappings

@@ -21,7 +21,13 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import pytest
+from deepagents.backends import CompositeBackend
+from deepagents.backends import StateBackend
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from langchain.agents import create_agent
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.messages import SystemMessage
 from langchain_core.messages import ToolMessage
 
@@ -29,6 +35,7 @@ from aiq_agent.agents.deep_researcher.custom_middleware import ArtifactHarvestMi
 from aiq_agent.agents.deep_researcher.custom_middleware import ExecuteTimeoutClampMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import FilesystemToolCallGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import PlanPersistenceMiddleware
+from aiq_agent.agents.deep_researcher.custom_middleware import RequiredOutputFileMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRegistryMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRoutingGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import TodoSuppressionMiddleware
@@ -38,6 +45,13 @@ from aiq_agent.agents.deep_researcher.tools.source_registry import build_get_ver
 from aiq_agent.common.citation_verification import SourceEntry
 from aiq_agent.common.data_source_registry import populate_from_config
 from aiq_agent.common.data_source_registry import reset_registry
+
+
+class _ToolBindingFakeChatModel(FakeMessagesListChatModel):
+    """Scripted chat model that accepts the tools bound by ``create_agent``."""
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        return self
 
 
 class TestSourceRoutingGuardMiddleware:
@@ -253,6 +267,128 @@ class TestFilesystemToolCallGuardMiddleware:
 
         assert result is expected
         handler.assert_awaited_once_with(request)
+
+
+class TestRequiredOutputFileMiddleware:
+    """The writer may only claim completion after a non-empty report exists."""
+
+    marker = "Wrote /shared/output.md"
+
+    @staticmethod
+    def _state(*, files: dict | None = None, messages: list | None = None) -> dict:
+        return {
+            "files": files or {},
+            "messages": messages or [AIMessage(content="Wrote /shared/output.md")],
+        }
+
+    @pytest.mark.parametrize("path", ["/shared/output.md", "/output.md"])
+    def test_accepts_non_empty_output_in_both_backend_path_forms(self, path: str) -> None:
+        middleware = RequiredOutputFileMiddleware()
+        state = self._state(files={path: {"content": "# Final report"}})
+
+        assert middleware.after_model(state, None) is None
+
+    @pytest.mark.parametrize("content", ["", "   ", b"\n", []])
+    def test_empty_output_requests_one_local_corrective_turn(self, content: object) -> None:
+        middleware = RequiredOutputFileMiddleware()
+        state = self._state(files={"/output.md": {"content": content}})
+
+        update = middleware.after_model(state, None)
+
+        assert update is not None
+        assert update["jump_to"] == "model"
+        correction = update["messages"][0]
+        assert isinstance(correction, HumanMessage)
+        assert "Call write_file" in str(correction.content)
+        assert "Do not repeat research" in str(correction.content)
+
+    def test_does_not_interrupt_intermediate_tool_call(self) -> None:
+        middleware = RequiredOutputFileMiddleware()
+        state = self._state(
+            messages=[
+                AIMessage(
+                    content=self.marker,
+                    tool_calls=[{"name": "write_file", "args": {}, "id": "tc1"}],
+                )
+            ]
+        )
+
+        assert middleware.after_model(state, None) is None
+
+    @pytest.mark.asyncio
+    async def test_async_retry_accepts_repaired_route_local_output(self) -> None:
+        middleware = RequiredOutputFileMiddleware()
+        first = middleware.after_model(self._state(), None)
+        correction = first["messages"][0]
+        repaired = self._state(
+            files={"/output.md": {"content": "# Final report"}},
+            messages=[AIMessage(content=self.marker), correction, AIMessage(content=self.marker)],
+        )
+
+        assert await middleware.aafter_model(repaired, None) is None
+
+    def test_repeated_false_completion_fails_with_stable_reason_code(self) -> None:
+        middleware = RequiredOutputFileMiddleware()
+        first = middleware.after_model(self._state(), None)
+        correction = first["messages"][0]
+        still_missing = self._state(
+            messages=[AIMessage(content=self.marker), correction, AIMessage(content=self.marker)]
+        )
+
+        with pytest.raises(RuntimeError, match="^writer_output_missing$"):
+            middleware.after_model(still_missing, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shared_route", [False, True])
+    async def test_graph_retry_stays_local_and_writes_required_output(self, shared_route: bool) -> None:
+        """The jump performs one corrective model turn and then follows the normal tool loop."""
+        model = _ToolBindingFakeChatModel(
+            responses=[
+                AIMessage(content=self.marker),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_file",
+                            "args": {"file_path": "/shared/output.md", "content": "# Final report"},
+                            "id": "tc1",
+                        }
+                    ],
+                ),
+                AIMessage(content=self.marker),
+            ]
+        )
+        backend = (
+            CompositeBackend(default=StateBackend(), routes={"/shared/": StateBackend()}) if shared_route else None
+        )
+        graph = create_agent(
+            model,
+            tools=[],
+            middleware=[FilesystemMiddleware(backend=backend), RequiredOutputFileMiddleware()],
+        )
+
+        result = await graph.ainvoke({"messages": [HumanMessage(content="Write the report")]})
+
+        expected_path = "/output.md" if shared_route else "/shared/output.md"
+        assert result["files"][expected_path]["content"] == "# Final report"
+        assert [message.content for message in result["messages"]].count(self.marker) == 2
+
+    @pytest.mark.asyncio
+    async def test_graph_stops_after_bounded_false_completion_retry(self) -> None:
+        model = _ToolBindingFakeChatModel(
+            responses=[
+                AIMessage(content=self.marker),
+                AIMessage(content=self.marker),
+            ]
+        )
+        graph = create_agent(
+            model,
+            tools=[],
+            middleware=[FilesystemMiddleware(), RequiredOutputFileMiddleware()],
+        )
+
+        with pytest.raises(RuntimeError, match="^writer_output_missing"):
+            await graph.ainvoke({"messages": [HumanMessage(content="Write the report")]})
 
 
 class TestToolNameSanitizationMiddleware:
