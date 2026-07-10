@@ -362,6 +362,11 @@ class TestDeepAgentsRuntimeJobId:
         with pytest.raises(ValueError, match="network_allow"):
             DeepResearchSandboxConfig(network="allowlist")
 
+    @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+    def test_public_ready_timeout_must_be_positive_and_finite(self, timeout: float) -> None:
+        with pytest.raises(ValueError, match="ready_timeout_seconds"):
+            DeepResearchSandboxConfig(ready_timeout_seconds=timeout)
+
 
 class TestDeepAgentsRuntimeArtifacts:
     """Terminal artifact harvesting is safe on normal and interrupted paths."""

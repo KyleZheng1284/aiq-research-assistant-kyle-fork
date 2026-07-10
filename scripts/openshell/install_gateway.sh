@@ -102,14 +102,7 @@ if [[ "$formula_count" -gt 1 ]]; then
 fi
 if [[ "$formula_count" -eq 1 ]]; then
     installed_formula="$(printf '%s\n' "$installed_formulas" | awk 'NF {print; exit}')"
-    official_tap_present=false
-    if brew tap 2>/dev/null | grep -Fx "nvidia/openshell" >/dev/null; then
-        official_tap_present=true
-    fi
-    if [[ "$installed_formula" == "openshell" && "$official_tap_present" != "true" ]]; then
-        fail "ambiguous_gateway_installation: the installed OpenShell formula is not from the official tap"
-    fi
-    if [[ "$installed_formula" != "openshell" && "$installed_formula" != "nvidia/openshell/openshell" ]]; then
+    if [[ "$installed_formula" != "nvidia/openshell/openshell" ]]; then
         fail "ambiguous_gateway_installation: remove the non-official OpenShell formula before continuing"
     fi
 fi

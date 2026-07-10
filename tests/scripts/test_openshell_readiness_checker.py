@@ -164,6 +164,22 @@ class _DeleteFailureClient(_Client):
         return False
 
 
+class _MismatchedNameClient(_Client):
+    def __init__(self) -> None:
+        super().__init__()
+        self.deleted_name: str | None = None
+
+    def create(self, *, spec: object, name: str, labels: dict[str, str]) -> object:
+        del spec, name
+        self.sandbox.name = "gateway-returned-name"
+        self.sandbox.labels = labels
+        return self.sandbox
+
+    def delete(self, name: str) -> bool:
+        self.deleted_name = name
+        return super().delete(name)
+
+
 @contextmanager
 def _fake_runtime(client: _Client):
     openshell = ModuleType("openshell")
@@ -378,6 +394,21 @@ def test_probe_rejects_selector_metadata_mismatch_and_cleans_up(checker: ModuleT
         checker.run_check(_config(checker, tmp_path))
 
     assert client.delete_calls == 1
+
+
+def test_probe_cleans_up_sdk_returned_name_on_name_mismatch(checker: ModuleType, tmp_path: Path) -> None:
+    client = _MismatchedNameClient()
+    with (
+        _provider_helpers(client),
+        _fake_runtime(client),
+        patch.object(checker.importlib.metadata, "version", return_value="1.2.3"),
+        patch.object(checker, "_version_from_cli", return_value="1.2.3"),
+        pytest.raises(checker.ReadinessError, match="probe_failed"),
+    ):
+        checker.run_check(_config(checker, tmp_path))
+
+    assert client.deleted_name == "gateway-returned-name"
+    assert client.deleted is True
 
 
 def test_probe_reports_cleanup_failure(checker: ModuleType, tmp_path: Path) -> None:

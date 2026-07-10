@@ -143,6 +143,37 @@ def test_multiple_local_installations_fail_as_ambiguous(inspector: ModuleType, m
     assert report.reason_code == "ambiguous_gateway_installation"
 
 
+def test_bare_formula_is_preserved_as_ambiguous(inspector: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_common(inspector, monkeypatch)
+    monkeypatch.setattr(inspector.shutil, "which", lambda _name: "/opt/homebrew/bin/brew")
+
+    def fake_run(command: list[str]) -> str | None:
+        args = command[1:]
+        if args == ["list", "--formula", "--full-name"]:
+            return "openshell"
+        if args == ["services", "list", "--json"]:
+            return "[]"
+        if args == ["list", "--versions", "openshell"]:
+            return "openshell 0.0.80"
+        if args == ["--prefix", "openshell"]:
+            return "/opt/homebrew/opt/openshell"
+        return None
+
+    monkeypatch.setattr(inspector, "_run", fake_run)
+    monkeypatch.setattr(inspector, "_cli_version", lambda _path: "0.0.80")
+
+    formulas, formula, formula_version, packaged_version = inspector._homebrew_components()
+
+    assert formulas == ["openshell"]
+    assert formula == "openshell"
+    assert formula_version == "0.0.80"
+    assert packaged_version == "0.0.80"
+
+    report = inspector.inspect_components(gateway_name="openshell", system="Darwin")
+
+    assert report.reason_code == "ambiguous_gateway_installation"
+
+
 def test_remote_mismatch_never_recommends_local_install(inspector: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_common(inspector, monkeypatch, gateway_type="remote", gateway_version="0.0.72")
 

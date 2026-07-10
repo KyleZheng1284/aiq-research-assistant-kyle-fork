@@ -222,9 +222,11 @@ def run_check(config: ReadinessConfig) -> tuple[str, str]:
             raise ReadinessError("request_labels_unsupported")
 
         sandbox_name = f"aiq-readiness-{uuid4().hex[:12]}"
+        cleanup_name = sandbox_name
         primary_error: ReadinessError | None = None
         try:
             sandbox = client.create(spec=spec, name=sandbox_name, labels=labels)
+            cleanup_name = getattr(sandbox, "name", None) or sandbox_name
             if sandbox.name != sandbox_name:
                 raise ReadinessError("probe_failed")
             sandbox = client.wait_ready(sandbox_name, timeout_seconds=config.ready_timeout_seconds)
@@ -251,15 +253,15 @@ def run_check(config: ReadinessConfig) -> tuple[str, str]:
         finally:
             try:
                 try:
-                    client.get(sandbox_name)
+                    client.get(cleanup_name)
                 except grpc.RpcError as exc:
                     if not _is_not_found(exc, grpc):
                         raise
                 else:
-                    if not client.delete(sandbox_name):
+                    if not client.delete(cleanup_name):
                         raise ReadinessError("cleanup_failed")
-                    client.wait_deleted(sandbox_name)
-                _verify_absent(client, sandbox_name, selector, grpc)
+                    client.wait_deleted(cleanup_name)
+                _verify_absent(client, cleanup_name, selector, grpc)
             except Exception as exc:  # noqa: BLE001 - cleanup failure overrides probe failure
                 raise ReadinessError("cleanup_failed") from exc
         if primary_error is not None:

@@ -108,7 +108,12 @@ class OpenShellProviderConfig(BaseModel):
         description="OpenShell policy YAML applied when the per-job sandbox is created.",
     )
     image: str = Field(default="aiq-openshell-demo:latest", description="OpenShell image identifier")
-    ready_timeout_seconds: float = Field(default=300.0, description="Seconds to wait for the sandbox to become ready")
+    ready_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Seconds to wait for the sandbox to become ready",
+    )
     policy_load_timeout_seconds: float = Field(
         default=30.0,
         gt=0,

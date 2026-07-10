@@ -280,6 +280,12 @@ def test_policy_reader_rejects_missing_file_and_wrong_version(tmp_path: Path) ->
         (
             "version: 1\nfilesystem_policy: {read_write: [/sandbox]}\n"
             "landlock: {compatibility: hard_requirement}\n"
+            "process: {run_as_user: 1000, run_as_group: sandbox}\n",
+            "non-empty string",
+        ),
+        (
+            "version: 1\nfilesystem_policy: {read_write: [/sandbox]}\n"
+            "landlock: {compatibility: hard_requirement}\n"
             "process: {run_as_user: sandbox, run_as_group: sandbox}\n"
             "network_policies: {bad: {endpoints: [{host: example.com, enforcement: audit, access: read-write}]}}\n",
             "enforcement=enforce",
@@ -1207,6 +1213,12 @@ def test_cleanup_timeout_must_be_positive_and_finite(timeout: float) -> None:
 def test_policy_load_timeout_must_be_positive_and_finite(timeout: float) -> None:
     with pytest.raises(ValueError, match="policy_load_timeout_seconds"):
         SandboxConfig(provider="openshell", providers={"openshell": {"policy_load_timeout_seconds": timeout}})
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_ready_timeout_must_be_positive_and_finite(timeout: float) -> None:
+    with pytest.raises(ValueError, match="ready_timeout_seconds"):
+        SandboxConfig(provider="openshell", providers={"openshell": {"ready_timeout_seconds": timeout}})
 
 
 def test_deferred_context_cleanup_timeout_is_terminal() -> None:

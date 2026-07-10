@@ -205,6 +205,26 @@ echo "brew $*" >>"$FAKE_LOG"
     assert "curl " not in calls
 
 
+def test_bare_formula_is_not_treated_as_official_from_registered_tap(tmp_path: Path) -> None:
+    env, log = _environment(tmp_path)
+    brew = Path(env["PATH"].split(":", maxsplit=1)[0]) / "brew"
+    _write_executable(
+        brew,
+        """#!/bin/bash
+if [[ "$*" == "list --formula --full-name" ]]; then echo openshell; exit 0; fi
+if [[ "$*" == "tap" ]]; then echo nvidia/openshell; exit 0; fi
+echo "brew $*" >>"$FAKE_LOG"
+""",
+    )
+
+    result = _run(tmp_path, "--yes", env=env)
+
+    assert result.returncode != 0
+    assert "ambiguous_gateway_installation" in result.stderr
+    calls = log.read_text(encoding="utf-8") if log.exists() else ""
+    assert "curl " not in calls
+
+
 def test_ambiguous_service_installation_is_refused(tmp_path: Path) -> None:
     env, log = _environment(tmp_path)
     brew = Path(env["PATH"].split(":", maxsplit=1)[0]) / "brew"

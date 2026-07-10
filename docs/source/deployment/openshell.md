@@ -266,7 +266,7 @@ brew install bash
 /opt/homebrew/bin/bash ./scripts/openshell/setup_openshell.sh \
   --openshell-version 0.0.80 \
   --local-demo \
-  --policy offline \
+  --policy offline
 ```
 
 If setup reports `packaged_gateway_missing` or

@@ -18,6 +18,7 @@
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from pathlib import PurePosixPath
 
@@ -46,11 +47,8 @@ _SOURCE_ROUTING_PATH = "/shared/source_routing.json"
 # route-local key. The guard reads raw state, so it must accept both forms or it
 # blocks the orchestrator forever on sandboxed runs.
 _SOURCE_ROUTING_STATE_KEYS = (_SOURCE_ROUTING_PATH, "/source_routing.json")
-_UNRESOLVED_SANDBOX_PATH_TOKENS = (
-    "<sandbox_artifact_dir>",
-    "<sandbox_workdir>",
-    "{{ sandbox_artifact_dir }}",
-    "{{ sandbox_workdir }}",
+_UNRESOLVED_SANDBOX_PATH_PATTERN = re.compile(
+    r"<\s*sandbox_(?:artifact_dir|workdir)\s*>|\{\{\s*sandbox_(?:artifact_dir|workdir)\s*\}\}"
 )
 
 
@@ -186,11 +184,11 @@ class FilesystemToolCallGuardMiddleware(AgentMiddleware):
 
         if tool_call.get("name") == "execute" and isinstance(args.get("command"), str):
             command = args["command"]
-            unresolved = next((token for token in _UNRESOLVED_SANDBOX_PATH_TOKENS if token in command), None)
+            unresolved = _UNRESOLVED_SANDBOX_PATH_PATTERN.search(command)
             if unresolved is not None:
                 return ToolMessage(
                     content=(
-                        f"Command not executed: unresolved sandbox path placeholder {unresolved}. "
+                        f"Command not executed: unresolved sandbox path placeholder {unresolved.group(0)}. "
                         "Use the exact sandbox_workdir or sandbox_artifact_dir path from your instructions."
                     ),
                     tool_call_id=tool_call.get("id", "filesystem-tool-call-guard"),

@@ -240,7 +240,16 @@ class TestFilesystemToolCallGuardMiddleware:
         assert forwarded.tool_call["args"] == {"file_path": "/shared/output.md", "offset": 1}
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("placeholder", ["<sandbox_artifact_dir>", "{{ sandbox_workdir }}"])
+    @pytest.mark.parametrize(
+        "placeholder",
+        [
+            "<sandbox_artifact_dir>",
+            "<  sandbox_workdir  >",
+            "{{ sandbox_workdir }}",
+            "{{sandbox_artifact_dir}}",
+            "{{  sandbox_workdir  }}",
+        ],
+    )
     async def test_rejects_unresolved_execute_path_placeholder(self, placeholder: str) -> None:
         middleware = FilesystemToolCallGuardMiddleware()
         request = self._request("execute", {"command": f"python3 make_chart.py {placeholder}"})

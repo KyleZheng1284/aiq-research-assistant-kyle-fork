@@ -184,7 +184,9 @@ def _read_policy_data(policy_path: str, *, require_hard_landlock: bool) -> dict[
         raise ValueError("OpenShell production policy requires a process policy")
     for field in ("run_as_user", "run_as_group"):
         identity = process.get(field)
-        if not isinstance(identity, str) or not identity.strip() or identity.strip().lower() in {"0", "root"}:
+        if not isinstance(identity, str) or not identity.strip():
+            raise ValueError(f"OpenShell production policy requires process.{field} to be a non-empty string")
+        if identity.strip().lower() in {"0", "root"}:
             raise ValueError(f"OpenShell production policy requires a non-root process.{field}")
 
     network_policies = raw.get("network_policies") or {}

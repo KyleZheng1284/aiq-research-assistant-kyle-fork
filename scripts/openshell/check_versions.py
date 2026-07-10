@@ -88,9 +88,6 @@ def _homebrew_components() -> tuple[list[str], str | None, str | None, str | Non
     formulas = sorted(
         {line.strip() for line in formula_output.splitlines() if line.strip().split("/")[-1] == "openshell"}
     )
-    taps = set((_run([brew, "tap"]) or "").splitlines())
-    if formulas == ["openshell"] and "nvidia/openshell" in taps:
-        formulas = [_OFFICIAL_FORMULA]
     service_output = _run([brew, "services", "list", "--json"])
     if service_output:
         try:

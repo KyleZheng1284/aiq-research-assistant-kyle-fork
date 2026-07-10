@@ -113,6 +113,8 @@ class DeepResearchSandboxConfig(FunctionBaseConfig, name="deep_research_sandbox"
     policy: str | None = Field(default=None, description="OpenShell policy YAML applied at per-job creation.")
     ready_timeout_seconds: float = Field(
         default=300.0,
+        gt=0,
+        allow_inf_nan=False,
         description="Seconds to wait for the OpenShell sandbox to become ready.",
     )
     policy_load_timeout_seconds: float = Field(
