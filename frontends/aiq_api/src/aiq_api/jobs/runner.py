@@ -942,9 +942,10 @@ async def _flush_event_store(event_store: Any | None, *, job_id: str) -> None:
 def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: bool) -> None:
     """Harvest artifacts and release sandbox resources on a terminal path.
 
-    Interrupted jobs (cancel/timeout) call ``terminate()`` so a still-running ``execute`` is
-    forcibly preempted; normal paths call ``close()`` gracefully. Both are idempotent. This runs
-    off the event loop (``asyncio.to_thread``) so the SDK session close cannot block the worker.
+    Prefers ``finalize(interrupted=...)`` when available. On the legacy fallback,
+    interrupted/cancelled jobs call ``terminate()`` so a still-running ``execute`` is forcibly
+    preempted; normal failure and success paths call ``close()`` gracefully. Both are idempotent.
+    This runs off the event loop (``asyncio.to_thread``) so SDK cleanup cannot block the worker.
     """
     if sandbox_runtime is None:
         return

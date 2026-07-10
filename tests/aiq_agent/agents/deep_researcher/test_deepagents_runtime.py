@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
+from pathlib import Path
 from threading import Event
 from threading import Thread
 from typing import Any
@@ -26,6 +27,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
+import yaml
 from deepagents.backends import CompositeBackend
 from deepagents.backends import FilesystemBackend
 from deepagents.backends import StateBackend
@@ -41,6 +43,29 @@ from aiq_agent.agents.deep_researcher.deepagents_runtime import discover_skill_c
 from aiq_agent.agents.deep_researcher.deepagents_runtime import resolve_skill_collections
 
 SYNTHESIS_SKILL_SOURCE = f"{BUILTIN_SKILL_SOURCE}synthesis/"
+
+
+def test_openshell_workflow_only_diverges_for_sandbox_wiring() -> None:
+    """Keep the OpenShell workflow aligned with the standard web config."""
+
+    def load(path: str) -> dict[str, Any]:
+        text = Path(path).read_text(encoding="utf-8")
+        text = text.replace("${AIQ_OPENSHELL_REQUIRE_HARD_LANDLOCK:-true}", "true")
+        return yaml.safe_load(text)
+
+    standard = load("configs/config_web_default_llamaindex.yml")
+    openshell = load("configs/config_openshell.yml")
+    openshell_functions = openshell["functions"].copy()
+    openshell_functions.pop("deep_research_skills")
+    openshell_functions.pop("deep_research_sandbox")
+    openshell_functions["deep_research_agent"] = openshell_functions["deep_research_agent"].copy()
+    openshell_functions["deep_research_agent"].pop("skills")
+    openshell_functions["deep_research_agent"].pop("sandbox")
+
+    assert openshell["general"] == standard["general"]
+    assert openshell["llms"] == standard["llms"]
+    assert openshell_functions == standard["functions"]
+    assert openshell["workflow"] == standard["workflow"]
 
 
 class TestSkillCollections:
@@ -336,6 +361,57 @@ class TestDeepAgentsRuntimeJobId:
     def test_public_allowlist_requires_hosts(self) -> None:
         with pytest.raises(ValueError, match="network_allow"):
             DeepResearchSandboxConfig(network="allowlist")
+
+
+class TestDeepAgentsRuntimeArtifacts:
+    """Terminal artifact harvesting is safe on normal and interrupted paths."""
+
+    def test_final_harvest_logs_only_exception_type(self, caplog: pytest.LogCaptureFixture) -> None:
+        provider = MagicMock()
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig())
+        runtime.artifact_manager = MagicMock()
+        runtime.artifact_manager.final_harvest.side_effect = RuntimeError("credential=do-not-log")
+
+        with caplog.at_level(logging.WARNING):
+            runtime.final_harvest()
+
+        assert "RuntimeError" in caplog.text
+        assert "credential=do-not-log" not in caplog.text
+
+    def test_normal_finalize_artifacts_harvests(self) -> None:
+        provider = MagicMock()
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig())
+        runtime.artifact_manager = MagicMock()
+
+        assert runtime.finalize_artifacts(interrupted=False) is True
+        assert runtime.finalize_artifacts(interrupted=False) is False
+        runtime.artifact_manager.final_harvest.assert_called_once_with()
+
+    @pytest.mark.parametrize(("lease_acquired", "expected"), [(True, True), (False, False)])
+    def test_interrupted_finalize_harvests_only_when_provider_is_idle(
+        self,
+        lease_acquired: bool,
+        expected: bool,
+    ) -> None:
+        provider = MagicMock()
+        provider.try_operation_lease.return_value = nullcontext(lease_acquired)
+        with patch(
+            "aiq_agent.agents.deep_researcher.deepagents_runtime._create_sandbox_backend",
+            return_value=provider,
+        ):
+            runtime = DeepAgentsRuntime(sandbox=DeepResearchSandboxConfig())
+        runtime.artifact_manager = MagicMock()
+
+        assert runtime.finalize_artifacts(interrupted=True) is expected
+        assert runtime.artifact_manager.final_harvest.call_count == int(lease_acquired)
 
 
 class TestDeepAgentsRuntimeCleanup:

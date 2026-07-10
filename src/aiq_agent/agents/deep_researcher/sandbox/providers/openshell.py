@@ -112,7 +112,7 @@ def _classify_fs_error(text: str) -> str:
 
 
 _OPENSHELL_IMPORT_HINT = (
-    "The OpenShell sandbox provider requires the `openshell>=0.0.72,<0.1` SDK and the "
+    "The OpenShell sandbox provider requires the `openshell>=0.0.80,<0.1` SDK and the "
     "`langchain-nvidia-openshell` adapter (published on PyPI). They are optional, ad-hoc "
     "dependencies. Install them with `./scripts/setup_openshell.sh` (which installs "
     "`langchain-nvidia-openshell` from PyPI; override the source via `LANGCHAIN_NVIDIA_REPO`), "
@@ -209,7 +209,7 @@ def _read_policy_data(policy_path: str, *, require_hard_landlock: bool) -> dict[
                     "enforcement=enforce and access=read-only"
                 )
 
-    # OpenShell's YAML schema calls this field filesystem_policy while the 0.0.72
+    # OpenShell's YAML schema calls this field filesystem_policy while the
     # Python proto calls it filesystem. Keep this compatibility translation in one
     # place and reject every other unknown field through ParseDict below.
     policy_data = dict(raw)
@@ -306,7 +306,7 @@ def _has_message_field(message: Any, field: str) -> bool:
 
 
 def _deterministic_policy_hash(policy: Any) -> str:
-    """Compute OpenShell 0.0.72's canonical SHA-256 policy hash."""
+    """Compute OpenShell's canonical SHA-256 policy hash."""
     hasher = hashlib.sha256()
     hasher.update(int(getattr(policy, "version", 0)).to_bytes(4, byteorder="little", signed=False))
     for field in ("filesystem", "landlock", "process"):
@@ -707,8 +707,12 @@ class OpenShellSandboxProvider(SandboxProvider):
                     reason_code="version_mismatch",
                 )
             effective_version = revision_version
-            for reported_version in (active_version, initial_policy_version, current_policy_version):
-                if isinstance(reported_version, int) and reported_version > 0 and reported_version != effective_version:
+            for reported_version in (active_version, current_policy_version):
+                if (
+                    not isinstance(reported_version, int)
+                    or reported_version <= 0
+                    or reported_version != effective_version
+                ):
                     self._fail_attestation(
                         phase=phase,
                         policy_version=revision_version,

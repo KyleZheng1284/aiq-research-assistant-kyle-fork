@@ -157,7 +157,7 @@ def _verify_policy(
             getattr(status, "active_version", 0),
             getattr(refreshed, "current_policy_version", 0),
         ):
-            if isinstance(reported, int) and reported > 0 and reported != revision_version:
+            if not isinstance(reported, int) or reported <= 0 or reported != revision_version:
                 raise ReadinessError("version_mismatch")
         if getattr(config, "policy_source", sandbox_pb2.POLICY_SOURCE_UNSPECIFIED) != sandbox_pb2.POLICY_SOURCE_SANDBOX:
             raise ReadinessError("policy_source_mismatch")

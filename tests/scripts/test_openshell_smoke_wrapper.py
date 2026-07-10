@@ -50,7 +50,7 @@ def test_wrapper_translates_arguments_and_preserves_environment(
             "--image",
             "image:tag",
             "--expected-gateway-version",
-            "0.0.72",
+            "0.0.80",
             "--allow-best-effort-landlock",
         ]
     )
@@ -66,7 +66,7 @@ def test_wrapper_translates_arguments_and_preserves_environment(
     assert env["AIQ_OPENSHELL_GATEWAY_NAME"] == "enterprise"
     assert env["AIQ_OPENSHELL_POLICY_FILE"] == "policy.yaml"
     assert env["AIQ_OPENSHELL_IMAGE"] == "image:tag"
-    assert env["AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION"] == "0.0.72"
+    assert env["AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION"] == "0.0.80"
     assert env["AIQ_OPENSHELL_LIVE_ALLOW_BEST_EFFORT"] == "1"
 
 

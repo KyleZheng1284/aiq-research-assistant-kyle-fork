@@ -216,6 +216,22 @@ def test_setup_policy_declares_canonical_openshell_proxy_baseline() -> None:
     assert "/proc/self" not in policy_template
 
 
+def test_setup_resolves_docker_desktop_cli_and_credential_helper_together() -> None:
+    source = _SETUP_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'docker_desktop_bin="/Applications/Docker.app/Contents/Resources/bin"' in source
+    assert 'export PATH="$docker_desktop_bin:$PATH"' in source
+
+
+def test_setup_local_demo_uses_explicit_runtime_override_without_config_copy() -> None:
+    source = _SETUP_SCRIPT.read_text(encoding="utf-8")
+
+    assert "--local-demo" in source
+    assert 'LANDLOCK_COMPATIBILITY="best_effort"' in source
+    assert 'runtime_env="AIQ_OPENSHELL_REQUIRE_HARD_LANDLOCK=false "' in source
+    assert "configs/config_openshell.local.yml" not in source
+
+
 def test_e2e_gateway_start_is_explicit_opt_in() -> None:
     source = _E2E_SCRIPT.read_text(encoding="utf-8")
     result = subprocess.run(
@@ -231,3 +247,10 @@ def test_e2e_gateway_start_is_explicit_opt_in() -> None:
     assert "START_OPENSHELL_GATEWAY=false" in source
     assert 'if [[ "$START_OPENSHELL_GATEWAY" != "true" ]]' in source
     assert '"$PROJECT_ROOT/scripts/start_openshell_gateway.sh"' in source
+    assert 'PYTHON_BIN="$VENV_DIR/bin/python"' in source
+    assert 'NAT_BIN="$VENV_DIR/bin/nat"' in source
+    assert '"$NAT_BIN" serve' in source
+    assert 'BACKEND_PID=""' in source
+    assert 'FRONTEND_PID=""' in source
+    assert "${BACKEND_PID:-}" in source
+    assert "${FRONTEND_PID:-}" in source

@@ -12,7 +12,7 @@ filesystem_policy:
     - /lib
     - /etc
     - /var/log
-    - /proc/self
+    - /proc
     - /dev/urandom
   read_write:
     - /sandbox

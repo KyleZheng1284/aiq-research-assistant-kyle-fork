@@ -159,7 +159,7 @@ class _FakeCreatedContext(_FakeOpenShellSandbox):
         )
         self._client = SimpleNamespace(
             get=MagicMock(return_value=self.sandbox),
-            health=MagicMock(return_value=SimpleNamespace(version="0.0.72")),
+            health=MagicMock(return_value=SimpleNamespace(version="0.0.80")),
             _stub=SimpleNamespace(
                 GetSandboxPolicyStatus=MagicMock(return_value=status),
                 GetSandboxConfig=MagicMock(return_value=config),
@@ -550,10 +550,10 @@ def test_attestation_failure_deletes_before_raising(
     assert provider._os_context is None
 
 
-def test_attestation_refreshes_ready_sandbox_until_policy_is_loaded(tmp_path: Path) -> None:
+def test_attestation_reads_authoritative_policy_before_success(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.yaml"
     _write_policy(policy_path)
-    context = _FakeCreatedContext(policy_version=0)
+    context = _FakeCreatedContext(policy_version=1)
     policy_status = context._client._stub.GetSandboxPolicyStatus  # type: ignore[attr-defined]
     sandbox_config = context._client._stub.GetSandboxConfig  # type: ignore[attr-defined]
     events: list[dict[str, object]] = []
@@ -591,7 +591,7 @@ def test_attestation_refreshes_ready_sandbox_until_policy_is_loaded(tmp_path: Pa
 
 
 def test_attestation_polls_pending_revision_until_loaded() -> None:
-    context = _FakeCreatedContext(policy_version=0)
+    context = _FakeCreatedContext(policy_version=1)
     status_rpc = context._client._stub.GetSandboxPolicyStatus  # type: ignore[attr-defined]
     loaded = status_rpc.return_value
     pending = SimpleNamespace(
@@ -605,6 +605,26 @@ def test_attestation_polls_pending_revision_until_loaded() -> None:
     assert result.policy_version == 1
     assert status_rpc.call_count == 2
     assert context._client._stub.GetSandboxConfig.call_count == 2  # type: ignore[attr-defined]
+
+
+def test_attestation_accepts_zero_initial_version_after_authoritative_transition() -> None:
+    context = _FakeCreatedContext(policy_version=0)
+    refreshed = SimpleNamespace(**vars(context.sandbox))
+    refreshed.current_policy_version = 1
+    context._client.get.return_value = refreshed  # type: ignore[attr-defined]
+    status_rpc = context._client._stub.GetSandboxPolicyStatus  # type: ignore[attr-defined]
+    loaded = status_rpc.return_value
+    pending = SimpleNamespace(
+        revision=SimpleNamespace(**{**vars(loaded.revision), "status": 1}),
+        active_version=0,
+    )
+    status_rpc.side_effect = [pending, loaded]
+
+    result = _run_attestation(context, policy_load_timeout_seconds=1.0)
+
+    assert result.policy_version == 1
+    assert status_rpc.call_count == 2
+    assert context._client.get.call_count == 2  # type: ignore[attr-defined]
 
 
 def test_attestation_classifies_effective_policy_that_remains_pending() -> None:
@@ -660,25 +680,22 @@ def test_attestation_rejects_version_disagreement(field: str) -> None:
         _run_attestation(context)
 
 
-def test_attestation_accepts_unreported_optional_versions() -> None:
+def test_attestation_rejects_unreported_current_and_active_versions() -> None:
     context = _FakeCreatedContext(policy_version=0)
     status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
     status.active_version = 0
 
-    result = _run_attestation(context)
-
-    assert result.policy_version == 1
-    context._client.health.assert_not_called()  # type: ignore[attr-defined]
+    with pytest.raises(RuntimeError, match="version_mismatch"):
+        _run_attestation(context)
 
 
-def test_attestation_accepts_unreported_active_version_with_matching_current_version() -> None:
+def test_attestation_rejects_unreported_active_version_with_matching_current_version() -> None:
     context = _FakeCreatedContext(policy_version=1)
     status = context._client._stub.GetSandboxPolicyStatus.return_value  # type: ignore[attr-defined]
     status.active_version = 0
 
-    result = _run_attestation(context)
-
-    assert result.policy_version == 1
+    with pytest.raises(RuntimeError, match="version_mismatch"):
+        _run_attestation(context)
 
 
 @pytest.mark.parametrize(
@@ -1311,3 +1328,13 @@ def test_retry_cleanup_failure_remains_terminal_failure() -> None:
     replacement.close.assert_called_once_with()
     assert provider.cleanup_succeeded is False
     assert [event["data"]["status"] for event in events] == ["started", "failed"]  # type: ignore[index]
+
+
+def test_sample_policy_grants_broad_proc_not_proc_self() -> None:
+    """OpenShell requires read access to /proc (not just /proc/self); guard against regression."""
+    import yaml
+
+    policy = yaml.safe_load(Path("configs/openshell/aiq-research-policy.yaml").read_text(encoding="utf-8"))
+    read_only = policy["filesystem_policy"]["read_only"]
+    assert "/proc" in read_only
+    assert "/proc/self" not in read_only

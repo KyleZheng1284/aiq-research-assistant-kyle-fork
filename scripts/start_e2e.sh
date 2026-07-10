@@ -19,11 +19,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 UI_DIR="$PROJECT_ROOT/frontends/ui"
+VENV_DIR="$PROJECT_ROOT/.venv"
+PYTHON_BIN="$VENV_DIR/bin/python"
+NAT_BIN="$VENV_DIR/bin/nat"
 
 # Default config file
 CONFIG_FILE="configs/config_web_default_llamaindex.yml"
 PORT=8000
 START_OPENSHELL_GATEWAY=false
+BACKEND_PID=""
+FRONTEND_PID=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -73,11 +78,11 @@ fi
 cleanup() {
     echo ""
     echo "Shutting down services..."
-    if [ ! -z "$BACKEND_PID" ]; then
-        kill $BACKEND_PID 2>/dev/null || true
+    if [[ -n "${BACKEND_PID:-}" ]]; then
+        kill "$BACKEND_PID" 2>/dev/null || true
     fi
-    if [ ! -z "$FRONTEND_PID" ]; then
-        kill $FRONTEND_PID 2>/dev/null || true
+    if [[ -n "${FRONTEND_PID:-}" ]]; then
+        kill "$FRONTEND_PID" 2>/dev/null || true
     fi
     exit 0
 }
@@ -114,12 +119,23 @@ check_env() {
 check_dependencies() {
     echo "Checking Python dependencies..."
 
-    if ! python -c "import nat" 2>/dev/null; then
-        echo "NAT not installed. Installing dependencies..."
-        pip install -e .
+    if [ ! -x "$PYTHON_BIN" ]; then
+        echo "AI-Q virtual environment not found at $VENV_DIR"
+        echo "Run ./scripts/setup.sh or ./scripts/setup_openshell.sh first."
+        exit 1
     fi
 
-    echo "Python dependencies installed"
+    if ! "$PYTHON_BIN" -c "import nat" 2>/dev/null; then
+        echo "NAT not installed. Installing dependencies..."
+        "$PYTHON_BIN" -m pip install -e .
+    fi
+    if [ ! -x "$NAT_BIN" ]; then
+        echo "NAT CLI not found at $NAT_BIN"
+        echo "Run ./scripts/setup.sh or ./scripts/setup_openshell.sh first."
+        exit 1
+    fi
+
+    echo "Python dependencies installed ($PYTHON_BIN)"
 }
 
 check_ui_dependencies() {
@@ -161,7 +177,7 @@ start_backend() {
     echo "Config: $CONFIG_FILE"
     echo ""
 
-    nat serve --config_file "$CONFIG_FILE" --host 0.0.0.0 --port "$PORT" &
+    "$NAT_BIN" serve --config_file "$CONFIG_FILE" --host 0.0.0.0 --port "$PORT" &
     BACKEND_PID=$!
     echo "Backend PID: $BACKEND_PID"
 }

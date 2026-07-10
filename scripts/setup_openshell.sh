@@ -22,11 +22,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 VENV_DIR="$REPO_ROOT/.venv"
 
-# Floor aligned with the published langchain-nvidia-openshell 0.1.0 adapter, which is
-# tested against OpenShell 0.0.72+. Anything below this is upgraded by the adapter during
-# its install, so do not pin under it.
-MIN_OPENSHELL_VERSION="0.0.72"
-DEFAULT_OPENSHELL_VERSION="0.0.72"
+# OpenShell 0.0.80 is the first released version with the policy-revision acknowledgement
+# and immutable request-label SDK support required by AI-Q's strict attestation and ownership
+# selectors. Keep the default and supported floor aligned until a newer release passes acceptance.
+MIN_OPENSHELL_VERSION="0.0.80"
+DEFAULT_OPENSHELL_VERSION="0.0.80"
 OPENSHELL_VERSION="${AIQ_OPENSHELL_VERSION:-}"
 OPENSHELL_VERSION_USER_SUPPLIED=false
 if [[ -n "$OPENSHELL_VERSION" ]]; then
@@ -48,6 +48,8 @@ POLICY_PRESET="${AIQ_OPENSHELL_POLICY:-}"
 POLICY_ALLOWLIST="${AIQ_OPENSHELL_POLICY_ALLOWLIST:-${AIQ_OPENSHELL_POLICY_SERVICES:-}}"
 POLICY_FILE="${AIQ_OPENSHELL_POLICY_FILE:-$REPO_ROOT/configs/openshell/generated/aiq-openshell-policy.yaml}"
 LANDLOCK_COMPATIBILITY="${AIQ_OPENSHELL_LANDLOCK_COMPATIBILITY:-hard_requirement}"
+LANDLOCK_COMPATIBILITY_CLI=false
+LOCAL_DEMO=false
 DOCKER_BIN="${DOCKER_BIN:-}"
 OPENSHELL_BIN="${OPENSHELL_BIN:-}"
 BUILD_IMAGE=true
@@ -76,8 +78,8 @@ Canonical operator guide: docs/source/deployment/openshell.md
 
 Options:
   --openshell-version VERSION   Exact OpenShell version, or "latest".
-                                Default: asks in an interactive shell; Enter selects 0.0.72.
-                                Non-interactive default: 0.0.72.
+                                Default: asks in an interactive shell; Enter selects 0.0.80.
+                                Non-interactive default: 0.0.80.
   --policy CHOICE               Sandbox network policy.
                                 Choices: $SUPPORTED_POLICIES
                                 Default: asks in an interactive shell, offline otherwise.
@@ -86,6 +88,8 @@ Options:
   --policy-file PATH            Output policy file.
                                 Default: configs/openshell/generated/aiq-openshell-policy.yaml
   --landlock-compatibility MODE hard_requirement (default) or best_effort (local demo only).
+  --local-demo                 Shortcut for best_effort policy generation. Runtime commands
+                               must set AIQ_OPENSHELL_REQUIRE_HARD_LANDLOCK=false.
   --image-name NAME             Docker image tag (default: aiq-openshell-demo:latest).
   --sandbox-log-level LEVEL     In-container OpenShell log verbosity baked into the
                                 image via RUST_LOG (default: warn). Use "debug" to
@@ -96,14 +100,15 @@ Options:
   --skip-build                  Do not build the sandbox image.
   --list-policies               Print supported policy choices.
   --list-services               Print supported services for --allow.
-  --list-openshell-versions     Print released OpenShell versions >= 0.0.72.
+  --list-openshell-versions     Print released OpenShell versions >= 0.0.80.
   -h, --help                    Show this help.
 
 Examples:
   scripts/setup_openshell.sh
   scripts/setup_openshell.sh --policy python-packages
   scripts/setup_openshell.sh --policy custom --allow github,pypi,nvidia,tavily
-  scripts/setup_openshell.sh --openshell-version latest --policy offline
+  scripts/setup_openshell.sh --openshell-version 0.0.80 --policy offline
+  scripts/setup_openshell.sh --local-demo --policy offline
 EOF
 }
 
@@ -142,7 +147,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --landlock-compatibility)
             LANDLOCK_COMPATIBILITY="$2"
+            LANDLOCK_COMPATIBILITY_CLI=true
             shift 2
+            ;;
+        --local-demo)
+            LOCAL_DEMO=true
+            shift
             ;;
         --image-name)
             IMAGE_NAME="$2"
@@ -189,6 +199,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$LOCAL_DEMO" == "true" ]]; then
+    if [[ "$LANDLOCK_COMPATIBILITY_CLI" == "true" && "$LANDLOCK_COMPATIBILITY" != "best_effort" ]]; then
+        fail "--local-demo conflicts with --landlock-compatibility $LANDLOCK_COMPATIBILITY"
+    fi
+    LANDLOCK_COMPATIBILITY="best_effort"
+fi
 
 detect_os() {
     case "$(uname -s)" in
@@ -454,6 +471,13 @@ resolve_openshell_cli() {
 
 resolve_docker() {
     log "Resolving Docker CLI"
+    # Docker Desktop stores both the CLI and credential helper here. Prepend the
+    # directory before resolving `docker` so public-image pulls do not follow a
+    # stale /usr/local symlink and then fail to locate docker-credential-desktop.
+    local docker_desktop_bin="/Applications/Docker.app/Contents/Resources/bin"
+    if [[ "$OS_NAME" == "macos" && -x "$docker_desktop_bin/docker" ]]; then
+        export PATH="$docker_desktop_bin:$PATH"
+    fi
     local candidates=(
         "$DOCKER_BIN"
         "$(command -v docker || true)"
@@ -857,26 +881,49 @@ build_image() {
 }
 
 print_next_steps() {
+    local runtime_config="configs/config_openshell.yml"
+    local runtime_env=""
+    local landlock_note="Production defaults require hard Landlock; no runtime override is needed."
+    if [[ "$LANDLOCK_COMPATIBILITY" == "best_effort" ]]; then
+        runtime_env="AIQ_OPENSHELL_REQUIRE_HARD_LANDLOCK=false "
+        landlock_note="This is a local best_effort policy. Prefix validation, CLI, and E2E commands with
+AIQ_OPENSHELL_REQUIRE_HARD_LANDLOCK=false."
+    fi
     cat <<EOF
 
 OpenShell dependencies, policy, and image are provisioned for AI-Q.
 
-Use these exports in shells where you run AI-Q:
+The default local gateway, image, policy path, and expected version are already
+wired into the launcher, config, and live suite. These are optional overrides
+for custom shells or remote gateways:
 
+  export AIQ_OPENSHELL_GATEWAY_NAME="openshell"
   export AIQ_OPENSHELL_IMAGE="$IMAGE_NAME"
   export AIQ_OPENSHELL_POLICY_FILE="$POLICY_FILE"
+  export AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION="$OPENSHELL_VERSION"
+
+$landlock_note
+
+Validate the AI-Q config:
+
+  ${runtime_env}.venv/bin/nat validate --config_file $runtime_config
 
 Start or verify an authenticated gateway and run its strict capability probe:
 
+  source .venv/bin/activate
   ./scripts/start_openshell_gateway.sh
 
 Start CLI mode after the gateway probe succeeds:
 
-  ./scripts/start_cli.sh --config_file configs/config_openshell.yml --verbose
+  ${runtime_env}./scripts/start_cli.sh --config_file $runtime_config --verbose
 
-Start E2E mode:
+Start E2E mode after the gateway probe succeeds:
 
-  ./scripts/start_e2e.sh --start-openshell-gateway --config_file configs/config_openshell.yml
+  ${runtime_env}./scripts/start_e2e.sh --config_file $runtime_config
+
+Or combine the gateway probe with E2E startup:
+
+  ${runtime_env}./scripts/start_e2e.sh --start-openshell-gateway --config_file $runtime_config
 
 EOF
 }

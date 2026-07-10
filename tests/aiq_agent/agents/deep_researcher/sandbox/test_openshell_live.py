@@ -319,10 +319,8 @@ def _assert_authoritative_policy(runtime: LiveRuntime, client: Any, name: str) -
     assert not revision.load_error
     assert revision.version > 0
     assert config.version == revision.version
-    if status.active_version:
-        assert status.active_version == revision.version
-    if sandbox.current_policy_version:
-        assert sandbox.current_policy_version == revision.version
+    assert status.active_version == revision.version
+    assert sandbox.current_policy_version == revision.version
     assert config.policy_source == runtime.sandbox_pb2.POLICY_SOURCE_SANDBOX
     assert config.policy == runtime.expected_policy
     assert revision.policy == runtime.expected_policy

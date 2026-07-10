@@ -253,6 +253,25 @@ def test_probe_rejects_version_mismatch_before_creation(checker: ModuleType, tmp
     assert client.delete_calls == 0
 
 
+@pytest.mark.parametrize("field", ["active_version", "current_policy_version"])
+def test_probe_rejects_unreported_policy_versions(checker: ModuleType, tmp_path: Path, field: str) -> None:
+    client = _Client()
+    if field == "active_version":
+        client._stub.status.active_version = 0
+    else:
+        client.sandbox.current_policy_version = 0
+    with (
+        _provider_helpers(client),
+        _fake_runtime(client),
+        patch.object(checker.importlib.metadata, "version", return_value="1.2.3"),
+        patch.object(checker, "_version_from_cli", return_value="1.2.3"),
+        pytest.raises(checker.ReadinessError, match="version_mismatch"),
+    ):
+        checker.run_check(_config(checker, tmp_path))
+
+    assert client.delete_calls == 1
+
+
 def test_probe_accepts_equivalent_python_and_cargo_development_versions(
     checker: ModuleType,
     tmp_path: Path,
