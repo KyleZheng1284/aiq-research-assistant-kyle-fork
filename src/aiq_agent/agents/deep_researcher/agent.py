@@ -156,12 +156,15 @@ class DeepResearcherAgent:
             self.middleware = self.researcher_middleware
         except Exception:
             try:
-                self.deepagents_runtime.finalize(interrupted=False)
+                cleanup_succeeded = self.deepagents_runtime.finalize(interrupted=False)
             except Exception as cleanup_error:  # noqa: BLE001 - preserve the original construction failure
                 logger.warning(
                     "Deep research runtime cleanup failed during agent construction (%s)",
                     type(cleanup_error).__name__,
                 )
+            else:
+                if not cleanup_succeeded:
+                    logger.warning("Deep research runtime cleanup reported failure during agent construction")
             raise
 
     def finalize(self, *, interrupted: bool) -> bool:
