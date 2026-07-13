@@ -16,6 +16,6 @@ SPDX-License-Identifier: Apache-2.0
 - **[Tools and Sources](./tools-and-sources.md)** — Enable, disable, and configure search tools
 - **[MCP Tools](./mcp-tools.md)** — Add external tools through Model Context Protocol
 - **[Guardrails](./guardrails.md)** — Configure NeMo Guardrails at workflow and agent boundaries
-- **[Knowledge Layer](./knowledge-layer.md)** — Add document retrieval (LlamaIndex or Foundational RAG)
+- **[Knowledge Layer](./knowledge-layer.md)** — Add document retrieval with LlamaIndex, Foundational RAG, or OpenSearch
 - **[Prompts](./prompts.md)** — Modify agent behavior through Jinja2 prompt templates
 - **[Human-in-the-Loop](./hitl.md)** — Configure the clarifier

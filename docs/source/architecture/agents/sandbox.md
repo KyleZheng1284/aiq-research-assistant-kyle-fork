@@ -15,8 +15,9 @@ version disagreement fails closed.
 
 The sandbox is an internal execution detail. There are no sandbox-specific API
 endpoints, and job-level auth remains responsible for submit, stream, status,
-cancel, state, and report access. The one user-visible surface is the artifact
-runtime (`.../job/{job_id}/artifacts`), which is also auth-scoped to the job.
+cancel, state, and report access. User-visible artifact surfaces are the Files tab
+and the artifact runtime (`.../job/{job_id}/artifacts`), which follows the same job
+access policy and is owner-scoped when `REQUIRE_AUTH=true`.
 
 > **Developer reference:** the full architecture, provider contract, config schema,
 > artifact pipeline, and troubleshooting live next to the code in
@@ -48,7 +49,11 @@ also be stored in SQL, but object storage such as AWS S3 or MinIO is recommended
 production deployments. The selected artifact storage provider determines where the file
 content is stored.
 
-For configuration variables and examples, see [Docker Compose](../../deployment/docker-compose.md#artifact-storage)
+Each captured file emits a metadata-only `artifact.update` event. Stored events populate
+the Files tab during both live execution and replay; file bytes remain behind the
+job-scoped artifact content endpoint. Rejected candidates emit `artifact.warning`.
+
+For configuration variables and examples, refer to [Docker Compose](../../deployment/docker-compose.md#artifact-storage)
 and [Production Considerations](../../deployment/production.md#artifact-storage).
 
 ## Operational Notes
@@ -75,6 +80,6 @@ The following safeguards are in place:
 - Idempotency-gated retry-on-stale-container handling.
 - Artifact capture for generated charts/binaries (validate -> store -> serve/embed),
   with MIME-from-bytes spoof rejection, SVG sanitization, and an inline-render allowlist.
-- Sandbox quota and concurrency controls, and artifact retention via job-expiry cleanup.
+- Sandbox quota and concurrency controls, and periodic time-based artifact retention cleanup.
 - Structured lifecycle logging for sandbox create, reuse, failure, and cleanup.
 - Structured `sandbox.attestation` and `sandbox.cleanup` events.

@@ -30,7 +30,9 @@ For the full NAT MCP reference:
 
 - [NAT MCP client guide](https://docs.nvidia.com/nemo/agent-toolkit/latest/build-workflows/mcp-client.html)
 - [NAT MCP service-account auth guide](https://docs.nvidia.com/nemo/agent-toolkit/latest/components/auth/mcp-auth/mcp-service-account-auth.html)
-- [NAT MCP server guide](https://docs.nvidia.com/nemo/agent-toolkit/latest/run-workflows/mcp-server.html)
+
+This page documents AIQ as an MCP client/data-source consumer. The AIQ reference API does not expose the research
+workflow as a public MCP server.
 
 ## Choose an Integration Pattern
 
@@ -212,7 +214,8 @@ AIQ exposes:
 - Async job token propagation — AIQ captures the request token at submit time and makes it
   available in Dask workers through the same `get_auth_token()` helper. The token is **not**
   refreshed inside the worker, so jobs that outlive the access token's TTL will fail mid-execution
-  on auth-required tool calls; in-worker refresh is on the AIQ 2.2 roadmap.
+  on auth-required tool calls. There is currently no in-worker refresh guarantee; configure an adequate token TTL or
+  reconnect and resubmit the job after expiry.
 
 Example custom tool that forwards the AIQ user's token to an internal search service:
 
@@ -278,7 +281,7 @@ This is the supported AIQ-user-identity MCP pattern. The two alternatives —
 protocol-level pass-through via a custom NAT auth provider, and an auth-forwarding MCP proxy — are
 viable in NAT but are not first-class in AIQ; treat them as deployment-side extensions.
 
-For the broader auth context (UI sign-in flow, validator registration, headless API callers), see
+For the broader auth context (UI sign-in flow, validator registration, headless API callers), refer to
 [Authentication](../deployment/authentication.md).
 
 ## Per-User MCP OAuth
@@ -299,9 +302,9 @@ Set these values before starting AIQ:
 - `MCP_TOKEN_STORE_TYPE`: `aiq_sqlite` for a single-host example or `redis` for multi-process and
   multi-host deployments.
 
-The UI reads connection status from `/v1/data_sources` and presents Connect, Reconnect, and
-Disconnect actions for the protected source. AIQ owns the OAuth callback and stores the resulting
-token under the current AIQ user identity. Submitting a job with a disconnected protected source
+The UI reads connection status from `/v1/data_sources` and presents Connect or Reconnect for the protected source. AI-Q
+owns the connect flow and OAuth callback and stores the resulting token under the current AIQ user identity. Disconnect
+is not currently exposed by the reference API or UI. Submitting a job with a disconnected protected source
 fails with `409 mcp_auth_required`; AIQ does not silently run the job without that source.
 
 Both interactive WebSocket sessions and REST-submitted async jobs resolve the user's MCP tools.
@@ -324,7 +327,7 @@ For a released chart, provide an external Redis service as described in the
 [Helm deployment guide](https://github.com/NVIDIA-AI-Blueprints/aiq/blob/develop/deploy/helm/README.md#per-user-mcp-authentication-with-external-redis).
 The default Compose and Helm deployments remain Redis-free when this example is not selected.
 
-See the
+Refer to the
 [NAT MCP authentication guide](https://docs.nvidia.com/nemo/agent-toolkit/latest/components/auth/mcp-auth/index.html)
 for protocol details.
 
@@ -375,10 +378,11 @@ the frontend auth provider is configured and that requests include an `idToken` 
 ### Async Deep Research Loses User Auth Mid-Job
 
 Use `get_auth_token()` inside custom AIQ tools rather than reading request headers directly — AIQ
-captures the request token at job submit and restores it in the async worker context (see
+captures the request token at job submit and restores it in the async worker context (refer to
 [Authentication → Use the current user token in tools](../deployment/authentication.md#step-5-use-the-current-user-token-in-tools)).
 Note that the access token is **not** refreshed inside the worker, so jobs that outlive the
-token's TTL will fail mid-execution; in-worker refresh is on the AIQ 2.2 roadmap.
+token's TTL will fail mid-execution. There is currently no in-worker refresh guarantee; reconnect and resubmit after
+expiry, or configure token lifetimes appropriate for the longest expected job.
 
 ## Related Documentation
 

@@ -15,7 +15,7 @@ A pluggable abstraction for document ingestion and retrieval. Swap backends with
 - **Collection Management** - create/delete/list collections per session or use case
 - **File Management** - upload/delete/list files with status tracking (UPLOADING -> INGESTING -> SUCCESS/FAILED)
 - **Content Typing** - TEXT, TABLE, CHART, IMAGE enums for frontend rendering
-- **Backend Agnostic** - Swap between local (LlamaIndex) and hosted (RAG Blueprint) without core agent code changes
+- **Backend Agnostic** - Swap among local LlamaIndex, hosted RAG Blueprint, and OpenSearch without core agent code changes
 
 ---
 
@@ -43,15 +43,20 @@ A pluggable abstraction for document ingestion and retrieval. Swap backends with
 |---------|-------------|------|--------------|----------|
 | `llamaindex` | `"llamaindex"` | Local Library | ChromaDB | Dev, prototyping, macOS/Linux |
 | `foundational_rag` | `"foundational_rag"` | Hosted Service | Remote Milvus | Production, multi-user |
+| `opensearch` | `"opensearch"` | External Service | OpenSearch k-NN index | Self-hosted OpenSearch, Amazon OpenSearch Service, or Serverless |
 
 **Local Library Mode** - Everything runs in your Python process. No external services needed.
 - **`llamaindex`** - LlamaIndex + ChromaDB. Lightweight, great for development. Works on macOS and Linux.
 
-**Hosted Service Mode** - Connects to deployed services through HTTP. Requires infrastructure but scales better.
+**External Service Modes** - Connect to deployed services. They require infrastructure but support shared, durable stores.
 - **`foundational_rag`** - Connects to [NVIDIA RAG Blueprint](https://github.com/NVIDIA-AI-Blueprints/rag) through HTTP.
   - Tested with: **NVIDIA RAG Blueprint `v2.4.0`** (Helm chart `nvidia-blueprint-rag`)
   - [Deployment Guide](https://github.com/NVIDIA-AI-Blueprints/rag/blob/main/docs/deploy-docker-self-hosted.md)
   - Backend-specific documentation: `sources/knowledge_layer/src/foundational_rag/README.md`
+- **`opensearch`** - Uses one vector index per AI-Q collection with `none`, `basic`, or SigV4 authentication.
+  - Supports self-hosted OpenSearch, Amazon OpenSearch Service (`es`), and Amazon OpenSearch Serverless (`aoss`).
+  - Can ingest in the local process or dispatch ingestion to Dask workers.
+  - Refer to [Amazon OpenSearch Serverless](../deployment/aws-opensearch-serverless.md) for the AOSS/EKS deployment path.
 
 ---
 
@@ -70,6 +75,7 @@ export NVIDIA_API_KEY=nvapi-your-key-here
 # 2. Install backend (choose one)
 uv pip install -e "sources/knowledge_layer[llamaindex]"        # Recommended for local dev - works on macOS/Linux
 uv pip install -e "sources/knowledge_layer[foundational_rag]"  # Requires deployed server
+uv pip install -e "sources/knowledge_layer[opensearch]"        # Requires an OpenSearch endpoint
 ```
 
 > **New to Knowledge Layer?** Start with `llamaindex` - it requires no external services and works on macOS and Linux.
@@ -109,6 +115,12 @@ functions:
     ingest_url: http://localhost:8082/v1      # foundational_rag only
     timeout: 120                              # foundational_rag only
     # verify_ssl: true                        # foundational_rag only (set false for self-signed certs)
+
+    # opensearch_url: http://localhost:9200   # opensearch only
+    # opensearch_auth_type: none              # none, basic, or sigv4
+    # opensearch_index_prefix: aiq
+    # opensearch_ingestion_mode: local        # local, dask, or auto
+    # embed_model: nvidia/llama-nemotron-embed-vl-1b-v2
 ```
 
 You can also use environment variable substitution in YAML for sensitive values:
@@ -152,6 +164,44 @@ functions:
     timeout: 120
 ```
 
+**OpenSearch (Self-Hosted or AWS)**
+
+```yaml
+functions:
+  knowledge_search:
+    _type: knowledge_retrieval
+    backend: opensearch
+    collection_name: my_docs
+    top_k: 5
+    opensearch_url: ${OPENSEARCH_URL:-http://localhost:9200}
+    opensearch_auth_type: ${OPENSEARCH_AUTH_TYPE:-none}
+    opensearch_aws_region: ${AWS_REGION:-us-east-1}
+    opensearch_aws_service: ${OPENSEARCH_AWS_SERVICE:-aoss}
+    opensearch_index_prefix: ${OPENSEARCH_INDEX_PREFIX:-aiq}
+    opensearch_embedding_dim: ${OPENSEARCH_EMBEDDING_DIM:-2048}
+    opensearch_ingestion_mode: ${OPENSEARCH_INGESTION_MODE:-auto}
+    opensearch_dask_scheduler_address: ${NAT_DASK_SCHEDULER_ADDRESS:-}
+    embed_model: ${AIQ_EMBED_MODEL:-nvidia/llama-nemotron-embed-vl-1b-v2}
+    embed_base_url: ${AIQ_EMBED_BASE_URL:-https://integrate.api.nvidia.com/v1}
+```
+
+Use `opensearch_auth_type: none` only with a protected local development endpoint. Configure `basic` or `sigv4`
+authentication for every remote, shared, or production OpenSearch deployment. For basic authentication, set
+`OPENSEARCH_USERNAME` and `OPENSEARCH_PASSWORD`. For AWS, use `sigv4` and set `opensearch_aws_service` to `es` or
+`aoss`.
+
+The embedding model's output dimension must match `opensearch_embedding_dim` (environment variable
+`OPENSEARCH_EMBEDDING_DIM`, default `2048`) before the collection index is created. For example, if a test embedding
+response contains 2,048 values, keep the default; if it contains 1,024 values, set
+`opensearch_embedding_dim: 1024` or `OPENSEARCH_EMBEDDING_DIM=1024` before creating the collection. Use a new
+collection/index after changing dimensions because an existing `knn_vector` mapping cannot change its dimension.
+The full shipped profile is
+[`configs/config_web_opensearch.yml`](../../../configs/config_web_opensearch.yml).
+
+OpenSearch ingestion is text-only: it extracts text from PDF, DOCX, PPTX, and supported plain-text formats, but does not
+perform LlamaIndex table/image/chart extraction. Distributed Dask ingestion also disables document-summary generation
+because the configured summary LLM is not serialized to workers; use local ingestion when summaries are required.
+
 #### Multimodal Extraction (LlamaIndex Only)
 
 By default, LlamaIndex ingests text only and uses the NVIDIA hosted embedding models. When `AIQ_EXTRACT_IMAGES` or `AIQ_EXTRACT_CHARTS` is enabled, a Vision Language Model (VLM) is used during ingestion to caption embedded images and extract structured data from charts (axis labels, data points, chart type). This makes visual content in PDFs searchable and retrievable alongside text. The VLM is only invoked at ingestion time, not at query time.
@@ -163,6 +213,7 @@ All options below can be overridden via environment variables:
 | **Embedding** | | |
 | `AIQ_EMBED_MODEL` | `nvidia/llama-nemotron-embed-vl-1b-v2` | NVIDIA embedding model |
 | `AIQ_EMBED_BASE_URL` | `https://integrate.api.nvidia.com/v1` | Embedding API base URL — override for local NIM |
+| `OPENSEARCH_EMBEDDING_DIM` | `2048` | OpenSearch vector dimension; must equal the selected embedding model's output length before index creation |
 | **Extraction Flags** | | |
 | `AIQ_EXTRACT_TABLES` | `false` | Extract tables from PDFs as markdown |
 | `AIQ_EXTRACT_IMAGES` | `false` | Extract and caption images with VLM |
@@ -177,7 +228,7 @@ When enabled, the startup log shows the active mode:
 LlamaIndexIngestor initialized: persist_dir=/app/data/chroma_data, mode=text + tables + images
 ```
 
-> **Note:** `AIQ_EXTRACT_IMAGES` and `AIQ_EXTRACT_CHARTS` work together. If both are enabled, each image is classified by the VLM as either a chart or a regular image. Foundational RAG handles multimodal extraction server-side, so these flags only apply to the LlamaIndex backend.
+> **Note:** `AIQ_EXTRACT_IMAGES` and `AIQ_EXTRACT_CHARTS` work together. If both are enabled, each image is classified by the VLM as either a chart or a regular image. Foundational RAG handles multimodal extraction server-side. OpenSearch performs text extraction only, so these flags apply only to the LlamaIndex backend.
 
 #### Document Summaries
 
@@ -212,10 +263,11 @@ File type support depends on the configured backend:
 |---------|----------------|
 | **LlamaIndex** | PDF, DOCX, TXT, MD, HTML, JSON, CSV |
 | **Foundational RAG** | PDF, DOCX, PPTX, TXT, MD, HTML, images (PNG, JPG) |
+| **OpenSearch** | PDF, DOCX, PPTX, TXT, MD, CSV, JSON, YAML, YML, LOG |
 
 For custom backends, supported types are determined by the backend implementation.
 
-> **Note:** The backends support more types than the frontend currently allows. The frontend only supports uploading `.pdf,.docx,.txt,.md` (the common subset across both backends). Types like HTML, JSON, CSV, and images are supported by the backends but the frontend upload flow does not handle them yet -- this is a separate task.
+> **Note:** The backends support more types than the frontend currently allows. The frontend only supports uploading `.pdf,.docx,.txt,.md` (the common subset across the shipped backends). Types such as PPTX, HTML, JSON, CSV, YAML, logs, and images depend on the backend and are not accepted by the default frontend upload flow.
 
 To change the accepted types in the frontend, set `FILE_UPLOAD_ACCEPTED_TYPES` for your deployment method:
 
@@ -292,7 +344,7 @@ Open `http://localhost:3000` in your browser.
 
 ### Session Collections
 
-Both LlamaIndex and Foundational RAG support session-based collections (`s_<uuid>`) created by the UI. Each browser session gets its own isolated collection.
+LlamaIndex, Foundational RAG, and OpenSearch support session-based collections (`s_<uuid>`) created by the UI. Each browser session gets its own logical collection; OpenSearch stores each one in a separate prefixed index.
 
 ### TTL Cleanup
 
@@ -398,6 +450,14 @@ Configuration values are resolved in the following order (highest to lowest prio
 | `AIQ_CHROMA_DIR` | llamaindex | ChromaDB persistence path |
 | `RAG_SERVER_URL` | foundational_rag | Query server URL (port 8081) |
 | `RAG_INGEST_URL` | foundational_rag | Ingestion server URL (port 8082) |
+| `OPENSEARCH_URL` | opensearch | OpenSearch endpoint URL |
+| `OPENSEARCH_AUTH_TYPE` | opensearch | `none`, `basic`, or `sigv4` |
+| `OPENSEARCH_USERNAME`, `OPENSEARCH_PASSWORD` | opensearch | Credentials for basic authentication |
+| `AWS_REGION`, `OPENSEARCH_AWS_SERVICE` | opensearch | SigV4 region and service (`es` or `aoss`) |
+| `OPENSEARCH_INDEX_PREFIX` | opensearch | Prefix for AI-Q-managed indexes |
+| `OPENSEARCH_INGESTION_MODE` | opensearch | `local`, `dask`, or `auto` |
+| `OPENSEARCH_DASK_SCHEDULER_ADDRESS` | opensearch | Optional Dask scheduler for distributed ingestion |
+| `AIQ_EMBED_MODEL`, `AIQ_EMBED_BASE_URL` | llamaindex, opensearch | Embedding model and endpoint |
 | `COLLECTION_NAME` | All | Default collection name |
 
 ---
@@ -411,6 +471,8 @@ Configuration values are resolved in the following order (highest to lowest prio
 | Empty retrieval results | Collection empty | Run ingestion first, verify collection name matches |
 | Job status 404 | Different process/instance | Factory uses singletons - ensure same process |
 | `milvus-lite` required | Missing dependency | `uv pip install "pymilvus[milvus_lite]"` |
+| `opensearchpy` import error | OpenSearch extra not installed | `uv pip install -e "sources/knowledge_layer[opensearch]"` |
+| OpenSearch `401` or `403` | Auth mode, credentials, IAM, or AOSS data-access policy mismatch | Verify `opensearch_auth_type`; for AOSS follow the IAM and data-access steps in the deployment guide |
 | Backend registered twice | Module imported multiple times | Normal - factory logs warning but works fine |
 
 ### Debug Registration
@@ -432,3 +494,4 @@ print("Full config:", get_knowledge_layer_config())
 |----------|-------------|
 | [SDK Reference](../reference/knowledge-layer-sdk.md) | Build custom backend adapters - data schemas, interfaces, full implementation example |
 | Foundational RAG Setup (`sources/knowledge_layer/src/foundational_rag/README.md`) | Production deployment with NVIDIA RAG Blueprint |
+| [Amazon OpenSearch Serverless](../deployment/aws-opensearch-serverless.md) | Deploy the OpenSearch backend on EKS with AOSS and SigV4 |
