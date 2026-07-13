@@ -1036,6 +1036,55 @@ class TestDeepResearcherAgent:
                         tools=[real_tool],
                     )
 
+    @pytest.mark.parametrize("failure_target", ["load_prompt", "build_tool_set"])
+    def test_constructor_failure_finalizes_runtime(self, mock_llm_provider, real_tool, failure_target):
+        """Post-runtime constructor failures release the request-owned runtime."""
+        from aiq_agent.agents.deep_researcher.agent import DeepResearcherAgent
+
+        expected_error = RuntimeError("construction failed")
+        runtime = MagicMock(artifact_manager=None)
+        load_prompt_error = expected_error if failure_target == "load_prompt" else None
+        build_tool_set_error = expected_error if failure_target == "build_tool_set" else None
+
+        with (
+            patch("aiq_agent.agents.deep_researcher.agent.DeepAgentsRuntime", return_value=runtime),
+            patch(
+                "aiq_agent.agents.deep_researcher.agent.load_prompt",
+                return_value="prompt",
+                side_effect=load_prompt_error,
+            ),
+            patch(
+                "aiq_agent.agents.deep_researcher.agent.build_deep_research_tool_set",
+                side_effect=build_tool_set_error,
+            ),
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                DeepResearcherAgent(llm_provider=mock_llm_provider, tools=[real_tool])
+
+        assert exc_info.value is expected_error
+        runtime.finalize.assert_called_once_with(interrupted=False)
+
+    def test_constructor_cleanup_failure_does_not_mask_original_error(self, mock_llm_provider, real_tool, caplog):
+        """Cleanup errors remain secondary to the constructor failure."""
+        from aiq_agent.agents.deep_researcher.agent import DeepResearcherAgent
+
+        expected_error = RuntimeError("construction failed")
+        runtime = MagicMock(artifact_manager=None)
+        cleanup_canary = "secret-cleanup-detail"
+        runtime.finalize.side_effect = RuntimeError(cleanup_canary)
+
+        with (
+            patch("aiq_agent.agents.deep_researcher.agent.DeepAgentsRuntime", return_value=runtime),
+            patch("aiq_agent.agents.deep_researcher.agent.load_prompt", side_effect=expected_error),
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                DeepResearcherAgent(llm_provider=mock_llm_provider, tools=[real_tool])
+
+        assert exc_info.value is expected_error
+        runtime.finalize.assert_called_once_with(interrupted=False)
+        assert cleanup_canary not in caplog.text
+        assert "RuntimeError" in caplog.text
+
     @pytest.mark.asyncio
     async def test_provider_roles_used_on_init(self, mock_llm_provider, real_tool, mock_create_deep_agent):
         """Test LLM roles (planner, researcher, orchestrator) are requested when run() is invoked."""
