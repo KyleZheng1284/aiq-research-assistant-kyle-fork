@@ -143,6 +143,7 @@ FAQ <./resources/faq.md>
 ./examples/minimal-shallow-only.md
 ./examples/full-pipeline-llamaindex.md
 ./examples/full-pipeline-web.md
+./examples/azure-ai-search.md
 ./examples/cli-with-local-nims.md
 ./examples/hybrid-frontier-model.md
 ./examples/skills-sandbox/index.md
