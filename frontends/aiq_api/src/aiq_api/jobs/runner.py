@@ -254,7 +254,7 @@ def _get_worker_function_type(config: Any) -> str | None:
     if config.workflow is None:
         return None
 
-    if config.workflow.use_async_deep_research:
+    if getattr(config.workflow, "use_async_deep_research", False):
         return _DEEP_RESEARCH_FUNCTION_TYPE
     return None
 
