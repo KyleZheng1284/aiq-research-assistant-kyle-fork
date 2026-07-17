@@ -272,7 +272,8 @@ functions:
 ### `knowledge_retrieval`
 
 Semantic search over ingested documents. Supports LlamaIndex (local ChromaDB), Foundational RAG
-(hosted NVIDIA RAG Blueprint), OpenSearch (self-hosted OpenSearch or Amazon OpenSearch Serverless), and Azure AI Search.
+(hosted NVIDIA RAG Blueprint), OpenSearch (self-hosted OpenSearch or Amazon OpenSearch Serverless), Azure AI Search,
+and an independently deployed NeMo Retriever service through its public REST API.
 
 ```yaml
 functions:
@@ -332,9 +333,25 @@ functions:
     embed_model: ${AIQ_EMBED_MODEL:-nvidia/llama-nemotron-embed-vl-1b-v2}
 ```
 
+```yaml
+functions:
+  # NeMo Retriever REST backend
+  knowledge_search:
+    _type: knowledge_retrieval
+    backend: nemo_retriever
+    collection_name: ${COLLECTION_NAME:-aiq-nrl}
+    top_k: 5
+    generate_summary: false
+    nrl_base_url: ${NRL_BASE_URL:-http://127.0.0.1:17670}
+    nrl_api_token: ${NRL_API_TOKEN:-}
+    nrl_scope: ${NRL_SCOPE}
+    nrl_verify_ssl: ${NRL_VERIFY_SSL:-true}
+    nrl_collection_ttl_hours: ${NRL_COLLECTION_TTL_HOURS:-24}
+```
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `backend` | `str` | `llamaindex` | Backend type: `llamaindex`, `opensearch`, `foundational_rag`, or `azure_ai_search`. |
+| `backend` | `str` | `llamaindex` | Backend type: `llamaindex`, `opensearch`, `foundational_rag`, `azure_ai_search`, or `nemo_retriever`. |
 | `collection_name` | `str` | `default` | Name of the document collection/index. |
 | `top_k` | `int` | `5` | Number of results to return per query. |
 | `generate_summary` | `bool` | `false` | Generate one-sentence summaries for ingested documents. |
@@ -364,6 +381,16 @@ functions:
 | `opensearch_dask_file_transfer` | `str` | `bytes` | Send uploads to Dask workers as `bytes` or shared filesystem `paths`. |
 | `embed_model` | `str` | `nvidia/llama-nemotron-embed-vl-1b-v2` | Embedding model for OpenSearch ingestion and retrieval. |
 | `embed_base_url` | `str` | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible embeddings endpoint. |
+| `nrl_base_url` | `str` | `http://127.0.0.1:17670` | Public NeMo Retriever gateway URL. |
+| `nrl_api_token` | `SecretStr` | `NRL_API_TOKEN` or `None` | Optional bearer token. |
+| `nrl_scope` | `str` | **required** | Workspace scope sent as `X-NRL-Scope` on every request. |
+| `nrl_connect_timeout_s` | `float` | `30` | Gateway connection timeout in seconds. |
+| `nrl_request_timeout_s` | `float` | `300` | Request timeout in seconds, including uploads. |
+| `nrl_max_retries` | `int` | `5` | Bounded retries for transport failures, 429, and retryable 5xx responses. |
+| `nrl_max_concurrency` | `int` | `8` | Maximum concurrent multipart document uploads. |
+| `nrl_verify_ssl` | `bool` | `true` | Verify the NRL gateway TLS certificate. |
+| `nrl_ca_bundle` | `str` | `None` | Optional enterprise CA bundle path. |
+| `nrl_collection_ttl_hours` | `float` | `24` | Expiration applied when AI-Q creates an NRL collection. |
 
 Refer to [Knowledge Layer](./knowledge-layer.md) for backend selection and the
 [Amazon OpenSearch Serverless](../deployment/aws-opensearch-serverless.md) guide for SigV4, IAM, and AOSS setup.

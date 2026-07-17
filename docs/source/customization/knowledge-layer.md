@@ -45,6 +45,7 @@ A pluggable abstraction for document ingestion and retrieval. Swap backends with
 | `foundational_rag` | `"foundational_rag"` | Hosted Service | Remote Milvus | Production, multi-user |
 | `azure_ai_search` | `"azure_ai_search"` | Managed Service | Azure AI Search | Managed hybrid retrieval |
 | `opensearch` | `"opensearch"` | External Service | OpenSearch k-NN index | Self-hosted OpenSearch, Amazon OpenSearch Service, or Serverless |
+| `nemo_retriever` | `"nemo_retriever"` | External Service | NRL-managed VectorDB | Enterprise multimodal ingestion and retrieval through REST |
 
 **Local Library Mode** - Everything runs in your Python process. No external services needed.
 - **`llamaindex`** - LlamaIndex + ChromaDB. Lightweight, great for development. Works on macOS and Linux.
@@ -60,6 +61,10 @@ A pluggable abstraction for document ingestion and retrieval. Swap backends with
   - Supports self-hosted OpenSearch, Amazon OpenSearch Service (`es`), and Amazon OpenSearch Serverless (`aoss`).
   - Can ingest in the local process or dispatch ingestion to Dask workers.
   - Refer to [Amazon OpenSearch Serverless](../deployment/aws-opensearch-serverless.md) for the AOSS/EKS deployment path.
+- **`nemo_retriever`** - Calls a separately deployed NeMo Retriever gateway through its public REST API.
+  - NRL owns extraction, OCR, tokenization, embedding, indexing, and collection durability.
+  - AI-Q owns logical inputs, job polling, retrieval, and universal-schema mapping only.
+  - See the [backend operator guide](../../../sources/knowledge_layer/src/nemo_retriever/README.md).
 
 ---
 
@@ -80,6 +85,7 @@ uv pip install -e "sources/knowledge_layer[llamaindex]"        # Recommended for
 uv pip install -e "sources/knowledge_layer[foundational_rag]"  # Requires deployed server
 uv pip install -e "sources/knowledge_layer[azure_ai_search]"   # Requires an Azure AI Search service
 uv pip install -e "sources/knowledge_layer[opensearch]"        # Requires an OpenSearch endpoint
+uv pip install -e "sources/knowledge_layer"                    # NeMo Retriever REST support is in base dependencies
 ```
 
 > **New to Knowledge Layer?** Start with `llamaindex` - it requires no external services and works on macOS and Linux.
@@ -125,6 +131,12 @@ functions:
     # opensearch_index_prefix: aiq
     # opensearch_ingestion_mode: local        # local, dask, or auto
     # embed_model: nvidia/llama-nemotron-embed-vl-1b-v2
+
+    # nrl_base_url: http://127.0.0.1:17670    # nemo_retriever only
+    # nrl_api_token: ${NRL_API_TOKEN:-}
+    # nrl_scope: ${NRL_SCOPE}                 # required
+    # nrl_verify_ssl: true
+    # nrl_collection_ttl_hours: 24
 ```
 
 You can also use environment variable substitution in YAML for sensitive values:
@@ -235,6 +247,41 @@ The full shipped profile is
 OpenSearch ingestion is text-only: it extracts text from PDF, DOCX, PPTX, and supported plain-text formats, but does not
 perform LlamaIndex table/image/chart extraction. Distributed Dask ingestion also disables document-summary generation
 because the configured summary LLM is not serialized to workers; use local ingestion when summaries are required.
+
+**NeMo Retriever (External REST Service)**
+
+```yaml
+functions:
+  knowledge_search:
+    _type: knowledge_retrieval
+    backend: nemo_retriever
+    collection_name: ${COLLECTION_NAME:-aiq-nrl}
+    top_k: 5
+    generate_summary: false
+    nrl_base_url: ${NRL_BASE_URL:-http://127.0.0.1:17670}
+    nrl_api_token: ${NRL_API_TOKEN:-}
+    nrl_scope: ${NRL_SCOPE}
+    nrl_verify_ssl: ${NRL_VERIFY_SSL:-true}
+    nrl_collection_ttl_hours: ${NRL_COLLECTION_TTL_HOURS:-24}
+```
+
+Use [`configs/config_web_nemo_retriever.yml`](../../../configs/config_web_nemo_retriever.yml)
+for the complete web workflow. The URL must identify the public NRL gateway,
+not a realtime, batch, or VectorDB pod. One deployment token and explicit
+workspace scope are sent on every scoped request. For a remote development
+deployment, forward the gateway port with SSH; for Kubernetes, use the gateway
+Service or an enterprise ingress and configure `NRL_CA_BUNDLE` when required.
+
+The adapter returns NRL's job ID after every multipart upload is accepted,
+then polls the NRL aggregate. Stable `document_id` values are AI-Q file IDs;
+per-attempt IDs remain diagnostic metadata. Query filters are rejected until
+the public NRL query contract supports them. AI-Q does not expose NRL pipeline
+tuning and does not consume physical VectorDB names or LanceDB locations.
+
+The tested baseline is NeMo Retriever commit `edfed55da` plus the TXT/HTML
+tokenizer landing patch, or a merged successor containing both changes. See
+the [backend operator guide](../../../sources/knowledge_layer/src/nemo_retriever/README.md)
+for local Docker, SSH tunnel, Kubernetes, live validation, and troubleshooting.
 
 #### Multimodal Extraction (LlamaIndex Only)
 
@@ -497,6 +544,12 @@ Configuration values are resolved in the following order (highest to lowest prio
 | `OPENSEARCH_INGESTION_MODE` | opensearch | `local`, `dask`, or `auto` |
 | `OPENSEARCH_DASK_SCHEDULER_ADDRESS` | opensearch | Optional Dask scheduler for distributed ingestion |
 | `AIQ_EMBED_MODEL`, `AIQ_EMBED_BASE_URL` | llamaindex, opensearch | Embedding model and endpoint |
+| `NRL_BASE_URL` | nemo_retriever | Public NeMo Retriever gateway URL |
+| `NRL_API_TOKEN`, `NRL_SCOPE` | nemo_retriever | Deployment bearer token and required workspace scope |
+| `NRL_CONNECT_TIMEOUT_S`, `NRL_REQUEST_TIMEOUT_S` | nemo_retriever | Connection and request timeout seconds |
+| `NRL_MAX_RETRIES`, `NRL_MAX_CONCURRENCY` | nemo_retriever | Transient retry and multipart upload bounds |
+| `NRL_VERIFY_SSL`, `NRL_CA_BUNDLE` | nemo_retriever | TLS verification and optional enterprise CA bundle |
+| `NRL_COLLECTION_TTL_HOURS` | nemo_retriever | Expiration applied to new NRL collections |
 | `COLLECTION_NAME` | All | Default collection name |
 
 ---
@@ -512,6 +565,10 @@ Configuration values are resolved in the following order (highest to lowest prio
 | `milvus-lite` required | Missing dependency | `uv pip install "pymilvus[milvus_lite]"` |
 | `opensearchpy` import error | OpenSearch extra not installed | `uv pip install -e "sources/knowledge_layer[opensearch]"` |
 | OpenSearch `401` or `403` | Auth mode, credentials, IAM, or AOSS data-access policy mismatch | Verify `opensearch_auth_type`; for AOSS follow the IAM and data-access steps in the deployment guide |
+| NRL connection or health failure | AI-Q cannot reach the public gateway | Verify `NRL_BASE_URL`, network policy, ingress, or the SSH tunnel |
+| NRL `401` or `403` | Missing/invalid token or unauthorized scope | Verify `NRL_API_TOKEN` and its authorization for `NRL_SCOPE` |
+| NRL job-route `404` or `410` | AI-Q and NRL use incompatible collection-management APIs | Upgrade the NRL chart/image to the validated API version |
+| NRL TXT/HTML failure | Service image lacks the tokenizer landing fix | Rebuild or deploy NRL with the tokenizer patch or a merged successor |
 | Backend registered twice | Module imported multiple times | Normal - factory logs warning but works fine |
 
 ### Debug Registration
@@ -534,3 +591,4 @@ print("Full config:", get_knowledge_layer_config())
 | [SDK Reference](../reference/knowledge-layer-sdk.md) | Build custom backend adapters - data schemas, interfaces, full implementation example |
 | Foundational RAG Setup (`sources/knowledge_layer/src/foundational_rag/README.md`) | Production deployment with NVIDIA RAG Blueprint |
 | [Amazon OpenSearch Serverless](../deployment/aws-opensearch-serverless.md) | Deploy the OpenSearch backend on EKS with AOSS and SigV4 |
+| [NeMo Retriever backend](../../../sources/knowledge_layer/src/nemo_retriever/README.md) | Deploy and validate NRL as an independent AI-Q knowledge service |
