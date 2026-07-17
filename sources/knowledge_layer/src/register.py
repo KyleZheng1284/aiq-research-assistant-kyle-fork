@@ -51,7 +51,7 @@ def _secret_from_env(name: str) -> SecretStr | None:
 
 
 # Type-safe backend selection - Pydantic validates at config load time
-BackendType = Literal["llamaindex", "foundational_rag", "opensearch", "azure_ai_search"]
+BackendType = Literal["llamaindex", "foundational_rag", "opensearch", "azure_ai_search", "nemo_retriever"]
 OpenSearchAuthType = Literal["none", "basic", "sigv4"]
 OpenSearchAwsService = Literal["aoss", "es"]
 OpenSearchIngestionMode = Literal["local", "dask", "auto"]
@@ -281,6 +281,52 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
         gt=0,
         description="Embedding dimensions; defaults to AIQ_EMBED_DIM and must match existing indexes",
     )
+    # NeMo Retriever service options
+    nrl_base_url: str = Field(
+        default_factory=lambda: _env_value("NRL_BASE_URL", default="http://127.0.0.1:17670"),
+        description="Public NeMo Retriever gateway URL (nemo_retriever only).",
+    )
+    nrl_api_token: OptionalSecretStr = Field(
+        default_factory=lambda: _secret_from_env("NRL_API_TOKEN"),
+        description="Optional NeMo Retriever bearer token; defaults to NRL_API_TOKEN.",
+    )
+    nrl_scope: str | None = Field(
+        default_factory=lambda: _env_value("NRL_SCOPE"),
+        description="Required NeMo Retriever workspace scope; defaults to NRL_SCOPE.",
+    )
+    nrl_connect_timeout_s: float = Field(
+        default_factory=lambda: _env_float("NRL_CONNECT_TIMEOUT_S", 30.0),
+        gt=0,
+        description="NeMo Retriever connection timeout in seconds.",
+    )
+    nrl_request_timeout_s: float = Field(
+        default_factory=lambda: _env_float("NRL_REQUEST_TIMEOUT_S", 300.0),
+        gt=0,
+        description="NeMo Retriever request timeout in seconds.",
+    )
+    nrl_max_retries: int = Field(
+        default_factory=lambda: _env_int("NRL_MAX_RETRIES", 5),
+        ge=0,
+        description="Maximum retries for transient NeMo Retriever failures.",
+    )
+    nrl_max_concurrency: int = Field(
+        default_factory=lambda: _env_int("NRL_MAX_CONCURRENCY", 8),
+        ge=1,
+        description="Maximum concurrent NeMo Retriever document uploads.",
+    )
+    nrl_verify_ssl: bool = Field(
+        default_factory=lambda: _env_bool("NRL_VERIFY_SSL", True),
+        description="Verify the NeMo Retriever gateway TLS certificate.",
+    )
+    nrl_ca_bundle: str | None = Field(
+        default_factory=lambda: _env_value("NRL_CA_BUNDLE"),
+        description="Optional CA bundle path for the NeMo Retriever gateway.",
+    )
+    nrl_collection_ttl_hours: float = Field(
+        default_factory=lambda: _env_float("NRL_COLLECTION_TTL_HOURS", 24.0),
+        gt=0,
+        description="Expiration applied when AIQ creates a NeMo Retriever collection.",
+    )
 
     @model_validator(mode="after")
     def validate_backend_config(self):
@@ -332,6 +378,13 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
         elif backend == "azure_ai_search":
             if self.azure_search_endpoint is None:
                 raise ValueError("azure_ai_search requires azure_search_endpoint")
+        elif backend == "nemo_retriever":
+            if not self.nrl_scope or not self.nrl_scope.strip():
+                raise ValueError("nemo_retriever requires an explicit nrl_scope")
+            if not self.nrl_verify_ssl:
+                logger.warning("TLS verification disabled for nemo_retriever. Use only in trusted environments.")
+            if self.nrl_ca_bundle and not self.nrl_verify_ssl:
+                raise ValueError("nrl_ca_bundle cannot be used when nrl_verify_ssl is false")
 
         return self
 
@@ -433,9 +486,27 @@ def _setup_backend(config: KnowledgeRetrievalConfig, summary_llm_obj=None) -> tu
             **summary_config,
         }
 
+    elif backend == "nemo_retriever":
+        import knowledge_layer.nemo_retriever.adapter  # noqa: F401
+
+        backend_config = {
+            "base_url": config.nrl_base_url,
+            "api_token": config.nrl_api_token,
+            "scope": config.nrl_scope,
+            "connect_timeout_s": config.nrl_connect_timeout_s,
+            "request_timeout_s": config.nrl_request_timeout_s,
+            "max_retries": config.nrl_max_retries,
+            "max_concurrency": config.nrl_max_concurrency,
+            "verify_ssl": config.nrl_verify_ssl,
+            "ca_bundle": config.nrl_ca_bundle,
+            "collection_ttl_hours": config.nrl_collection_ttl_hours,
+            **summary_config,
+        }
+
     else:
         raise ValueError(
-            f"Unknown backend: {backend}. Use 'llamaindex', 'foundational_rag', 'opensearch', or 'azure_ai_search'."
+            f"Unknown backend: {backend}. Use 'llamaindex', 'foundational_rag', 'opensearch', "
+            "'azure_ai_search', or 'nemo_retriever'."
         )
 
     os.environ["KNOWLEDGE_RETRIEVER_BACKEND"] = backend

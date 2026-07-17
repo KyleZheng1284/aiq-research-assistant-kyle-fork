@@ -1,0 +1,609 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import threading
+from datetime import UTC
+from datetime import datetime
+from typing import Any
+
+import httpx
+import pytest
+from knowledge_layer.nemo_retriever._transport import NemoRetrieverCompatibilityError
+from knowledge_layer.nemo_retriever._transport import NemoRetrieverHTTPError
+from knowledge_layer.nemo_retriever._transport import NemoRetrieverTransportError
+from knowledge_layer.nemo_retriever._transport import _NRLTransport
+from knowledge_layer.nemo_retriever.adapter import NemoRetrieverIngestor
+from knowledge_layer.nemo_retriever.adapter import NemoRetrieverRetriever
+from knowledge_layer.register import KnowledgeRetrievalConfig
+from knowledge_layer.register import _setup_backend
+from pydantic import SecretStr
+from pydantic import ValidationError
+
+from aiq_agent.knowledge import BaseIngestor
+from aiq_agent.knowledge import BaseRetriever
+from aiq_agent.knowledge import ContentType
+from aiq_agent.knowledge import JobState
+from aiq_agent.knowledge.factory import is_ingestor_registered
+from aiq_agent.knowledge.factory import is_retriever_registered
+from aiq_agent.knowledge.schema import FileStatus
+
+NOW = "2026-07-17T12:00:00+00:00"
+
+
+def _response(request: httpx.Request, status: int, payload: Any = None, **kwargs: Any) -> httpx.Response:
+    if payload is None:
+        return httpx.Response(status, request=request, **kwargs)
+    return httpx.Response(status, request=request, json=payload, **kwargs)
+
+
+class FakeNRL:
+    def __init__(self, *, paginate: bool = False):
+        self.paginate = paginate
+        self.requests: list[httpx.Request] = []
+        self.create_job_bodies: list[dict[str, Any]] = []
+        self.query_hits: list[dict[str, Any]] = []
+        self.manifest: list[dict[str, str]] = []
+        self.documents: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self.collections = [
+            {
+                "name": "first",
+                "scope": "workspace-123",
+                "status": "active",
+                "description": "one",
+                "metadata": {"owner": "aiq", "table_name": "physical-secret"},
+                "created_at": NOW,
+                "updated_at": NOW,
+                "expires_at": None,
+            },
+            {
+                "name": "second",
+                "scope": "workspace-123",
+                "status": "active",
+                "description": "two",
+                "metadata": {},
+                "created_at": NOW,
+                "updated_at": NOW,
+                "expires_at": None,
+            },
+        ]
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        with self._lock:
+            self.requests.append(request)
+        path = request.url.path
+        method = request.method
+
+        if path == "/v1/health":
+            return _response(request, 200, {"status": "ok", "mode": "standalone"})
+        if path == "/v1/query":
+            return _response(request, 200, {"results": [{"hits": self.query_hits}]})
+        if path == "/v1/collections" and method == "POST":
+            body = json.loads(request.content)
+            return _response(
+                request,
+                201,
+                {
+                    "name": body["name"],
+                    "scope": "workspace-123",
+                    "status": "active",
+                    "description": body.get("description"),
+                    "metadata": body.get("metadata", {}),
+                    "created_at": NOW,
+                    "updated_at": NOW,
+                    "expires_at": body.get("expires_at"),
+                },
+            )
+        if path == "/v1/collections" and method == "GET":
+            token = request.url.params.get("continuation_token")
+            if self.paginate and token is None:
+                return _response(request, 200, {"items": self.collections[:1], "next_token": "page-2"})
+            return _response(request, 200, {"items": self.collections[1:] if self.paginate else self.collections})
+        if path == "/v1/collections/test" and method == "GET":
+            return _response(request, 200, {**self.collections[0], "name": "test"})
+        if path == "/v1/collections/test" and method == "DELETE":
+            return _response(
+                request,
+                200,
+                {
+                    "name": "test",
+                    "scope": "workspace-123",
+                    "existed": True,
+                    "deleted": True,
+                    "status": "deleted",
+                    "cleanup_pending": False,
+                },
+            )
+        if path == "/v1/ingest/job" and method == "POST":
+            body = json.loads(request.content)
+            with self._lock:
+                self.create_job_bodies.append(body)
+                self.manifest = body["document_manifest"]
+            return _response(
+                request,
+                201 if len(self.create_job_bodies) == 1 else 200,
+                {
+                    "job_id": "job-1",
+                    "expected_documents": body["expected_documents"],
+                    "status": "pending",
+                    "created_at": NOW,
+                    "collection_name": body["collection_name"],
+                    "operation": "append",
+                },
+            )
+        if path == "/v1/ingest/job/job-1/document" and method == "POST":
+            body = request.content.decode(errors="replace")
+            entry = next(item for item in self.manifest if item["manifest_entry_id"] in body)
+            position = self.manifest.index(entry)
+            stable_id = f"stable-doc-{position}"
+            accepted = {
+                "document_id": stable_id,
+                "attempt_id": f"attempt-{position}",
+                "job_id": "job-1",
+                "content_sha256": entry["content_sha256"],
+                "status": "pending",
+                "created_at": NOW,
+            }
+            self.documents[stable_id] = {
+                "document_id": stable_id,
+                "attempt_id": f"attempt-{position}",
+                "job_id": "job-1",
+                "status": "completed",
+                "submitted_at": NOW,
+                "started_at": NOW,
+                "completed_at": NOW,
+                "filename": entry["filename"],
+                "result_rows": position + 2,
+                "error": None,
+                "collection_name": "test",
+                "content_sha256": entry["content_sha256"],
+            }
+            return _response(request, 202, accepted)
+        if path == "/v1/ingest/job/job-1" and method == "GET":
+            return _response(
+                request,
+                200,
+                {
+                    "job_id": "job-1",
+                    "expected_documents": len(self.manifest),
+                    "status": "completed",
+                    "created_at": NOW,
+                    "started_at": NOW,
+                    "finalized_at": NOW,
+                    "counts": {"completed": len(self.documents)},
+                    "document_ids": [item["attempt_id"] for item in self.documents.values()],
+                    "collection_name": "test",
+                    "operation": "append",
+                },
+            )
+        if path == "/v1/ingest/job/job-1/documents" and method == "GET":
+            items = list(self.documents.values())
+            return _response(
+                request,
+                200,
+                {
+                    "job_id": "job-1",
+                    "total": len(items),
+                    "total_filtered": len(items),
+                    "offset": int(request.url.params.get("offset", 0)),
+                    "limit": int(request.url.params.get("limit", 1000)),
+                    "items": items,
+                },
+            )
+        if path == "/v1/collections/test/documents" and method == "GET":
+            items = [
+                {
+                    "document_id": item["document_id"],
+                    "collection_name": "test",
+                    "scope": "workspace-123",
+                    "filename": item["filename"],
+                    "content_sha256": item["content_sha256"],
+                    "document_version": "v1",
+                    "status": "indexed",
+                    "chunk_count": item["result_rows"],
+                    "job_id": "job-1",
+                    "created_at": NOW,
+                    "updated_at": NOW,
+                    "error": None,
+                }
+                for item in self.documents.values()
+            ]
+            token = request.url.params.get("continuation_token")
+            if self.paginate and token is None and len(items) > 1:
+                return _response(request, 200, {"items": items[:1], "next_token": "docs-2"})
+            return _response(request, 200, {"items": items[1:] if self.paginate and token else items})
+        if path.startswith("/v1/collections/test/documents/"):
+            document_id = path.rsplit("/", 1)[-1]
+            if method == "DELETE":
+                existed = document_id in self.documents
+                self.documents.pop(document_id, None)
+                return _response(
+                    request,
+                    200,
+                    {
+                        "document_id": document_id,
+                        "collection_name": "test",
+                        "scope": "workspace-123",
+                        "existed": existed,
+                        "deleted": existed,
+                        "status": "deleted",
+                        "cleanup_pending": False,
+                    },
+                )
+            item = self.documents.get(document_id)
+            if item is None:
+                return _response(request, 404, {"detail": "not found"})
+            return _response(
+                request,
+                200,
+                {
+                    "document_id": document_id,
+                    "collection_name": "test",
+                    "scope": "workspace-123",
+                    "filename": item["filename"],
+                    "content_sha256": item["content_sha256"],
+                    "document_version": "v1",
+                    "status": "indexed",
+                    "chunk_count": item["result_rows"],
+                    "job_id": "job-1",
+                    "created_at": NOW,
+                    "updated_at": NOW,
+                    "error": None,
+                },
+            )
+        return _response(request, 404, {"detail": f"unhandled {method} {path}"})
+
+
+def _adapter_config(handler: Any, *, token: str = "super-secret", retries: int = 0) -> dict[str, Any]:
+    mock_transport = httpx.MockTransport(handler)
+    transport = _NRLTransport(
+        base_url="https://nrl.example.test",
+        scope="workspace-123",
+        api_token=token,
+        connect_timeout_s=1,
+        request_timeout_s=5,
+        max_retries=retries,
+        verify_ssl=True,
+        ca_bundle=None,
+        client=httpx.Client(transport=mock_transport),
+    )
+    return {
+        "base_url": "https://nrl.example.test",
+        "scope": "workspace-123",
+        "api_token": SecretStr(token),
+        "max_retries": retries,
+        "max_concurrency": 2,
+        "_transport": transport,
+    }
+
+
+def test_backend_registration_config_validation_and_secret_redaction():
+    assert is_retriever_registered("nemo_retriever")
+    assert is_ingestor_registered("nemo_retriever")
+    assert issubclass(NemoRetrieverRetriever, BaseRetriever)
+    assert issubclass(NemoRetrieverIngestor, BaseIngestor)
+
+    with pytest.raises(ValidationError, match="explicit nrl_scope"):
+        KnowledgeRetrievalConfig(backend="nemo_retriever", nrl_scope="")
+
+    secret = "must-not-appear"  # pragma: allowlist secret
+    config = KnowledgeRetrievalConfig(
+        backend="nemo_retriever",
+        nrl_scope="workspace-123",
+        nrl_api_token=SecretStr(secret),
+    )
+    assert secret not in repr(config)
+    backend, backend_config = _setup_backend(config)
+    assert backend == "nemo_retriever"
+    assert isinstance(backend_config["api_token"], SecretStr)
+    assert secret not in repr(backend_config)
+
+
+def test_headers_collection_and_document_pagination(tmp_path):
+    fake = FakeNRL(paginate=True)
+    config = _adapter_config(fake)
+    ingestor = NemoRetrieverIngestor(config)
+
+    collections = ingestor.list_collections()
+    assert [item.name for item in collections] == ["first", "second"]
+    assert "table_name" not in collections[0].metadata
+
+    first = tmp_path / "one.txt"
+    second = tmp_path / "two.html"
+    first.write_text("alpha", encoding="utf-8")
+    second.write_text("<p>beta</p>", encoding="utf-8")
+    ingestor.submit_job([str(first), str(second)], "test")
+    files = ingestor.list_files("test")
+    ingestor.get_job_status("job-1")
+    assert {item.file_id for item in files} == {"stable-doc-0", "stable-doc-1"}
+
+    assert all(request.headers["X-NRL-Scope"] == "workspace-123" for request in fake.requests)
+    assert all(request.headers["Authorization"] == "Bearer super-secret" for request in fake.requests)
+    resource_list_requests = [
+        request
+        for request in fake.requests
+        if request.method == "GET" and request.url.path in {"/v1/collections", "/v1/collections/test/documents"}
+    ]
+    job_document_requests = [
+        request
+        for request in fake.requests
+        if request.method == "GET" and request.url.path == "/v1/ingest/job/job-1/documents"
+    ]
+    assert all(request.url.params["limit"] == "100" for request in resource_list_requests)
+    assert all(request.url.params["limit"] == "1000" for request in job_document_requests)
+
+
+def test_deterministic_manifest_idempotency_and_status_mapping(tmp_path):
+    fake = FakeNRL()
+    ingestor = NemoRetrieverIngestor(_adapter_config(fake))
+    one = tmp_path / "upload-a"
+    two = tmp_path / "upload-b"
+    one.write_text("same bytes", encoding="utf-8")
+    two.write_text("other bytes", encoding="utf-8")
+
+    job_id = ingestor.submit_job(
+        [str(one), str(two)],
+        "test",
+        {"original_filenames": ["report.txt", "page.html"]},
+    )
+    replay_id = ingestor.submit_job(
+        [str(one), str(two)],
+        "test",
+        {"original_filenames": ["report.txt", "page.html"]},
+    )
+
+    assert job_id == replay_id == "job-1"
+    assert fake.create_job_bodies[0]["idempotency_key"] == fake.create_job_bodies[1]["idempotency_key"]
+    expected_sha = hashlib.sha256(one.read_bytes()).hexdigest()
+    entry = fake.create_job_bodies[0]["document_manifest"][0]
+    assert entry["filename"] == "report.txt"
+    assert entry["content_sha256"] == expected_sha
+    assert entry["manifest_entry_id"] == hashlib.sha256(f"0\0report.txt\0{expected_sha}".encode()).hexdigest()
+
+    status = ingestor.get_job_status(job_id)
+    assert status.status == JobState.COMPLETED
+    assert status.processed_files == 2
+    assert {item.file_id for item in status.file_details} == {"stable-doc-0", "stable-doc-1"}
+    assert status.metadata["attempt_ids"] == {
+        "stable-doc-0": "attempt-0",
+        "stable-doc-1": "attempt-1",
+    }
+    assert all(item.status == FileStatus.SUCCESS for item in status.file_details)
+
+
+def test_query_mapping_citations_content_types_and_image_safety():
+    fake = FakeNRL()
+    fake.query_hits = [
+        {
+            "chunk_id": "text-1",
+            "document_id": "doc-1",
+            "text": "Text body",
+            "score": 0.9,
+            "filename": "report.pdf",
+            "page_number": 2,
+            "content_type": "text",
+            "source": "report.pdf",
+            "source_id": "source-1",
+            "bbox_xyxy_norm": [0.1, 0.2, 0.3, 0.4],
+            "metadata": {"table_name": "hidden", "section": "intro"},
+        },
+        {
+            "chunk_id": "table-1",
+            "document_id": "doc-1",
+            "text": "Table caption",
+            "score": 0.8,
+            "filename": "report.pdf",
+            "page_number": 3,
+            "content_type": "structured_table",
+            "metadata": {"structured_data": {"columns": ["a"]}},
+        },
+        {
+            "chunk_id": "chart-1",
+            "document_id": "doc-1",
+            "text": "Chart caption",
+            "score": 0.7,
+            "filename": "report.pdf",
+            "page_number": 4,
+            "content_type": "bar_chart",
+            "metadata": {},
+        },
+        {
+            "chunk_id": "image-1",
+            "document_id": "doc-1",
+            "text": "Image caption",
+            "score": 0.6,
+            "filename": "report.pdf",
+            "page_number": 5,
+            "content_type": "image",
+            "stored_image_uri": "s3://private-bucket/image.png",
+            "metadata": {"lancedb_uri": "/data/private"},
+        },
+        {
+            "chunk_id": "image-2",
+            "document_id": "doc-1",
+            "text": "Public image",
+            "score": 0.5,
+            "filename": "report.pdf",
+            "page_number": None,
+            "content_type": "figure",
+            "stored_image_uri": "https://images.example.test/signed.png",
+            "metadata": {},
+        },
+        {
+            "chunk_id": "unknown-1",
+            "document_id": "doc-1",
+            "text": "Unknown type",
+            "score": 0.4,
+            "filename": "notes.txt",
+            "page_number": None,
+            "content_type": "novel-modality",
+            "metadata": {},
+            "source": {"table_name": "hidden", "label": "logical source"},
+        },
+    ]
+    retriever = NemoRetrieverRetriever(_adapter_config(fake))
+    result = asyncio.run(retriever.retrieve("findings", "test", top_k=6))
+
+    assert result.success
+    assert [chunk.content_type for chunk in result.chunks] == [
+        ContentType.TEXT,
+        ContentType.TABLE,
+        ContentType.CHART,
+        ContentType.IMAGE,
+        ContentType.IMAGE,
+        ContentType.TEXT,
+    ]
+    assert result.chunks[0].display_citation == "report.pdf, p.2"
+    assert result.chunks[0].metadata["document_id"] == "doc-1"
+    assert result.chunks[0].metadata["bounding_box"] == [0.1, 0.2, 0.3, 0.4]
+    assert "table_name" not in result.chunks[0].metadata
+    assert result.chunks[1].structured_data == '{"columns": ["a"]}'
+    assert result.chunks[3].image_storage_uri == "s3://private-bucket/image.png"
+    assert result.chunks[3].image_url is None
+    assert "lancedb_uri" not in result.chunks[3].metadata
+    assert result.chunks[4].image_url == "https://images.example.test/signed.png"
+    assert all(0 <= chunk.score <= 1 for chunk in result.chunks)
+    assert result.chunks[5].metadata["source"] == {"label": "logical source"}
+
+
+def test_filters_empty_results_and_malformed_response():
+    fake = FakeNRL()
+    retriever = NemoRetrieverRetriever(_adapter_config(fake))
+    filtered = asyncio.run(retriever.retrieve("q", "test", filters={"author": "Kyle"}))
+    assert not filtered.success
+    assert "filters are not supported" in (filtered.error_message or "")
+    assert not any(request.url.path == "/v1/query" for request in fake.requests)
+
+    empty = asyncio.run(retriever.retrieve("q", "test"))
+    assert empty.success
+    assert empty.chunks == []
+
+    def malformed(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, content=b"not-json")
+
+    malformed_retriever = NemoRetrieverRetriever(_adapter_config(malformed))
+    result = asyncio.run(malformed_retriever.retrieve("q", "test"))
+    assert not result.success
+    assert "malformed JSON" in (result.error_message or "")
+
+
+def test_async_operations_are_safe_across_event_loops():
+    fake = FakeNRL()
+    retriever = NemoRetrieverRetriever(_adapter_config(fake))
+
+    assert asyncio.run(retriever.health_check())
+    first = asyncio.run(retriever.retrieve("first query", "test"))
+    second = asyncio.run(retriever.retrieve("second query", "test"))
+    assert first.success
+    assert second.success
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 409, 422])
+def test_non_retryable_http_errors(status):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _response(request, status, {"detail": "rejected"})
+
+    ingestor = NemoRetrieverIngestor(_adapter_config(handler, retries=3))
+    with pytest.raises(NemoRetrieverHTTPError) as error:
+        ingestor.create_collection("test")
+    assert error.value.status_code == status
+    assert calls == 1
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_retryable_http_errors(status):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _response(request, status, {"detail": "retry"}, headers={"Retry-After": "0"})
+        return _response(request, 200, {"status": "ok"})
+
+    config = _adapter_config(handler, retries=1)
+    assert asyncio.run(NemoRetrieverRetriever(config).health_check())
+    assert calls == 2
+
+
+def test_timeout_secret_redaction_and_job_api_mismatch():
+    secret = "token-that-must-not-leak"  # pragma: allowlist secret
+
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"Bearer {secret}", request=request)
+
+    transport = _adapter_config(timeout_handler, token=secret)["_transport"]
+    with pytest.raises(NemoRetrieverTransportError) as error:
+        transport.request_json("GET", "/v1/health", operation="health check")
+    assert secret not in str(error.value)
+
+    for status in (404, 410):
+
+        def mismatch(request: httpx.Request, status_code: int = status) -> httpx.Response:
+            return _response(request, status_code, {"detail": "missing"})
+
+        ingestor = NemoRetrieverIngestor(_adapter_config(mismatch))
+        with pytest.raises(NemoRetrieverCompatibilityError, match="compatible collection-management API versions"):
+            ingestor.get_job_status("missing-job")
+
+
+def test_partial_success_and_failed_file_status_mapping():
+    fake = FakeNRL()
+    fake.manifest = [
+        {"manifest_entry_id": "a" * 64, "filename": "ok.txt", "content_sha256": "b" * 64},
+        {"manifest_entry_id": "c" * 64, "filename": "bad.txt", "content_sha256": "d" * 64},
+    ]
+    fake.documents = {
+        "stable-ok": {
+            "document_id": "stable-ok",
+            "attempt_id": "attempt-ok",
+            "job_id": "job-1",
+            "status": "completed",
+            "submitted_at": NOW,
+            "completed_at": NOW,
+            "filename": "ok.txt",
+            "result_rows": 2,
+            "error": None,
+            "collection_name": "test",
+            "content_sha256": "b" * 64,
+        },
+        "stable-bad": {
+            "document_id": "stable-bad",
+            "attempt_id": "attempt-bad",
+            "job_id": "job-1",
+            "status": "failed",
+            "submitted_at": NOW,
+            "completed_at": NOW,
+            "filename": "bad.txt",
+            "result_rows": 0,
+            "error": "extract failed",
+            "collection_name": "test",
+            "content_sha256": "d" * 64,
+        },
+    }
+
+    original = fake.__call__
+
+    def partial(request: httpx.Request) -> httpx.Response:
+        response = original(request)
+        if request.url.path == "/v1/ingest/job/job-1" and response.status_code == 200:
+            body = response.json()
+            body["status"] = "partial_success"
+            return _response(request, 200, body)
+        return response
+
+    status = NemoRetrieverIngestor(_adapter_config(partial)).get_job_status("job-1")
+    assert status.status == JobState.COMPLETED
+    assert status.error_message
+    assert [item.status for item in status.file_details] == [FileStatus.SUCCESS, FileStatus.FAILED]
+    assert status.file_details[1].error_message == "extract failed"
+    assert status.submitted_at == datetime.fromisoformat(NOW).astimezone(UTC)
