@@ -57,7 +57,24 @@ identifiers are removed from mapped metadata.
 
 ## Connecting to NRL
 
-For local Docker, publish the NRL gateway and use its host port:
+From the NRL deployment directory, start the stack and confirm its core
+services are healthy:
+
+```bash
+docker compose up -d
+docker compose ps
+```
+
+With the default Compose project name `nrl`, the core rows should include:
+
+```text
+nrl-embed-1      healthy
+nrl-vectordb-1   healthy
+nrl-gateway-1    healthy
+```
+
+Container-name prefixes can differ when the Compose project name is
+overridden. For local Docker, publish the NRL gateway and use its host port:
 
 ```bash
 curl -fsS http://127.0.0.1:17670/v1/health

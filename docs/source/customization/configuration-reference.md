@@ -760,7 +760,7 @@ workflow:
 
 ## Provided Config Files
 
-The repository includes eleven top-level workflow configurations. They are focused reference profiles, not cumulative
+The repository includes twelve top-level workflow configurations. They are focused reference profiles, not cumulative
 layers, and no single profile enables every capability. Start from the profile closest to the deployment and merge
 only the additional sections you need.
 
@@ -773,6 +773,7 @@ only the additional sections you need.
 | `configs/config_web_opensearch.yml` | Web API | Built-in OpenSearch knowledge backend plus Tavily. Supports unauthenticated or basic self-hosted OpenSearch and SigV4 (`es` or `aoss`); infrastructure and credentials are deployment opt-ins. |
 | `configs/config_frontier_models.yml` | Web API | Shipped LlamaIndex frontier profile: GPT-5.6 Luna for intent/shallow/source routing/research, GPT-5.6 Sol for clarification/orchestration/planning/writing, and Gemma 4 for summaries. Requires `NVIDIA_API_KEY`, `OPENAI_API_KEY`, and `TAVILY_API_KEY` for the enabled Tavily tools; the commented paper-search opt-in requires `SERPER_API_KEY` when enabled. Validate the complete workflow against the configured provider endpoints before deployment. |
 | `configs/config_web_default_guardrails.yml` | Web API | LlamaIndex with workflow Guardrails attached explicitly, shallow-agent Guardrails dynamically attached through `workflow_functions`, and async deep-agent Guardrails applied by the AI-Q runner from the same target configuration. |
+| `configs/config_web_nemo_retriever.yml` | Web API | Independently deployed NeMo Retriever knowledge backend plus Tavily. Requires the NRL gateway URL, workspace scope, and optional bearer token. |
 | `configs/config_web_frag_mcp_auth.yml` | Web API | Foundational RAG plus a protected per-user OAuth MCP source example. Requires a real protected MCP endpoint and shared token-store configuration; it is not a zero-config default. |
 | `configs/config_domain_routing_and_skills.yml` | Direct deep-research workflow | Automatic domain routing, Tavily, DuckDuckGo news, Polymarket, LlamaIndex, enabled Serper paper search, built-in skills, and a Modal sandbox. Requires the corresponding service credentials and Modal setup. |
 | `configs/config_openshell.yml` | Web API, experimental | Skills and artifact capture over one policy-bound OpenShell sandbox per deep-research job, with fail-closed policy attestation and terminal deletion. |
