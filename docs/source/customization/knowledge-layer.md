@@ -64,7 +64,7 @@ A pluggable abstraction for document ingestion and retrieval. Swap backends with
 - **`nemo_retriever`** - Calls a separately deployed NeMo Retriever gateway through its public REST API.
   - NRL owns extraction, OCR, tokenization, embedding, indexing, and collection durability.
   - AI-Q owns logical inputs, job polling, retrieval, and universal-schema mapping only.
-  - See the [backend operator guide](../../../sources/knowledge_layer/src/nemo_retriever/README.md).
+  - See the backend operator guide at `sources/knowledge_layer/src/nemo_retriever/README.md`.
 
 ---
 
@@ -279,8 +279,8 @@ the public NRL query contract supports them. AI-Q does not expose NRL pipeline
 tuning and does not consume physical VectorDB names or LanceDB locations.
 
 The tested baseline is NeMo Retriever commit `edfed55da` plus the TXT/HTML
-tokenizer landing patch, or a merged successor containing both changes. See
-the [backend operator guide](../../../sources/knowledge_layer/src/nemo_retriever/README.md)
+tokenizer landing patch, or a merged successor containing both changes. See the
+backend operator guide at `sources/knowledge_layer/src/nemo_retriever/README.md`
 for local Docker, SSH tunnel, Kubernetes, live validation, and troubleshooting.
 
 #### Multimodal Extraction (LlamaIndex Only)
@@ -591,4 +591,4 @@ print("Full config:", get_knowledge_layer_config())
 | [SDK Reference](../reference/knowledge-layer-sdk.md) | Build custom backend adapters - data schemas, interfaces, full implementation example |
 | Foundational RAG Setup (`sources/knowledge_layer/src/foundational_rag/README.md`) | Production deployment with NVIDIA RAG Blueprint |
 | [Amazon OpenSearch Serverless](../deployment/aws-opensearch-serverless.md) | Deploy the OpenSearch backend on EKS with AOSS and SigV4 |
-| [NeMo Retriever backend](../../../sources/knowledge_layer/src/nemo_retriever/README.md) | Deploy and validate NRL as an independent AI-Q knowledge service |
+| NeMo Retriever backend (`sources/knowledge_layer/src/nemo_retriever/README.md`) | Deploy and validate NRL as an independent AI-Q knowledge service |

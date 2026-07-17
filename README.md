@@ -281,6 +281,7 @@ The `configs/` directory holds YAML workflow configs that define agents, tools, 
 | `config_web_frag.yml` | Nemotron 3 Super | Web/API and Helm base with Foundational RAG plus Tavily. Requires separately deployed RAG query and ingestion services. |
 | `config_web_opensearch.yml` | Nemotron 3 Super; NVIDIA embedding model | Web/API with built-in OpenSearch knowledge retrieval plus Tavily; supports self-hosted, `es`, and `aoss` authentication modes. |
 | `config_web_azure_ai_search.yml` | Nemotron 3 Super; NVIDIA embedding model | Web/API with Azure AI Search knowledge retrieval plus Tavily; supports API-key and Azure identity authentication. |
+| `config_web_nemo_retriever.yml` | Nemotron 3 Super; Nemotron Mini summary | Web/API with an independently deployed NeMo Retriever knowledge backend plus Tavily. Requires the NRL gateway URL, workspace scope, and optional bearer token. |
 | `config_frontier_models.yml` | GPT-5.2; Nemotron 3 Super; Nemotron Mini summary | LlamaIndex profile using GPT-5.2 for orchestration/planning/writing and Nemotron Super for routing/research. Requires `OPENAI_API_KEY`. |
 | `config_web_default_guardrails.yml` | GPT-OSS-120B; Nemotron 3 Super; Nemotron Mini summary | LlamaIndex profile with workflow Guardrails attached and async deep-agent Guardrails selected; shallow middleware is defined but not attached. |
 | `config_web_frag_mcp_auth.yml` | Nemotron 3 Super | Foundational RAG plus an opt-in protected per-user OAuth MCP source example. Requires a real MCP endpoint and shared token store. |

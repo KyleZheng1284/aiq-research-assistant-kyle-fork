@@ -664,7 +664,7 @@ workflow:
 
 ## Provided Config Files
 
-The repository includes eleven top-level workflow configurations. They are focused reference profiles, not cumulative
+The repository includes twelve top-level workflow configurations. They are focused reference profiles, not cumulative
 layers, and no single profile enables every capability. Start from the profile closest to the deployment and merge
 only the additional sections you need.
 
@@ -675,6 +675,7 @@ only the additional sections you need.
 | `configs/config_web_azure_ai_search.yml` | Web API | Azure AI Search knowledge retrieval and web search |
 | `configs/config_web_frag.yml` | Web API / Helm base | Foundational RAG plus Tavily. Requires separately deployed RAG query and ingestion services. Paper search is commented out. |
 | `configs/config_web_opensearch.yml` | Web API | Built-in OpenSearch knowledge backend plus Tavily. Supports unauthenticated or basic self-hosted OpenSearch and SigV4 (`es` or `aoss`); infrastructure and credentials are deployment opt-ins. |
+| `configs/config_web_nemo_retriever.yml` | Web API | Independently deployed NeMo Retriever knowledge backend plus Tavily. Requires the NRL gateway URL, workspace scope, and optional bearer token. |
 | `configs/config_frontier_models.yml` | Web API | LlamaIndex plus explicit per-agent tools, Nemotron researcher roles, and an OpenAI frontier model for orchestration/planning/writing. Requires `OPENAI_API_KEY`; paper search is commented out. |
 | `configs/config_web_default_guardrails.yml` | Web API | LlamaIndex plus workflow Guardrails attachment. Shallow/deep middleware types are defined as capability examples; refer to [Guardrails](./guardrails.md) for the active attachment semantics. |
 | `configs/config_web_frag_mcp_auth.yml` | Web API | Foundational RAG plus a protected per-user OAuth MCP source example. Requires a real protected MCP endpoint and shared token-store configuration; it is not a zero-config default. |
