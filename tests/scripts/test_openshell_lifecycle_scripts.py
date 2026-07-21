@@ -134,6 +134,7 @@ def test_authenticated_gateway_runs_mandatory_strict_readiness_check(tmp_path: P
             "auth": "oidc",
             "active": False,
         },
+        extra_env={"AIQ_OPENSHELL_WORKSPACE": "research"},
     )
 
     assert result.returncode == 0, result.stderr
@@ -142,6 +143,7 @@ def test_authenticated_gateway_runs_mandatory_strict_readiness_check(tmp_path: P
     assert calls.count("version-inspector") == 2
     assert "readiness-checker" in calls
     assert "--gateway-name enterprise" in calls
+    assert "--workspace research" in calls
     assert "gateway add" not in calls
 
 
@@ -258,7 +260,7 @@ def test_setup_rejects_uncertified_openshell_versions(version: str) -> None:
 
     assert result.returncode != 0
     assert "not certified" in result.stderr
-    assert "0.0.80" in result.stderr
+    assert "0.0.88" in result.stderr
 
 
 def test_setup_resolves_docker_desktop_cli_and_credential_helper_together() -> None:

@@ -336,6 +336,7 @@ class TestDeepAgentsRuntimeJobId:
         public = DeepResearchSandboxConfig(
             policy="policy.yaml",
             openshell_image="aiq:test",
+            workspace="research",
             attest=True,
             expected_policy_version=3,
             policy_load_timeout_seconds=17,
@@ -353,6 +354,7 @@ class TestDeepAgentsRuntimeJobId:
         assert resolved.network.mode == "allowlist"
         assert resolved.network.allow == ("api.github.com",)
         assert resolved.providers.openshell.image == "aiq:test"
+        assert resolved.providers.openshell.workspace == "research"
         assert resolved.providers.openshell.attest is True
         assert resolved.providers.openshell.expected_policy_version == 3
         assert resolved.providers.openshell.policy_load_timeout_seconds == 17

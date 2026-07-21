@@ -153,6 +153,7 @@ sandbox:
       python_packages: [matplotlib, numpy, pandas, pillow, tabulate]
     openshell:
       gateway: null            # null = locally selected gateway
+      workspace: default        # OpenShell lifecycle scope (not the in-sandbox workdir)
       image: aiq-openshell-demo:latest
       policy: configs/openshell/generated/aiq-openshell-policy.yaml
       delete_on_exit: true
