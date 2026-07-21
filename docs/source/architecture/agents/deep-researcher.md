@@ -295,11 +295,18 @@ edit. The writer performs no new research, writes the complete final answer to
 `/shared/output.md`, and returns a short completion marker. The runtime loads
 the Markdown from that file.
 
-This is the normative synthesis contract. As a defensive compatibility path,
-`_salvage_inline_report()` accepts the orchestrator's final message when the
-output file is missing, but only if the message is substantive Markdown: at
-least 400 characters with a Markdown heading and not merely the writer
-completion marker. Otherwise, missing writer output remains an error.
+This is the only synthesis contract. The runtime accepts only non-empty writer
+output whose exact UTF-8 bytes match the digest recorded after a successful
+writer mutation in the current run. After one bounded corrective turn, missing,
+stale, or mismatched output fails closed with
+``writer_output_not_committed``; inline orchestrator messages are not salvaged
+as final reports.
+
+``/shared/output.md`` is the sole writer-facing path. When
+``CompositeBackend`` routes ``/shared/`` through ``StateBackend``, raw graph
+state may represent that file under the internal route-stripped key
+``/output.md``. Ownership and digest checks recognize that internal alias, but
+agents must not target it directly.
 
 ### Phase 5: Citation Verification (Post-Processing)
 
