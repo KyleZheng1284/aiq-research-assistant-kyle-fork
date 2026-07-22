@@ -1277,11 +1277,11 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
     def __init__(
         self,
         *,
-        max_attempts: int = 3,
+        max_attempts: int | None = None,
         output_paths: tuple[str, ...] = ("/shared/output.md", "/output.md"),
         artifact_manager: object | None = None,
     ) -> None:
-        if max_attempts < 1:
+        if max_attempts is not None and max_attempts < 1:
             raise ValueError("max_attempts must be at least one")
         if not output_paths:
             raise ValueError("output_paths must not be empty")
@@ -1451,7 +1451,7 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
         )
 
     async def awrap_tool_call(self, request, handler):
-        """Admit at most ``max_attempts`` physical writer execute calls."""
+        """Guard publication and enforce the physical writer-execute budget when configured."""
         tool_call = request.tool_call if isinstance(getattr(request, "tool_call", None), dict) else {}
         publication_write = self._targets_artifact_directory(tool_call)
         if publication_write:
@@ -1506,7 +1506,7 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
             )
 
         async with self._attempt_lock:
-            if self._attempts >= self.max_attempts:
+            if self.max_attempts is not None and self._attempts >= self.max_attempts:
                 return self._tool_message(
                     request,
                     "writer_execute_budget_exhausted: chart execution is disabled; preserve the report, table, "
@@ -1514,7 +1514,7 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
                 )
             self._attempts += 1
         result = await handler(request)
-        if self._attempts >= self.max_attempts and _tool_result_failed(result):
+        if self.max_attempts is not None and self._attempts >= self.max_attempts and _tool_result_failed(result):
             return self._tool_message(
                 request,
                 "writer_execute_budget_exhausted: chart execution failed at the attempt limit; preserve the "
@@ -1532,7 +1532,7 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
     @hook_config(can_jump_to=["end"])
     async def aafter_model(self, state, runtime):
         """End a post-exhaustion execute request before it reaches the sandbox."""
-        if self._attempts < self.max_attempts:
+        if self.max_attempts is None or self._attempts < self.max_attempts:
             return None
         last_message = self._last_ai_message(state)
         if last_message is None or not any(self._targets_artifact_execute(call) for call in last_message.tool_calls):

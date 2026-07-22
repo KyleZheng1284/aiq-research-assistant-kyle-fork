@@ -1926,6 +1926,18 @@ class TestWriterExecuteBudgetMiddleware:
         handler.assert_awaited_once_with(request)
 
     @pytest.mark.asyncio
+    async def test_disabled_chart_budget_allows_repeated_execution(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=None, artifact_manager=self._manager())
+        handler = AsyncMock(return_value="ok")
+        request = self._request(files=self._baseline())
+
+        for _ in range(5):
+            assert await middleware.awrap_tool_call(request, handler) == "ok"
+
+        assert middleware.attempts == 5
+        assert handler.await_count == 5
+
+    @pytest.mark.asyncio
     async def test_crlf_report_table_opens_execute_gate(self) -> None:
         middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager())
         handler = AsyncMock(return_value="ok")

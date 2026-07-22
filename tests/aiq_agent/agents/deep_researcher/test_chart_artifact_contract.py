@@ -82,6 +82,24 @@ def test_researcher_hands_off_canonical_dataset_without_publishing() -> None:
     assert "Do not calculate or guess `csv_sha256`" in rendered
 
 
+def test_researcher_prompt_omits_execute_budget_when_disabled() -> None:
+    prompt = _read(_AGENT_ROOT / "prompts" / "researcher.j2")
+    rendered = render_prompt_template(
+        prompt,
+        current_datetime="2026-07-09",
+        execution_enabled=True,
+        sandbox_workdir="/sandbox/job-123",
+        sandbox_artifact_dir="/sandbox/job-123/aiq-artifacts",
+        max_researcher_execute_attempts=None,
+        user_info=None,
+        tools=[],
+        available_documents=None,
+    )
+
+    assert "physical `execute` attempts" not in rendered
+    assert "None physical" not in rendered
+
+
 def test_writer_writes_baseline_before_publication_and_bounds_chart_failure() -> None:
     prompt = _read(_AGENT_ROOT / "prompts" / "writer.j2")
     rendered = render_prompt_template(
@@ -144,4 +162,6 @@ def test_sandbox_profiles_assign_analysis_to_researcher_and_publication_to_write
         "writer-agent": ["synthesis"],
     }
     assert skills["require_sandbox"] == ["research", "synthesis"]
-    assert agent["workflow_timeout_seconds"] == "${AIQ_DEEP_RESEARCH_WORKFLOW_TIMEOUT_SECONDS:-3600}"
+    assert "max_researcher_execute_attempts" not in agent
+    assert "max_writer_execute_attempts" not in agent
+    assert "workflow_timeout_seconds" not in agent

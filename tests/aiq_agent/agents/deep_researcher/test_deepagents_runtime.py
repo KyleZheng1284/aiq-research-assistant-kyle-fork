@@ -61,9 +61,6 @@ def test_openshell_workflow_only_diverges_for_sandbox_wiring() -> None:
     openshell_functions["deep_research_agent"] = openshell_functions["deep_research_agent"].copy()
     openshell_functions["deep_research_agent"].pop("skills")
     openshell_functions["deep_research_agent"].pop("sandbox")
-    openshell_functions["deep_research_agent"].pop("max_researcher_execute_attempts")
-    openshell_functions["deep_research_agent"].pop("workflow_timeout_seconds")
-
     assert openshell["general"] == standard["general"]
     assert openshell["llms"] == standard["llms"]
     assert openshell_functions == standard["functions"]

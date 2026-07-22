@@ -204,8 +204,8 @@ for configuration details.
 | `domain_catalog_path` | `str` or `None` | `None` | Optional YAML or JSON domain catalog used by the source router |
 | `enable_source_router` | `bool` | `true` | Run the advisory source-router stage before planning |
 | `max_research_concurrency` | `int` | `6` | Maximum `ResearchQuery` items accepted and run concurrently per batch call |
-| `max_researcher_execute_attempts` | `int` | `3` | Physical code-execution limit per researcher worker, including generic retries |
-| `max_writer_execute_attempts` | `int` | `3` | Physical writer chart-execution limit, including generic retries |
+| `max_researcher_execute_attempts` | `int` or `None` | `None` | Optional physical code-execution limit per researcher worker, including generic retries |
+| `max_writer_execute_attempts` | `int` or `None` | `None` | Optional physical writer chart-execution limit, including generic retries |
 | `workflow_timeout_seconds` | `float` or `None` | `None` | Optional async workflow deadline; expiry fails with `deep_research_workflow_timeout` |
 | `skills` | `FunctionRef`, inline `deep_research_skills`, or `None` | `None` | Optional built-in skill assignments by agent name |
 | `sandbox` | `FunctionRef`, inline `deep_research_sandbox`, or `None` | `None` | Optional sandbox profile for DeepAgents `execute` support |
@@ -226,13 +226,34 @@ functions:
     enable_source_router: true
     enable_citation_verification: true
     max_research_concurrency: 6
-    max_researcher_execute_attempts: 3
-    max_writer_execute_attempts: 3
-    workflow_timeout_seconds: 3600
     verbose: true
     tools:
       - web_search_tool
 ```
+
+### Optional convergence safeguards
+
+Execution budgets and the async workflow deadline are disabled by default so an upgrade does not truncate an existing
+long-running or multi-step workflow. Operators can enable them independently:
+
+```yaml
+functions:
+  deep_research_agent:
+    max_researcher_execute_attempts: 3
+    max_writer_execute_attempts: 3
+    workflow_timeout_seconds: 3600
+```
+
+`max_researcher_execute_attempts` applies separately to each researcher worker. Every physical `execute` call, including
+a call made by generic retry middleware, consumes an attempt. After exhaustion, the worker is asked to return supported
+notes from evidence already collected; an unvalidated quantitative dataset may be omitted.
+
+`max_writer_execute_attempts` counts only canonical chart-rendering `execute` calls, not generic writer file publication.
+After exhaustion, the writer preserves the report, Markdown table, and already-published CSV, but may finish without a
+PNG. `workflow_timeout_seconds` covers the asynchronous workflow invocation. Expiry marks the job as failed with
+`deep_research_workflow_timeout`, requests forced sandbox termination, and performs only best-effort artifact recovery.
+Choose these values from observed workload duration and execution counts; an execution budget alone does not bound
+model or source-tool loops.
 
 ```{note}
 **Nemotron Super — Build Endpoint Availability:** Nemotron Super (`nvidia/nemotron-3-super-120b-a12b`) is compatible and tested with AIQ, but Build API endpoints have limited availability due to high demand (HTTP 429/503 responses). The default configs use Nemotron Super for the `researcher_llm` role. For production deployments requiring consistent throughput, self-hosting via a [Brev Launchable](https://brev.nvidia.com/launchable/deploy?launchableID=nvidia-official-nemotron-super-49b-v1) is recommended. Refer to [Troubleshooting](../../resources/troubleshooting.md#nemotron-super--build-endpoint-availability) for details.

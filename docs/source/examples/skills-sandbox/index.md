@@ -92,7 +92,6 @@ functions:
   deep_research_agent:
     _type: deep_research_agent
     enable_citation_verification: false
-    workflow_timeout_seconds: ${AIQ_DEEP_RESEARCH_WORKFLOW_TIMEOUT_SECONDS:-3600}
     skills: deep_research_skills
     sandbox: deep_research_sandbox
 ```
@@ -167,8 +166,8 @@ Expected behavior:
    `csv_text`, a Markdown table, summary statistics, provenance, and caveats in validated `ResearchNotes`.
 4. AI-Q registers the canonical dataset ID, artifact path, and SHA-256 digest over the exact UTF-8 CSV text.
 5. The writer writes the complete `/shared/output.md` baseline, then reads `chart-generation` to publish the exact CSV.
-6. CSV-only requests finish without chart execution. Chart requests render only from the published CSV and, by
-   default, stop after three failed writer execution attempts while preserving the report, table, and CSV.
+6. CSV-only requests finish without chart execution. Chart requests render only from the published CSV. Operators can
+   opt into a writer execution budget that stops repeated chart failures while preserving the report, table, and CSV.
 7. The final report cites the original sources for input figures and labels computed columns as calculations.
 
 ## Skill Files
@@ -249,8 +248,8 @@ source.
 - Canonical dataset manifests must carry the runtime-registered path and digest. Missing, moved, unregistered, or
   mismatched identities are rejected. Registered canonical paths remain digest-protected during the final directory
   scan even when no manifest was written.
-- `workflow_timeout_seconds` is disabled by default in the library. The shipped sandbox profiles set it from
-  `AIQ_DEEP_RESEARCH_WORKFLOW_TIMEOUT_SECONDS` with a 3600-second fallback. When the timeout wins the terminal-state
-  race, the job fails with `deep_research_workflow_timeout`, requests forced sandbox termination, and bounds how long
-  the worker waits. It then attempts a separate bounded terminal harvest only if termination returned; otherwise it
-  skips harvest to avoid concurrent provider I/O.
+- The researcher and writer execution budgets and `workflow_timeout_seconds` are disabled by default. Operators may
+  enable them independently. Researcher attempts are counted per worker and include generic retries; writer attempts
+  count canonical chart rendering and may finish without a PNG when exhausted. When the workflow timeout wins the
+  terminal-state race, the job fails with `deep_research_workflow_timeout` and requests forced sandbox termination.
+  Artifact recovery after timeout is best effort and is skipped when termination does not return within its bound.

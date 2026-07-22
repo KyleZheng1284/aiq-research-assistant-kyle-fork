@@ -468,9 +468,9 @@ functions:
     max_research_concurrency: 6
     max_concurrent_source_tool_calls: 5
     max_source_tool_batch_size: 4
-    max_researcher_execute_attempts: 3
-    max_writer_execute_attempts: 3
-    # Optional; shipped sandbox profiles default this environment-backed value to 3600.
+    # Optional convergence safeguards; all are disabled when omitted or null.
+    max_researcher_execute_attempts: null
+    max_writer_execute_attempts: null
     workflow_timeout_seconds: null
     verbose: true
 ```
@@ -492,8 +492,8 @@ functions:
 | `max_research_concurrency` | `int` | `6` | Maximum `ResearchQuery` objects accepted and run concurrently by one `run_research_batch` call. |
 | `max_concurrent_source_tool_calls` | `int` | `5` | Shared cap on concurrent source-tool calls across all researcher workers in the run. |
 | `max_source_tool_batch_size` | `int` | `4` | Maximum concrete inputs accepted by a batch-capable source-tool wrapper in one call. |
-| `max_researcher_execute_attempts` | `int` | `3` | Maximum physical code executions per researcher worker. Generic tool retries cannot exceed this limit. |
-| `max_writer_execute_attempts` | `int` | `3` | Maximum physical writer-side chart executions. Generic tool retries cannot exceed this limit. |
+| `max_researcher_execute_attempts` | `int` or `None` | `None` | Optional maximum physical code executions per researcher worker. Generic tool retries consume this budget. Exhaustion asks that worker to return supported notes and may omit an unvalidated quantitative dataset. |
+| `max_writer_execute_attempts` | `int` or `None` | `None` | Optional maximum physical writer-side canonical chart executions. Generic tool retries consume this budget. Exhaustion preserves the report, table, and published CSV but may omit the PNG. |
 | `workflow_timeout_seconds` | `float` or `None` | `None` | Optional wall-clock deadline for async deep research. When timeout wins the terminal-state race, the job fails with `deep_research_workflow_timeout`, requests forced sandbox termination, and bounds how long the worker waits. |
 | `verbose` | `bool` | `true` | Enable verbose logging. |
 
@@ -502,6 +502,11 @@ unselected registry sources but preserves configured tools with no source mappin
 ordered `preferred_tools` and `fallback_tools` guidance on each `ResearchQuery`; workers still receive the full
 request-filtered callable set. Refer to [Tools and Sources](./tools-and-sources.md#automatic-source-routing) and the
 [`config_domain_routing_and_skills.yml`](../../../configs/config_domain_routing_and_skills.yml) reference profile.
+
+The three convergence safeguards are opt-in and independent. Set their values from observed production workloads rather
+than assuming one limit fits every deployment. The researcher budget is per worker, while the writer budget is per run.
+The workflow deadline is the only one that turns the whole job into a timeout failure; terminal artifact recovery after
+that deadline is best effort.
 
 ---
 

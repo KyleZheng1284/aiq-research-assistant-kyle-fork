@@ -53,8 +53,8 @@ from .tools.source_tool_batching import DEFAULT_MAX_SOURCE_TOOL_BATCH_SIZE
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_RESEARCH_CONCURRENCY = 6
-DEFAULT_MAX_RESEARCHER_EXECUTE_ATTEMPTS = 3
-DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS = 3
+DEFAULT_MAX_RESEARCHER_EXECUTE_ATTEMPTS: int | None = None
+DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS: int | None = None
 PARENT_REPORT_CONTEXT_PATH = "/shared/parent_report_context.json"
 
 # Path to this agent's directory (for loading prompts)
@@ -91,8 +91,8 @@ class DeepResearcherAgent:
         max_research_concurrency: int = DEFAULT_MAX_RESEARCH_CONCURRENCY,
         max_concurrent_source_tool_calls: int = DEFAULT_MAX_CONCURRENT_SOURCE_TOOL_CALLS,
         max_source_tool_batch_size: int = DEFAULT_MAX_SOURCE_TOOL_BATCH_SIZE,
-        max_researcher_execute_attempts: int = DEFAULT_MAX_RESEARCHER_EXECUTE_ATTEMPTS,
-        max_writer_execute_attempts: int = DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS,
+        max_researcher_execute_attempts: int | None = DEFAULT_MAX_RESEARCHER_EXECUTE_ATTEMPTS,
+        max_writer_execute_attempts: int | None = DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS,
     ) -> None:
         """
         Initialize the deep researcher agent.
@@ -112,9 +112,9 @@ class DeepResearcherAgent:
                 run_research_batch call.
             max_concurrent_source_tool_calls: Shared source-tool concurrency limit across researcher workers.
             max_source_tool_batch_size: Maximum concrete inputs per batch-capable source tool call.
-            max_researcher_execute_attempts: Hard limit on physical researcher code-execution attempts.
-            max_writer_execute_attempts: Hard limit on writer-side chart execution attempts,
-                including physical retries.
+            max_researcher_execute_attempts: Optional hard limit on physical researcher code-execution attempts.
+            max_writer_execute_attempts: Optional hard limit on writer-side chart execution attempts,
+                including physical retries. ``None`` disables each corresponding limit.
         """
         self.llm_provider = llm_provider
         self.tools = list(tools) if tools else []

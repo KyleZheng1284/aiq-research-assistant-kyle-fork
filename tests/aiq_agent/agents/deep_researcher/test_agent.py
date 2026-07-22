@@ -350,16 +350,16 @@ class TestDeepResearcherAgent:
         assert config.sandbox.app_name == "custom-aiq"
         assert config.sandbox.packages == ("matplotlib", "pillow")
 
-    def test_convergence_limits_are_bounded_and_watchdog_defaults_disabled(self):
-        """The library stays opt-in for deadlines while physical execution is bounded by default."""
+    def test_convergence_limits_are_disabled_by_default(self):
+        """Compatibility safeguards remain opt-in unless an operator configures them."""
         from pydantic import ValidationError
 
         from aiq_agent.agents.deep_researcher.register import DeepResearchAgentConfig
 
         config = DeepResearchAgentConfig(orchestrator_llm="llm")
 
-        assert config.max_researcher_execute_attempts == 3
-        assert config.max_writer_execute_attempts == 3
+        assert config.max_researcher_execute_attempts is None
+        assert config.max_writer_execute_attempts is None
         assert config.workflow_timeout_seconds is None
         with pytest.raises(ValidationError):
             DeepResearchAgentConfig(orchestrator_llm="llm", max_researcher_execute_attempts=0)

@@ -110,15 +110,15 @@ class DeepResearchAgentConfig(FunctionBaseConfig, name="deep_research_agent"):
         ge=1,
         description="Maximum concrete inputs accepted by batch-capable source tool wrappers.",
     )
-    max_writer_execute_attempts: int = Field(
+    max_writer_execute_attempts: int | None = Field(
         default=DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS,
         ge=1,
-        description="Hard limit on writer-side chart execution attempts, including generic retries.",
+        description="Optional hard limit on writer-side chart execution attempts, including generic retries.",
     )
-    max_researcher_execute_attempts: int = Field(
+    max_researcher_execute_attempts: int | None = Field(
         default=DEFAULT_MAX_RESEARCHER_EXECUTE_ATTEMPTS,
         ge=1,
-        description="Hard limit on physical researcher code-execution attempts per worker.",
+        description="Optional hard limit on physical researcher code-execution attempts per worker.",
     )
     workflow_timeout_seconds: float | None = Field(
         default=None,

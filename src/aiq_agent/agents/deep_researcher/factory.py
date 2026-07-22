@@ -144,7 +144,7 @@ class DeepResearchGraphContext:
     backend: Any
     visibility_middleware: list[Any]
     final_report_tracker: FinalReportCommitTracker
-    max_researcher_execute_attempts: int = 3
+    max_researcher_execute_attempts: int | None = None
 
     @property
     def available_documents(self) -> list[dict[str, Any]]:
@@ -280,8 +280,8 @@ def build_deep_research_middleware_set(
     source_registry_middleware: SourceRegistryMiddleware,
     enable_source_router: bool = True,
     artifact_manager: object | None = None,
-    max_researcher_execute_attempts: int = 3,
-    max_writer_execute_attempts: int = 3,
+    max_researcher_execute_attempts: int | None = None,
+    max_writer_execute_attempts: int | None = None,
 ) -> DeepResearchMiddlewareSet:
     """Build researcher, writer, and orchestrator middleware stacks."""
 
@@ -306,7 +306,8 @@ def build_deep_research_middleware_set(
         )
 
     researcher = common()
-    researcher.append(ResearcherExecuteBudgetMiddleware(max_attempts=max_researcher_execute_attempts))
+    if max_researcher_execute_attempts is not None:
+        researcher.append(ResearcherExecuteBudgetMiddleware(max_attempts=max_researcher_execute_attempts))
 
     return DeepResearchMiddlewareSet(
         researcher=researcher,
@@ -557,7 +558,7 @@ def build_deep_research_graph(
     domain_catalog_path: str | None,
     max_research_concurrency: int,
     final_report_tracker: FinalReportCommitTracker,
-    max_researcher_execute_attempts: int = 3,
+    max_researcher_execute_attempts: int | None = None,
     enable_source_router: bool = True,
 ) -> Any:
     """Build the full DeepAgents graph for one deep research run."""

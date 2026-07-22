@@ -256,6 +256,29 @@ def test_middleware_set_wires_publication_and_execute_guards_only_on_writer():
     assert limiter.max_attempts == 2
 
 
+def test_middleware_set_keeps_execution_unbounded_by_default():
+    """Publication guards remain active without silently limiting physical execution."""
+    registry = SourceRegistryMiddleware(source_tool_names={web_search_tool.name})
+    tool_set = build_deep_research_tool_set(
+        [web_search_tool],
+        source_registry_middleware=registry,
+        max_concurrent_source_tool_calls=2,
+        max_source_tool_batch_size=3,
+    )
+    manager = MagicMock()
+    manager.artifact_dir = "/workspace/aiq-artifacts"
+
+    middleware_set = build_deep_research_middleware_set(
+        tool_set=tool_set,
+        source_registry_middleware=registry,
+        artifact_manager=manager,
+    )
+
+    assert not any(isinstance(item, ResearcherExecuteBudgetMiddleware) for item in middleware_set.researcher)
+    writer_guard = next(item for item in middleware_set.writer if isinstance(item, WriterExecuteBudgetMiddleware))
+    assert writer_guard.max_attempts is None
+
+
 def test_middleware_set_omits_writer_publication_runtime_without_artifact_manager():
     """Capture-disabled workflows do not install writer publication or chart middleware."""
     _, _tool_set, middleware_set = _tool_set_and_middleware()
