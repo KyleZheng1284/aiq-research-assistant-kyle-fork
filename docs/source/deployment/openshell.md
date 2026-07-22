@@ -404,7 +404,8 @@ The human-readable contract is:
 - Active jobs are discoverable with `--selector aiq=deep-research`, with a
   distinct `aiq-job-id` gateway label for each job.
 - Attestation succeeds before the execution adapter is exposed.
-- Success, command failure, timeout, and cancellation delete owned sandboxes.
+- Success and command failure delete owned sandboxes. Timeout and cancellation request deletion
+  under a bounded worker wait; a hung provider call cannot guarantee completion before that bound.
 - Cancelling one job does not delete or replace another job's sandbox.
 - `sandbox.attestation` reports sanitized status, policy version, hash, source,
   assurance, and reason code.
@@ -419,11 +420,12 @@ the resource.
 
 ## Artifact Capture
 
-`configs/config_openshell.yml` enables durable sandbox artifact capture. Successful
-`execute` calls checkpoint declared artifacts, and terminal finalization performs
-one idempotent scan before sandbox cleanup. Metadata is stored in the job database;
-bytes use the configured SQL or S3-compatible artifact blob provider. Clients
-receive `artifact.update` metadata with a `content_url`, never raw bytes in SSE.
+`configs/config_openshell.yml` enables durable sandbox artifact capture. Writer manifest
+writes and successful writer chart executions checkpoint declared artifacts; execution by
+other roles does not publish durable artifacts. Terminal finalization performs one
+idempotent scan before sandbox cleanup. Metadata is stored in the job database; bytes use
+the configured SQL or S3-compatible artifact blob provider. Clients receive
+`artifact.update` metadata with a `content_url`, never raw bytes in SSE.
 
 For validation, storage configuration, event payloads, and report rendering, see
 the developer [artifact runtime](https://github.com/NVIDIA-AI-Blueprints/aiq/blob/develop/src/aiq_agent/agents/deep_researcher/sandbox/README.md#artifact-runtime)

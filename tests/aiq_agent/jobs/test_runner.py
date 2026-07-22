@@ -1591,6 +1591,649 @@ class TestCancellationMonitor:
         assert monitor._monitor_task is None
 
 
+class TestWorkflowWatchdog:
+    """Tests for the optional deep-research workflow deadline."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_cancels_active_task_with_stable_reason(self):
+        import asyncio
+
+        from aiq_api.jobs.runner import DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON
+        from aiq_api.jobs.runner import DeepResearchWorkflowTimeoutError
+        from aiq_api.jobs.runner import run_with_cancellation
+
+        class FakeMonitor:
+            is_cancelled = False
+            started = False
+            stopped = False
+
+            def start(self):
+                self.started = True
+
+            def stop(self):
+                self.stopped = True
+
+        cancelled = asyncio.Event()
+
+        async def never_finishes():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        monitor = FakeMonitor()
+        with pytest.raises(DeepResearchWorkflowTimeoutError, match=DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON):
+            await run_with_cancellation(never_finishes(), monitor, timeout_seconds=0.01)
+
+        assert cancelled.is_set()
+        assert monitor.started is True
+        assert monitor.stopped is True
+
+    @pytest.mark.asyncio
+    async def test_timeout_remains_bounded_when_task_resists_cancellation(self):
+        import asyncio
+
+        from aiq_api.jobs.runner import DeepResearchWorkflowTimeoutError
+        from aiq_api.jobs.runner import run_with_cancellation
+
+        class FakeMonitor:
+            is_cancelled = False
+            stopped = False
+
+            def start(self):
+                return None
+
+            def stop(self):
+                self.stopped = True
+
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        async def cancellation_resistant():
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+
+        monitor = FakeMonitor()
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(DeepResearchWorkflowTimeoutError):
+            await run_with_cancellation(
+                cancellation_resistant(),
+                monitor,
+                timeout_seconds=0.01,
+                cancellation_grace_seconds=0.01,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert cancellation_seen.is_set()
+        assert elapsed < 0.25
+        assert monitor.stopped is True
+
+        # Let the deliberately resistant background task exit cleanly.
+        release.set()
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_timeout_records_failure_then_terminates_before_harvest(self):
+        from aiq_api.jobs.runner import DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON
+        from aiq_api.jobs.runner import _handle_workflow_timeout
+
+        order: list[str] = []
+
+        class RecordingRuntime:
+            def finalize_artifacts(self, *, interrupted):
+                assert interrupted is True
+                order.append("harvest")
+                return True
+
+            def finalize(self, *, interrupted):
+                assert interrupted is True
+                order.append("terminate")
+                return True
+
+        def write_timeout_status(*args, **kwargs):
+            order.append("status")
+            return True
+
+        event_store = MagicMock()
+        event_store.job_id = "job-timeout"
+        event_store.store.side_effect = lambda _event: order.append("event")
+
+        with patch(
+            "aiq_api.jobs.runner._write_job_timeout_failure_if_running_sync",
+            side_effect=write_timeout_status,
+        ) as timeout_cas:
+            completed = await _handle_workflow_timeout(
+                event_store,
+                RecordingRuntime(),
+                db_url="sqlite:///unused.db",
+                job_id="job-timeout",
+                teardown_timeout_seconds=0.1,
+            )
+
+        assert completed is True
+        assert order == ["status", "event", "terminate", "harvest"]
+        timeout_cas.assert_called_once_with("sqlite:///unused.db", "job-timeout")
+        stored_event = event_store.store.call_args.args[0]
+        assert stored_event["data"]["reason"] == DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON
+
+    @pytest.mark.asyncio
+    async def test_timeout_hanging_harvest_is_bounded_after_termination(self):
+        import asyncio
+        import threading
+
+        from aiq_api.jobs.runner import _handle_workflow_timeout
+
+        order: list[str] = []
+        harvest_started = threading.Event()
+        release_harvest = threading.Event()
+
+        class BlockingHarvestRuntime:
+            def finalize(self, *, interrupted):
+                assert interrupted is True
+                order.append("terminate")
+                return True
+
+            def finalize_artifacts(self, *, interrupted):
+                assert interrupted is True
+                order.append("harvest")
+                harvest_started.set()
+                release_harvest.wait(timeout=5)
+                return True
+
+        def write_timeout_status(*args, **kwargs):
+            order.append("status")
+            return True
+
+        event_store = MagicMock()
+        event_store.job_id = "job-timeout-harvest"
+        event_store.store.side_effect = lambda _event: order.append("event")
+
+        started = asyncio.get_running_loop().time()
+        try:
+            with patch(
+                "aiq_api.jobs.runner._write_job_timeout_failure_if_running_sync",
+                side_effect=write_timeout_status,
+            ):
+                completed = await _handle_workflow_timeout(
+                    event_store,
+                    BlockingHarvestRuntime(),
+                    db_url="sqlite:///unused.db",
+                    job_id="job-timeout-harvest",
+                    teardown_timeout_seconds=0.01,
+                )
+            elapsed = asyncio.get_running_loop().time() - started
+
+            assert completed is False
+            assert harvest_started.is_set()
+            assert order == ["status", "event", "terminate", "harvest"]
+            assert elapsed < 0.25
+        finally:
+            release_harvest.set()
+            await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_timeout_skips_harvest_while_termination_is_still_running(self):
+        import asyncio
+        import threading
+
+        from aiq_api.jobs.runner import _handle_workflow_timeout
+
+        order: list[str] = []
+        termination_started = threading.Event()
+        release_termination = threading.Event()
+        harvest_started = threading.Event()
+
+        class BlockingTerminationRuntime:
+            def finalize(self, *, interrupted):
+                assert interrupted is True
+                order.append("terminate")
+                termination_started.set()
+                release_termination.wait(timeout=5)
+                return True
+
+            def finalize_artifacts(self, *, interrupted):
+                harvest_started.set()
+                order.append("harvest")
+
+        def write_timeout_status(*args, **kwargs):
+            order.append("status")
+            return True
+
+        event_store = MagicMock()
+        event_store.job_id = "job-timeout-terminate"
+        event_store.store.side_effect = lambda _event: order.append("event")
+
+        started = asyncio.get_running_loop().time()
+        try:
+            with patch(
+                "aiq_api.jobs.runner._write_job_timeout_failure_if_running_sync",
+                side_effect=write_timeout_status,
+            ):
+                completed = await _handle_workflow_timeout(
+                    event_store,
+                    BlockingTerminationRuntime(),
+                    db_url="sqlite:///unused.db",
+                    job_id="job-timeout-terminate",
+                    teardown_timeout_seconds=0.01,
+                )
+            elapsed = asyncio.get_running_loop().time() - started
+
+            assert completed is False
+            assert termination_started.is_set()
+            assert harvest_started.is_set() is False
+            assert order == ["status", "event", "terminate"]
+            assert elapsed < 0.25
+        finally:
+            release_termination.set()
+            await asyncio.sleep(0.05)
+        assert harvest_started.is_set() is False
+
+    @pytest.mark.asyncio
+    async def test_timeout_losing_terminal_cas_suppresses_event_but_still_cleans_up(self):
+        from aiq_api.jobs.runner import _handle_workflow_timeout
+
+        order: list[str] = []
+
+        class RecordingRuntime:
+            def finalize(self, *, interrupted):
+                assert interrupted is True
+                order.append("terminate")
+                return True
+
+            def finalize_artifacts(self, *, interrupted):
+                assert interrupted is True
+                order.append("harvest")
+                return True
+
+        event_store = MagicMock()
+        event_store.job_id = "job-timeout-race"
+        with patch(
+            "aiq_api.jobs.runner._write_job_timeout_failure_if_running_sync",
+            return_value=False,
+        ) as timeout_cas:
+            completed = await _handle_workflow_timeout(
+                event_store,
+                RecordingRuntime(),
+                db_url="sqlite:///unused.db",
+                job_id="job-timeout-race",
+                teardown_timeout_seconds=0.1,
+            )
+
+        assert completed is True
+        timeout_cas.assert_called_once_with("sqlite:///unused.db", "job-timeout-race")
+        event_store.store.assert_not_called()
+        event_store.flush.assert_not_called()
+        assert order == ["terminate", "harvest"]
+
+    def test_timeout_failure_cas_claims_running_job(self, tmp_path):
+        from sqlalchemy.orm import Session
+
+        from aiq_api.jobs.event_store import EventStore
+        from aiq_api.jobs.runner import DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON
+        from aiq_api.jobs.runner import _write_job_timeout_failure_if_running_sync
+        from nat.front_ends.fastapi.async_jobs.job_store import Base
+        from nat.front_ends.fastapi.async_jobs.job_store import JobInfo
+        from nat.front_ends.fastapi.async_jobs.job_store import JobStatus
+
+        db_url = f"sqlite:///{tmp_path / 'timeout-running.db'}"
+        engine = EventStore._get_or_create_sync_engine(db_url)
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            session.add(
+                JobInfo(
+                    job_id="job-running",
+                    status=JobStatus.RUNNING,
+                    config_file=None,
+                    error=None,
+                    output_path=None,
+                    expiry_seconds=3600,
+                    output=None,
+                    is_expired=False,
+                )
+            )
+            session.commit()
+
+        assert _write_job_timeout_failure_if_running_sync(db_url, "job-running") is True
+
+        with Session(engine) as session:
+            job = session.get(JobInfo, "job-running")
+            assert job is not None
+            assert job.status == JobStatus.FAILURE
+            assert job.error == DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON
+
+    @pytest.mark.parametrize("terminal_status", ["interrupted", "failure"])
+    def test_timeout_failure_cas_preserves_existing_terminal_state(self, tmp_path, terminal_status):
+        from sqlalchemy.orm import Session
+
+        from aiq_api.jobs.event_store import EventStore
+        from aiq_api.jobs.runner import _write_job_timeout_failure_if_running_sync
+        from nat.front_ends.fastapi.async_jobs.job_store import Base
+        from nat.front_ends.fastapi.async_jobs.job_store import JobInfo
+
+        db_url = f"sqlite:///{tmp_path / f'timeout-{terminal_status}.db'}"
+        engine = EventStore._get_or_create_sync_engine(db_url)
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            session.add(
+                JobInfo(
+                    job_id="job-terminal",
+                    status=terminal_status,
+                    config_file=None,
+                    error="original terminal reason",
+                    output_path=None,
+                    expiry_seconds=3600,
+                    output=None,
+                    is_expired=False,
+                )
+            )
+            session.commit()
+
+        assert _write_job_timeout_failure_if_running_sync(db_url, "job-terminal") is False
+
+        with Session(engine) as session:
+            job = session.get(JobInfo, "job-terminal")
+            assert job is not None
+            assert job.status == terminal_status
+            assert job.error == "original terminal reason"
+
+    @pytest.mark.asyncio
+    async def test_success_owns_one_sequential_bounded_teardown_when_it_times_out(self, tmp_path):
+        from types import SimpleNamespace
+
+        from aiq_api.jobs.crypto import ContentEncryptionConfig
+        from aiq_api.jobs.runner import run_agent_job
+        from nat.front_ends.fastapi.async_jobs.job_store import JobStatus
+
+        class AsyncContext:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeWorkflowBuilder:
+            _telemetry_exporters = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def get_function_config(self, _name):
+                return SimpleNamespace(
+                    tools=[],
+                    exclude_tools=[],
+                    verbose=False,
+                    workflow_timeout_seconds=None,
+                )
+
+            async def get_tools(self, *, tool_names, wrapper_type):  # noqa: ARG002 - mirrors NAT API
+                return []
+
+        class FakeExporterManager:
+            def start(self, *, context_state):  # noqa: ARG002 - mirrors NAT API
+                return AsyncContext()
+
+        order: list[str] = []
+        runtime = object()
+        agent = SimpleNamespace(deepagents_runtime=runtime)
+        teardown = AsyncMock(side_effect=lambda *_args, **_kwargs: order.append("teardown") or False)
+        write_success = MagicMock(side_effect=lambda *_args: order.append("success") or True)
+        job_store = MagicMock()
+        job_store.update_status = AsyncMock()
+        db_url = f"sqlite:///{tmp_path / 'success-teardown.db'}"
+        config = SimpleNamespace(workflow=None, functions={}, middleware={})
+
+        with patch("nat.front_ends.fastapi.async_jobs.job_store.JobStore", return_value=job_store):
+            with patch("nat.runtime.loader.load_config", return_value=config):
+                with patch(
+                    "nat.builder.workflow_builder.WorkflowBuilder.from_config",
+                    return_value=FakeWorkflowBuilder(),
+                ):
+                    with patch(
+                        "nat.observability.exporter_manager.ExporterManager.from_exporters",
+                        return_value=FakeExporterManager(),
+                    ):
+                        with patch("aiq_api.jobs.runner._load_agent_class", return_value=object):
+                            with patch(
+                                "aiq_api.jobs.runner._create_llm_provider",
+                                AsyncMock(return_value=(object(), object())),
+                            ):
+                                with patch("aiq_api.jobs.runner._create_agent_instance", return_value=agent):
+                                    with patch(
+                                        "aiq_api.jobs.runner._run_agent",
+                                        AsyncMock(return_value="completed report"),
+                                    ):
+                                        with (
+                                            patch("aiq_api.jobs.runner._teardown_sandbox_bounded", teardown),
+                                            patch(
+                                                "aiq_api.jobs.runner._write_job_success_if_running_sync",
+                                                write_success,
+                                            ),
+                                        ):
+                                            await run_agent_job(
+                                                False,
+                                                20,
+                                                "tcp://localhost:8786",
+                                                db_url,
+                                                "config.yml",
+                                                "job-success",
+                                                "input",
+                                                "aiq_agent.agents.deep_researcher.agent.DeepResearcherAgent",
+                                                "deep_research_agent",
+                                                content_encryption_policy=ContentEncryptionConfig(
+                                                    mode="off"
+                                                ).policy_identity,
+                                            )
+
+        teardown.assert_awaited_once_with(runtime, job_id="job-success", interrupted=False)
+        assert order == ["teardown", "success"]
+        assert job_store.update_status.await_args_list == [call("job-success", JobStatus.RUNNING)]
+
+    @pytest.mark.asyncio
+    async def test_terminal_artifact_harvest_is_bounded_when_provider_blocks(self):
+        import asyncio
+        import threading
+
+        from aiq_api.jobs.runner import _harvest_sandbox_artifacts_bounded
+
+        harvest_started = threading.Event()
+        release_harvest = threading.Event()
+
+        class BlockingRuntime:
+            def finalize_artifacts(self, *, interrupted):
+                assert interrupted is False
+                harvest_started.set()
+                release_harvest.wait(timeout=5)
+
+        started = asyncio.get_running_loop().time()
+        try:
+            completed = await _harvest_sandbox_artifacts_bounded(
+                BlockingRuntime(),
+                job_id="job-blocking-harvest",
+                interrupted=False,
+                timeout_seconds=0.01,
+            )
+            elapsed = asyncio.get_running_loop().time() - started
+
+            assert completed is False
+            assert harvest_started.is_set()
+            assert elapsed < 0.25
+        finally:
+            release_harvest.set()
+            await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_user_cancellation_remains_distinct_from_timeout(self):
+        import asyncio
+
+        from aiq_api.jobs.runner import run_with_cancellation
+
+        class FakeMonitor:
+            is_cancelled = False
+            stopped = False
+
+            def start(self):
+                asyncio.get_running_loop().call_later(0.01, setattr, self, "is_cancelled", True)
+
+            def stop(self):
+                self.stopped = True
+
+        monitor = FakeMonitor()
+        with pytest.raises(asyncio.CancelledError, match="cancelled by user"):
+            await run_with_cancellation(asyncio.sleep(60), monitor, timeout_seconds=1)
+
+        assert monitor.stopped is True
+
+    @pytest.mark.asyncio
+    async def test_generic_failure_is_not_reclassified_as_timeout(self):
+        from aiq_api.jobs.runner import run_with_cancellation
+
+        class FakeMonitor:
+            is_cancelled = False
+
+            def start(self):
+                return None
+
+            def stop(self):
+                return None
+
+        async def fail():
+            raise ValueError("ordinary failure")
+
+        with pytest.raises(ValueError, match="ordinary failure"):
+            await run_with_cancellation(fail(), FakeMonitor(), timeout_seconds=1)
+
+    @pytest.mark.asyncio
+    async def test_deadline_wraps_configured_function_middleware(self):
+        import asyncio
+
+        from aiq_api.jobs import runner
+        from aiq_api.jobs.runner import DeepResearchWorkflowTimeoutError
+
+        class FakeAgent:
+            async def run(self, state):
+                return state
+
+        class FakeMonitor:
+            is_cancelled = False
+
+            def start(self):
+                return None
+
+            def stop(self):
+                return None
+
+        middleware_cancelled = asyncio.Event()
+
+        async def slow_middleware(**_kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                middleware_cancelled.set()
+
+        with patch(
+            "aiq_api.jobs.runner._run_with_configured_function_middleware",
+            side_effect=slow_middleware,
+        ):
+            with pytest.raises(DeepResearchWorkflowTimeoutError):
+                await runner._run_agent(
+                    agent=FakeAgent(),
+                    input_text="research",
+                    monitor=FakeMonitor(),
+                    builder=object(),
+                    config=object(),
+                    function_name="deep_research_agent",
+                    function_config=object(),
+                    workflow_timeout_seconds=0.01,
+                )
+
+        assert middleware_cancelled.is_set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scenario", ["timeout", "cancelled", "generic"])
+    async def test_terminal_status_and_event_keep_failure_reasons_distinct(self, scenario, tmp_path):
+        import asyncio
+        from types import SimpleNamespace
+
+        from aiq_api.jobs.crypto import ContentEncryptionConfig
+        from aiq_api.jobs.event_store import EventStore
+        from aiq_api.jobs.runner import DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON
+        from aiq_api.jobs.runner import DeepResearchWorkflowTimeoutError
+        from aiq_api.jobs.runner import run_agent_job
+        from nat.front_ends.fastapi.async_jobs.job_store import JobStatus
+
+        if scenario == "timeout":
+            failure = DeepResearchWorkflowTimeoutError()
+            expected_status = JobStatus.FAILURE
+            expected_error = DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON
+            expected_event = "job.error"
+        elif scenario == "cancelled":
+            failure = asyncio.CancelledError("cancelled by user")
+            expected_status = JobStatus.INTERRUPTED
+            expected_error = "cancelled by user"
+            expected_event = "job.cancelled"
+        else:
+            failure = ValueError("secret provider detail")
+            expected_status = JobStatus.FAILURE
+            expected_error = "job failed (ValueError); check server logs for details"
+            expected_event = "job.error"
+
+        job_id = f"watchdog-{scenario}"
+        db_url = f"sqlite:///{tmp_path / f'{scenario}.db'}"
+        mock_job_store = MagicMock()
+        mock_job_store.update_status = AsyncMock()
+        mock_job_store.get_job = AsyncMock(return_value=SimpleNamespace(status=JobStatus.RUNNING.value))
+        config = SimpleNamespace(workflow=None, functions={}, middleware={})
+
+        with patch("nat.front_ends.fastapi.async_jobs.job_store.JobStore", return_value=mock_job_store):
+            with patch("nat.runtime.loader.load_config", return_value=config):
+                with patch(
+                    "aiq_api.jobs.runner._write_job_timeout_failure_if_running_sync",
+                    return_value=True,
+                ) as timeout_cas:
+                    with patch("aiq_api.jobs.runner._load_agent_class", side_effect=failure):
+                        await run_agent_job(
+                            False,
+                            20,
+                            "tcp://localhost:8786",
+                            db_url,
+                            "config.yml",
+                            job_id,
+                            "input",
+                            "aiq_agent.agents.deep_researcher.agent.DeepResearcherAgent",
+                            "deep_research_agent",
+                            content_encryption_policy=ContentEncryptionConfig(mode="off").policy_identity,
+                        )
+
+        assert mock_job_store.update_status.await_args_list[0] == call(job_id, JobStatus.RUNNING)
+        if scenario == "timeout":
+            assert mock_job_store.update_status.await_args_list == [call(job_id, JobStatus.RUNNING)]
+            timeout_cas.assert_called_once_with(db_url, job_id)
+        else:
+            assert mock_job_store.update_status.await_args_list[-1] == call(
+                job_id,
+                expected_status,
+                error=expected_error,
+            )
+            timeout_cas.assert_not_called()
+        events = EventStore.get_events(db_url, job_id)
+        assert events[-1]["type"] == expected_event
+        if scenario == "timeout":
+            assert events[-1]["data"] == {
+                "error": DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON,
+                "error_type": "DeepResearchWorkflowTimeoutError",
+                "reason": DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON,
+            }
+        elif scenario == "generic":
+            assert events[-1]["data"]["error"] == expected_error
+            assert "secret provider detail" not in str(events[-1])
+
+
 class TestDataSourceModel:
     """Tests for the DataSource Pydantic model."""
 
@@ -1993,6 +2636,7 @@ class TestAsyncJobRunnerAgentFactory:
                 max_research_concurrency=None,
                 max_concurrent_source_tool_calls=None,
                 max_source_tool_batch_size=None,
+                max_writer_execute_attempts=None,
             ):
                 self.llm_provider = llm_provider
                 self.tools = tools
@@ -2009,6 +2653,7 @@ class TestAsyncJobRunnerAgentFactory:
                 self.max_research_concurrency = max_research_concurrency
                 self.max_concurrent_source_tool_calls = max_concurrent_source_tool_calls
                 self.max_source_tool_batch_size = max_source_tool_batch_size
+                self.max_writer_execute_attempts = max_writer_execute_attempts
 
         fn_config = DeepResearchAgentConfig(
             orchestrator_llm="llm",
@@ -2020,6 +2665,7 @@ class TestAsyncJobRunnerAgentFactory:
             max_research_concurrency=2,
             max_concurrent_source_tool_calls=3,
             max_source_tool_batch_size=4,
+            max_writer_execute_attempts=5,
         )
 
         agent = _create_agent_instance(
@@ -2045,6 +2691,7 @@ class TestAsyncJobRunnerAgentFactory:
         assert agent.max_research_concurrency == 2
         assert agent.max_concurrent_source_tool_calls == 3
         assert agent.max_source_tool_batch_size == 4
+        assert agent.max_writer_execute_attempts == 5
 
     def test_create_agent_instance_allows_non_deep_agent_to_reuse_deep_config(self):
         """Async workers should not treat shared DeepResearchAgentConfig as a constructor contract."""
@@ -2438,6 +3085,7 @@ class TestAsyncJobRunnerAgentFactory:
                 max_research_concurrency=None,
                 max_concurrent_source_tool_calls=None,
                 max_source_tool_batch_size=None,
+                max_writer_execute_attempts=None,
             ):
                 raise TypeError("internal constructor failure")
 
@@ -2570,9 +3218,8 @@ class TestTerminalTeardown:
     def test_harvest_persists_artifacts_without_releasing_sandbox(self):
         from aiq_api.jobs.runner import _harvest_sandbox_artifacts
 
-        # Runs before the terminal status: artifacts must be persisted, but the
-        # unbounded close()/terminate() must NOT run here (deferred to finally),
-        # so a hanging SDK cleanup cannot strand a finished job in RUNNING.
+        # Artifact-only callers must not implicitly release the provider; terminal
+        # paths explicitly choose the required harvest/release ordering.
         runtime = MagicMock(spec=["close", "terminate", "finalize_artifacts"])
         _harvest_sandbox_artifacts(runtime, job_id="job-1", interrupted=False)
 

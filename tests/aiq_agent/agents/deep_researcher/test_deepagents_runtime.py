@@ -61,6 +61,7 @@ def test_openshell_workflow_only_diverges_for_sandbox_wiring() -> None:
     openshell_functions["deep_research_agent"] = openshell_functions["deep_research_agent"].copy()
     openshell_functions["deep_research_agent"].pop("skills")
     openshell_functions["deep_research_agent"].pop("sandbox")
+    openshell_functions["deep_research_agent"].pop("workflow_timeout_seconds")
 
     assert openshell["general"] == standard["general"]
     assert openshell["llms"] == standard["llms"]
@@ -253,10 +254,12 @@ class TestDeepAgentsRuntimeRouting:
 
         assert [skill["name"] for skill in top_level_skills] == []
         assert [skill["name"] for skill in synthesis_skills] == [
+            "chart-generation",
             "long-form-report-writer",
             "prediction-report-writer",
         ]
         assert [skill["path"] for skill in synthesis_skills] == [
+            "/skills/synthesis/chart-generation/SKILL.md",
             "/skills/synthesis/long-form-report-writer/SKILL.md",
             "/skills/synthesis/prediction-report-writer/SKILL.md",
         ]

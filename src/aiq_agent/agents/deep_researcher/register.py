@@ -44,6 +44,7 @@ from nat.data_models.function import FunctionBaseConfig
 from .agent import DEFAULT_MAX_CONCURRENT_SOURCE_TOOL_CALLS
 from .agent import DEFAULT_MAX_RESEARCH_CONCURRENCY
 from .agent import DEFAULT_MAX_SOURCE_TOOL_BATCH_SIZE
+from .agent import DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS
 from .agent import DeepResearcherAgent
 from .deepagents_runtime import DeepResearchSandboxConfig
 from .deepagents_runtime import DeepResearchSkillsConfig
@@ -107,6 +108,17 @@ class DeepResearchAgentConfig(FunctionBaseConfig, name="deep_research_agent"):
         default=DEFAULT_MAX_SOURCE_TOOL_BATCH_SIZE,
         ge=1,
         description="Maximum concrete inputs accepted by batch-capable source tool wrappers.",
+    )
+    max_writer_execute_attempts: int = Field(
+        default=DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS,
+        ge=1,
+        description="Hard limit on writer-side chart execution attempts, including generic retries.",
+    )
+    workflow_timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Optional wall-clock deadline for async deep-research execution; disabled by default.",
     )
 
     @field_validator("skills", mode="before")
@@ -233,6 +245,7 @@ async def deep_research_agent(config: DeepResearchAgentConfig, builder: Builder)
         max_research_concurrency=config.max_research_concurrency,
         max_concurrent_source_tool_calls=config.max_concurrent_source_tool_calls,
         max_source_tool_batch_size=config.max_source_tool_batch_size,
+        max_writer_execute_attempts=config.max_writer_execute_attempts,
     )
 
     async def _run(state: DeepResearchAgentState) -> DeepResearchAgentState:
@@ -268,6 +281,7 @@ async def deep_research_agent(config: DeepResearchAgentConfig, builder: Builder)
                     max_research_concurrency=config.max_research_concurrency,
                     max_concurrent_source_tool_calls=config.max_concurrent_source_tool_calls,
                     max_source_tool_batch_size=config.max_source_tool_batch_size,
+                    max_writer_execute_attempts=config.max_writer_execute_attempts,
                 )
                 owns_active_agent = True
 

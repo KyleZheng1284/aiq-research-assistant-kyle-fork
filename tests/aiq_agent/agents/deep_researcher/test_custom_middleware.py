@@ -15,7 +15,12 @@
 
 """Tests for custom middleware."""
 
+import asyncio
+import json
 import logging
+from contextvars import ContextVar
+from hashlib import sha256
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -25,12 +30,14 @@ from deepagents.backends import CompositeBackend
 from deepagents.backends import StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents import create_agent
+from langchain.agents.middleware import ToolRetryMiddleware
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.messages import HumanMessage
 from langchain_core.messages import SystemMessage
 from langchain_core.messages import ToolMessage
 
+from aiq_agent.agents.deep_researcher.custom_middleware import ArtifactDirectoryOwnershipGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ArtifactHarvestMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ExecuteTimeoutClampMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import FilesystemToolCallGuardMiddleware
@@ -44,6 +51,7 @@ from aiq_agent.agents.deep_researcher.custom_middleware import SourceRoutingGuar
 from aiq_agent.agents.deep_researcher.custom_middleware import TodoSuppressionMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ToolNameSanitizationMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ToolVisibilityMiddleware
+from aiq_agent.agents.deep_researcher.custom_middleware import WriterExecuteBudgetMiddleware
 from aiq_agent.agents.deep_researcher.tools.source_registry import build_get_verified_sources_tool
 from aiq_agent.common.citation_verification import SourceEntry
 from aiq_agent.common.data_source_registry import populate_from_config
@@ -1149,6 +1157,82 @@ class TestSourceRegistryMiddleware:
         assert result.content == content
 
 
+class TestArtifactDirectoryOwnershipGuardMiddleware:
+    """Non-writer roles cannot mutate the durable publication directory."""
+
+    @staticmethod
+    def _request(tool_name: str, args: dict) -> MagicMock:
+        request = MagicMock()
+        request.tool_call = {"name": tool_name, "id": "ownership-1", "args": args}
+        return request
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/sandbox/job/tmp/../aiq-artifacts/revenue.csv",
+            "aiq-artifacts/revenue.csv",
+            "./aiq-artifacts/revenue.csv",
+        ],
+    )
+    async def test_artifact_write_is_blocked_before_handler(self, tool_name: str, path: str) -> None:
+        middleware = ArtifactDirectoryOwnershipGuardMiddleware("/sandbox/job/aiq-artifacts")
+        handler = AsyncMock(return_value="physical write")
+        request = self._request(
+            tool_name,
+            {"file_path": path, "content": "data"},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result.status == "error"
+        assert "durable_artifact_publication_writer_only" in result.content
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python chart.py /sandbox/job/aiq-artifacts",
+            "python chart.py --output=/sandbox/job/aiq-artifacts/revenue.png",
+            'python -c \'open("/sandbox/job/aiq-artifacts/revenue.csv", "w")\'',
+            "touch aiq-artifacts/revenue.csv",
+            "touch ./aiq-artifacts/revenue.csv",
+        ],
+    )
+    async def test_artifact_execute_is_blocked_before_handler(self, command: str) -> None:
+        middleware = ArtifactDirectoryOwnershipGuardMiddleware("/sandbox/job/aiq-artifacts")
+        handler = AsyncMock(return_value="physical execute")
+        request = self._request("execute", {"command": command})
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result.status == "error"
+        assert "durable_artifact_publication_writer_only" in result.content
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tool_name", "args"),
+        [
+            ("write_file", {"file_path": "/shared/research_note.json", "content": "{}"}),
+            ("edit_file", {"file_path": "/sandbox/job/analysis.py", "old_string": "x", "new_string": "y"}),
+            ("execute", {"command": "python /sandbox/job/analysis.py /sandbox/job/input.csv"}),
+            ("read_file", {"file_path": "/sandbox/job/aiq-artifacts/revenue.csv"}),
+        ],
+    )
+    async def test_unrelated_or_read_only_operations_pass_through(self, tool_name: str, args: dict) -> None:
+        middleware = ArtifactDirectoryOwnershipGuardMiddleware("/sandbox/job/aiq-artifacts")
+        handler = AsyncMock(return_value="allowed")
+        request = self._request(tool_name, args)
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "allowed"
+        handler.assert_awaited_once_with(request)
+
+
 class TestArtifactHarvestMiddleware:
     """Checkpoint harvesting runs only after successful execute tool calls."""
 
@@ -1171,6 +1255,36 @@ class TestArtifactHarvestMiddleware:
         middleware = ArtifactHarvestMiddleware(manager)
         request = MagicMock()
         request.tool_call = {"name": "read_file"}
+
+        await middleware.awrap_tool_call(request, AsyncMock(return_value="ok"))
+
+        manager.harvest_after_execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_artifact_manifest_write_checkpoints(self) -> None:
+        manager = MagicMock()
+        manager.artifact_dir = "/shared/aiq-artifacts"
+        middleware = ArtifactHarvestMiddleware(manager)
+        request = MagicMock()
+        request.tool_call = {
+            "name": "write_file",
+            "args": {"file_path": "/shared/aiq-artifacts/manifest.json", "content": "{}"},
+        }
+
+        await middleware.awrap_tool_call(request, AsyncMock(return_value="ok"))
+
+        manager.harvest_after_execute.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_non_manifest_artifact_write_does_not_checkpoint(self) -> None:
+        manager = MagicMock()
+        manager.artifact_dir = "/shared/aiq-artifacts"
+        middleware = ArtifactHarvestMiddleware(manager)
+        request = MagicMock()
+        request.tool_call = {
+            "name": "write_file",
+            "args": {"file_path": "/shared/aiq-artifacts/data.csv", "content": "a\n1\n"},
+        }
 
         await middleware.awrap_tool_call(request, AsyncMock(return_value="ok"))
 
@@ -1200,6 +1314,27 @@ class TestArtifactHarvestMiddleware:
             AsyncMock(return_value=ToolMessage(content="failed", tool_call_id="tc1", status="error")),
         )
 
+        manager.harvest_after_execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_nonzero_exit_does_not_harvest(self) -> None:
+        manager = MagicMock()
+        middleware = ArtifactHarvestMiddleware(manager)
+        request = MagicMock()
+        request.tool_call = {"name": "execute"}
+
+        result = await middleware.awrap_tool_call(
+            request,
+            AsyncMock(
+                return_value=ToolMessage(
+                    content="chart failed\n[Command failed with exit code 2]",
+                    tool_call_id="tc1",
+                    status="success",
+                )
+            ),
+        )
+
+        assert result.status == "success"
         manager.harvest_after_execute.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1233,6 +1368,527 @@ class TestArtifactHarvestMiddleware:
 
         assert "artifact://capex_by_quarter.png" in result.content
         assert "capex_by_quarter.csv (downloadable; not marked inline)" in result.content
+
+    @pytest.mark.asyncio
+    async def test_parallel_checkpoints_keep_artifacts_and_rejections_atomic(self) -> None:
+        harvest_key: ContextVar[str] = ContextVar("harvest_key")
+        barrier = Barrier(2)
+
+        class _AtomicManager:
+            artifact_dir = "/shared/aiq-artifacts"
+
+            def harvest_after_execute_with_diagnostics(self):
+                key = harvest_key.get()
+                barrier.wait(timeout=5)
+                if key == "accepted":
+                    return SimpleNamespace(
+                        artifacts=(SimpleNamespace(filename="accepted.csv", inline=False),),
+                        rejections=(),
+                    )
+                return SimpleNamespace(
+                    artifacts=(),
+                    rejections=(("rejected.csv", "canonical_dataset_digest_mismatch"),),
+                )
+
+            def harvest_after_execute(self):
+                raise AssertionError("legacy non-atomic harvest must not be called")
+
+            def last_harvest_rejections(self):
+                raise AssertionError("diagnostics must come from the same atomic harvest")
+
+        middleware = ArtifactHarvestMiddleware(_AtomicManager())
+
+        async def invoke(key: str) -> ToolMessage:
+            request = MagicMock()
+            request.tool_call = {"name": "execute"}
+
+            async def handler(_request):
+                harvest_key.set(key)
+                return ToolMessage(content=f"{key} completed", tool_call_id=key)
+
+            return await middleware.awrap_tool_call(request, handler)
+
+        accepted, rejected = await asyncio.wait_for(
+            asyncio.gather(invoke("accepted"), invoke("rejected")),
+            timeout=10,
+        )
+
+        assert "accepted.csv (downloadable; not marked inline)" in accepted.content
+        assert "canonical_dataset_digest_mismatch" not in accepted.content
+        assert "rejected.csv: canonical_dataset_digest_mismatch" in rejected.content
+        assert "accepted.csv" not in rejected.content
+
+
+class TestWriterExecuteBudgetMiddleware:
+    """Writer execution is baseline-gated and physically bounded."""
+
+    _CSV_TEXT = "quarter,revenue\nQ1,10\n"
+    _CSV_DIGEST = sha256(_CSV_TEXT.encode("utf-8")).hexdigest()
+    _MARKDOWN_TABLE = "| Quarter | Revenue |\n| --- | ---: |\n| Q1 | 10 |"
+
+    @staticmethod
+    def _request(
+        tool_name: str = "execute",
+        *,
+        files: dict | None = None,
+        args: dict | None = None,
+    ) -> MagicMock:
+        request = MagicMock()
+        request.tool = None
+        request.state = {"files": files or {}}
+        request.tool_call = {
+            "name": tool_name,
+            "id": "tc1",
+            "args": args if args is not None else {"command": "python chart.py /shared/aiq-artifacts"},
+        }
+        return request
+
+    @classmethod
+    def _manager(cls, *, published: bool = True) -> MagicMock:
+        manager = MagicMock()
+        manager.artifact_dir = "/shared/aiq-artifacts"
+        manager.has_published_canonical_dataset.return_value = published
+        manager.published_canonical_digests.return_value = frozenset({cls._CSV_DIGEST}) if published else frozenset()
+        return manager
+
+    @classmethod
+    def _research_note(cls) -> dict:
+        return {
+            "query_topic": "Quarterly revenue",
+            "target_components": ["revenue_table"],
+            "summary": "Revenue evidence.",
+            "findings": [],
+            "gaps": [],
+            "sources": [
+                {
+                    "id": 1,
+                    "title": "Quarterly results",
+                    "source_type": "url",
+                    "locator": "https://example.test/results",
+                }
+            ],
+            "narrative_notes": "Canonical quarterly values.",
+            "language": "English",
+            "quantitative_datasets": [
+                {
+                    "dataset_id": "quarterly_revenue",
+                    "title": "Quarterly revenue",
+                    "csv_text": cls._CSV_TEXT,
+                    "markdown_table": cls._MARKDOWN_TABLE,
+                    "summary": "Revenue was 10.",
+                    "source_ids": [1],
+                    "caveats": [],
+                    "csv_sha256": "f" * 64,
+                }
+            ],
+        }
+
+    @classmethod
+    def _baseline(cls, *, table: str | None = None) -> dict:
+        return {
+            "/shared/output.md": {
+                "content": f"# Baseline\n\n{table if table is not None else cls._MARKDOWN_TABLE}",
+            },
+            "/shared/research_note_01_quarterly.json": {"content": json.dumps(cls._research_note())},
+        }
+
+    @pytest.mark.asyncio
+    async def test_execute_requires_report_baseline(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager())
+        handler = AsyncMock(return_value="ok")
+
+        result = await middleware.awrap_tool_call(self._request(), handler)
+
+        assert result.status == "error"
+        assert "writer_report_baseline_missing" in result.content
+        assert middleware.attempts == 0
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_execute_requires_published_canonical_csv(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="ok")
+
+        result = await middleware.awrap_tool_call(self._request(files=self._baseline()), handler)
+
+        assert result.status == "error"
+        assert "writer_canonical_dataset_unpublished" in result.content
+        assert middleware.attempts == 0
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+    async def test_artifact_publication_write_requires_valid_canonical_state(self, tool_name: str) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="physically wrote artifact")
+        request = self._request(
+            tool_name,
+            args={"file_path": "/shared/aiq-artifacts/revenue.csv", "content": "quarter,revenue\nQ1,10\n"},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result.status == "error"
+        assert result.name == tool_name
+        assert "writer_canonical_dataset_missing" in result.content
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_invalid_research_note_cannot_open_artifact_publication_gate(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="physically wrote artifact")
+        invalid_note = self._research_note()
+        invalid_note["quantitative_datasets"][0]["csv_text"] = "quarter,revenue\n"
+        files = {
+            "/shared/research_note_01_invalid.json": {"content": json.dumps(invalid_note)},
+        }
+        request = self._request(
+            "write_file",
+            files=files,
+            args={"file_path": "/shared/aiq-artifacts/revenue.csv", "content": self._CSV_TEXT},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert "writer_canonical_dataset_missing" in result.content
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_report_write_outside_artifact_directory_needs_no_canonical_state(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="report written")
+        request = self._request(
+            "write_file",
+            args={"file_path": "/shared/output.md", "content": "# Text fallback"},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "report written"
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_valid_canonical_state_allows_artifact_publication_write(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="artifact written")
+        request = self._request(
+            "write_file",
+            files=self._baseline(),
+            args={"file_path": "/shared/aiq-artifacts/quarterly_revenue.csv", "content": self._CSV_TEXT},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "artifact written"
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_artifact_publication_requires_output_baseline(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="artifact written")
+        files = {
+            "/shared/research_note_01_quarterly.json": {"content": json.dumps(self._research_note())},
+        }
+        request = self._request(
+            "write_file",
+            files=files,
+            args={"file_path": "/shared/aiq-artifacts/quarterly_revenue.csv", "content": self._CSV_TEXT},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert "writer_report_baseline_missing" in result.content
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_artifact_publication_requires_matching_canonical_table(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="artifact written")
+        unrelated_table = "| Label | Value |\n| --- | ---: |\n| A | 1 |"
+        request = self._request(
+            "write_file",
+            files=self._baseline(table=unrelated_table),
+            args={"file_path": "/shared/aiq-artifacts/quarterly_revenue.csv", "content": self._CSV_TEXT},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert "writer_canonical_table_missing" in result.content
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_csv_publication_does_not_require_unrelated_dataset_table(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="artifact written")
+        note = self._research_note()
+        note["quantitative_datasets"].append(
+            {
+                "dataset_id": "unrelated_costs",
+                "title": "Unrelated costs",
+                "csv_text": "quarter,cost\nQ1,5\n",
+                "markdown_table": "| Quarter | Cost |\n| --- | ---: |\n| Q1 | 5 |",
+                "summary": "Costs were 5.",
+                "source_ids": [1],
+                "caveats": [],
+            }
+        )
+        files = {
+            "/shared/output.md": {"content": f"# Baseline\n\n{self._MARKDOWN_TABLE}"},
+            "/shared/research_note_01_quarterly.json": {"content": json.dumps(note)},
+        }
+        request = self._request(
+            "write_file",
+            files=files,
+            args={"file_path": "/shared/aiq-artifacts/quarterly_revenue.csv", "content": self._CSV_TEXT},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "artifact written"
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_manifest_publication_resolves_declared_canonical_digest(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="manifest written")
+        manifest = json.dumps(
+            {
+                "version": 1,
+                "artifacts": [
+                    {
+                        "path": "/shared/aiq-artifacts/quarterly_revenue.csv",
+                        "kind": "dataset",
+                        "expected_sha256": self._CSV_DIGEST,
+                    }
+                ],
+            }
+        )
+        request = self._request(
+            "write_file",
+            files=self._baseline(),
+            args={"file_path": "/shared/aiq-artifacts/manifest.json", "content": manifest},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "manifest written"
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_manifest_publication_fails_closed_for_unregistered_canonical_intent(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="manifest written")
+        manifest = json.dumps(
+            {
+                "version": 1,
+                "artifacts": [
+                    {
+                        "path": "/shared/aiq-artifacts/unknown.csv",
+                        "kind": "dataset",
+                        "expected_sha256": "a" * 64,
+                    }
+                ],
+            }
+        )
+        request = self._request(
+            "write_file",
+            files=self._baseline(),
+            args={"file_path": "/shared/aiq-artifacts/manifest.json", "content": manifest},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert "writer_canonical_dataset_missing" in result.content
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unrelated_writer_execute_passes_without_consuming_chart_budget(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager())
+        handler = AsyncMock(return_value="analysis complete")
+        request = self._request(
+            files={},
+            args={"command": "python /shared/analyze.py /shared/input.csv"},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "analysis complete"
+        assert middleware.attempts == 0
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_relative_artifact_execute_consumes_chart_budget(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager())
+        handler = AsyncMock(return_value="chart complete")
+        request = self._request(
+            files=self._baseline(),
+            args={"command": "python chart.py ./aiq-artifacts"},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "chart complete"
+        assert middleware.attempts == 1
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_exhausted_chart_budget_does_not_block_unrelated_writer_execute(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=1, artifact_manager=self._manager())
+        await middleware.awrap_tool_call(
+            self._request(files=self._baseline()),
+            AsyncMock(return_value="chart complete"),
+        )
+        handler = AsyncMock(return_value="analysis complete")
+        request = self._request(args={"command": "python /shared/analyze.py /shared/input.csv"})
+
+        result = await middleware.awrap_tool_call(request, handler)
+        after_model = await middleware.aafter_model(
+            {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "execute",
+                                "id": "analysis-1",
+                                "args": {"command": "python /shared/analyze.py /shared/input.csv"},
+                            }
+                        ],
+                    )
+                ]
+            },
+            runtime=None,
+        )
+
+        assert result == "analysis complete"
+        assert middleware.attempts == 1
+        assert after_model is None
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_execute_without_canonical_state_never_reaches_sandbox(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager())
+        handler = AsyncMock(return_value="physically executed chart")
+        files = {
+            "/shared/output.md": {
+                "content": "# Baseline\n\n| Label | Value |\n| --- | ---: |\n| A | 1 |",
+            }
+        }
+
+        result = await middleware.awrap_tool_call(self._request(files=files), handler)
+
+        assert "writer_canonical_table_missing" in result.content
+        assert middleware.attempts == 0
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unrelated_markdown_table_does_not_open_execute_gate(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager())
+        handler = AsyncMock(return_value="ok")
+        unrelated_table = "| Label | Value |\n| --- | ---: |\n| A | 1 |"
+
+        result = await middleware.awrap_tool_call(
+            self._request(files=self._baseline(table=unrelated_table)),
+            handler,
+        )
+
+        assert result.status == "error"
+        assert "writer_canonical_table_missing" in result.content
+        assert middleware.attempts == 0
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exact_persisted_canonical_table_opens_execute_gate(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager())
+        handler = AsyncMock(return_value="ok")
+        request = self._request(files=self._baseline())
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "ok"
+        assert middleware.attempts == 1
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_generic_retries_cannot_reach_fourth_physical_execute(self) -> None:
+        manager = self._manager()
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=manager)
+        retry = ToolRetryMiddleware(max_retries=3, initial_delay=0, backoff_factor=0)
+        request = self._request(files=self._baseline())
+        physical = AsyncMock(side_effect=RuntimeError("chart failed"))
+
+        result = await retry.awrap_tool_call(
+            request,
+            lambda current_request: middleware.awrap_tool_call(current_request, physical),
+        )
+
+        assert result.status == "error"
+        assert "writer_execute_budget_exhausted" in result.content
+        assert middleware.attempts == 3
+        assert physical.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_non_execute_calls_do_not_consume_budget(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=1)
+        handler = AsyncMock(return_value="ok")
+
+        result = await middleware.awrap_tool_call(self._request("write_file"), handler)
+
+        assert result == "ok"
+        assert middleware.attempts == 0
+
+    @pytest.mark.asyncio
+    async def test_post_exhaustion_execute_ends_with_stable_reason(self) -> None:
+        manager = self._manager()
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=1, artifact_manager=manager)
+        request = self._request(files=self._baseline())
+        await middleware.awrap_tool_call(request, AsyncMock(return_value="ok"))
+        state = {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "execute",
+                            "id": "tc2",
+                            "args": {"command": "python chart.py /shared/aiq-artifacts"},
+                        }
+                    ],
+                )
+            ]
+        }
+
+        update = await middleware.aafter_model(state, runtime=None)
+
+        assert update["jump_to"] == "end"
+        assert any(
+            isinstance(message, ToolMessage) and "writer_execute_budget_exhausted" in message.content
+            for message in update["messages"]
+        )
+        assert update["messages"][-1].content.startswith("Wrote /shared/output.md")
+
+    @pytest.mark.asyncio
+    async def test_third_nonzero_exit_returns_stable_exhaustion_without_fourth_execution(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager())
+        request = self._request(files=self._baseline())
+        physical = AsyncMock(
+            return_value=ToolMessage(
+                content="matplotlib error\n[Command failed with exit code 1]",
+                tool_call_id="tc1",
+                status="success",
+            )
+        )
+
+        first = await middleware.awrap_tool_call(request, physical)
+        second = await middleware.awrap_tool_call(request, physical)
+        third = await middleware.awrap_tool_call(request, physical)
+        fourth = await middleware.awrap_tool_call(request, physical)
+
+        assert first.status == second.status == "error"
+        assert "writer_execute_budget_exhausted" in third.content
+        assert "writer_execute_budget_exhausted" in fourth.content
+        assert middleware.attempts == 3
+        assert physical.await_count == 3
 
 
 class _RecordingBackend:

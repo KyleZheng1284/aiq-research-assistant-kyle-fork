@@ -26,6 +26,8 @@ from uuid import uuid4
 import pytest
 from deepagents.backends.protocol import FileUploadResponse
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import ModelRetryMiddleware
+from langchain.agents.structured_output import ToolStrategy
 from langchain_core.messages import AIMessage
 from langchain_core.messages import HumanMessage
 from langchain_core.messages import ToolMessage
@@ -70,6 +72,64 @@ def committed_tracker(markdown: str) -> FinalReportCommitTracker:
     tracker = FinalReportCommitTracker()
     tracker.record(markdown)
     return tracker
+
+
+def build_quantitative_note(
+    *,
+    topic: str,
+    dataset_prefix: str,
+    dataset_count: int = 1,
+    finding_evidence: str = "Validated quantitative evidence.",
+    relevance_score: int | None = None,
+) -> ResearchNotes:
+    """Build compact validated quantitative notes for report-fallback tests."""
+    datasets = []
+    for index in range(dataset_count):
+        label = f"{dataset_prefix}-{index}"
+        datasets.append(
+            {
+                "dataset_id": f"{dataset_prefix}_{index}",
+                "title": f"{topic} dataset {index}",
+                "csv_text": f"label,value\n{label},{index + 1}\n",
+                "markdown_table": f"| Label | Value |\n| --- | ---: |\n| {label} | {index + 1} |",
+                "summary": f"The validated value is {index + 1}.",
+                "source_ids": [1],
+                "caveats": [],
+            }
+        )
+    payload = {
+        "query_topic": topic,
+        "target_components": [dataset_prefix],
+        "summary": f"Summary for {topic}.",
+        "findings": [
+            {
+                "claim": f"Finding for {topic}.",
+                "evidence": finding_evidence,
+                "source_ids": [1],
+                "confidence": "high",
+                "caveats": [],
+            }
+        ],
+        "gaps": [],
+        "sources": [
+            {
+                "id": 1,
+                "title": f"Source for {topic}",
+                "source_type": "url",
+                "locator": f"https://example.test/{dataset_prefix}",
+            }
+        ],
+        "narrative_notes": f"Narrative for {topic}.",
+        "language": "English",
+        "quantitative_datasets": datasets,
+    }
+    if relevance_score is not None:
+        payload["evidence_judgment"] = {
+            "relevance_score": relevance_score,
+            "confidence": "high",
+            "rationale": "Deterministic test relevance.",
+        }
+    return ResearchNotes.model_validate(payload)
 
 
 @pytest.fixture(autouse=True)
@@ -223,6 +283,7 @@ class TestDeepResearcherAgent:
                 max_research_concurrency=2,
                 max_concurrent_source_tool_calls=3,
                 max_source_tool_batch_size=4,
+                max_writer_execute_attempts=2,
             )
 
             assert agent.verbose is False
@@ -230,6 +291,7 @@ class TestDeepResearcherAgent:
             assert agent.max_research_concurrency == 2
             assert agent.max_concurrent_source_tool_calls == 3
             assert agent.max_source_tool_batch_size == 4
+            assert agent.max_writer_execute_attempts == 2
             assert agent.domain_catalog_path == "configs/domain_catalogs/deep_research_domain_catalog.yml"
             assert agent.enable_source_router is False
             assert agent.enable_citation_verification is False
@@ -261,6 +323,8 @@ class TestDeepResearcherAgent:
             max_research_concurrency=2,
             max_concurrent_source_tool_calls=3,
             max_source_tool_batch_size=4,
+            max_writer_execute_attempts=2,
+            workflow_timeout_seconds=120,
             domain_catalog_path="configs/domain_catalogs/deep_research_domain_catalog.yml",
             enable_source_router=False,
         )
@@ -274,11 +338,28 @@ class TestDeepResearcherAgent:
         assert config.max_research_concurrency == 2
         assert config.max_concurrent_source_tool_calls == 3
         assert config.max_source_tool_batch_size == 4
+        assert config.max_writer_execute_attempts == 2
+        assert config.workflow_timeout_seconds == 120
         assert config.enable_source_router is False
         assert config.sandbox is not None
         assert config.sandbox.provider == "openshell"
         assert config.sandbox.app_name == "custom-aiq"
         assert config.sandbox.packages == ("matplotlib", "pillow")
+
+    def test_convergence_limits_are_bounded_and_watchdog_defaults_disabled(self):
+        """The library stays opt-in for deadlines while writer execution is bounded by default."""
+        from pydantic import ValidationError
+
+        from aiq_agent.agents.deep_researcher.register import DeepResearchAgentConfig
+
+        config = DeepResearchAgentConfig(orchestrator_llm="llm")
+
+        assert config.max_writer_execute_attempts == 3
+        assert config.workflow_timeout_seconds is None
+        with pytest.raises(ValidationError):
+            DeepResearchAgentConfig(orchestrator_llm="llm", max_writer_execute_attempts=0)
+        with pytest.raises(ValidationError):
+            DeepResearchAgentConfig(orchestrator_llm="llm", workflow_timeout_seconds=float("inf"))
 
     def test_register_resolves_named_runtime_config_refs(self):
         """Deep research agent config can reference config-only skills and sandbox functions."""
@@ -427,7 +508,8 @@ class TestDeepResearcherAgent:
             assert create_researcher.call_count == 1
             researcher_kwargs = create_researcher.call_args.kwargs
             kwargs = create.call_args.kwargs
-            assert researcher_kwargs["response_format"] is ResearchNotes
+            assert isinstance(researcher_kwargs["response_format"], ToolStrategy)
+            assert researcher_kwargs["response_format"].schema is ResearchNotes
             researcher_middleware = researcher_kwargs["middleware"]
             assert researcher_middleware is not agent.researcher_middleware
             assert not any(m.__class__.__name__ == "TodoListMiddleware" for m in researcher_middleware)
@@ -435,7 +517,12 @@ class TestDeepResearcherAgent:
             assert researcher_skills == []
             assert any(m.__class__.__name__ == "FilesystemMiddleware" for m in researcher_middleware)
             assert any(m.__class__.__name__ == "PatchToolCallsMiddleware" for m in researcher_middleware)
-            assert all(m in researcher_middleware for m in agent.researcher_middleware)
+            assert all(
+                m in researcher_middleware
+                for m in agent.researcher_middleware
+                if not isinstance(m, ModelRetryMiddleware)
+            )
+            assert any(isinstance(m, ModelRetryMiddleware) and m.on_failure == "error" for m in researcher_middleware)
             assert "skills" not in researcher_kwargs
             assert "backend" not in researcher_kwargs
             assert all(m in kwargs["middleware"] for m in agent.orchestrator_middleware)
@@ -496,14 +583,20 @@ class TestDeepResearcherAgent:
             assert create.call_count == 1
             assert create_researcher.call_count == 1
             researcher_kwargs = create_researcher.call_args.kwargs
-            assert researcher_kwargs["response_format"] is ResearchNotes
+            assert isinstance(researcher_kwargs["response_format"], ToolStrategy)
+            assert researcher_kwargs["response_format"].schema is ResearchNotes
             researcher_middleware = researcher_kwargs["middleware"]
             assert researcher_middleware is not agent.researcher_middleware
             assert not any(m.__class__.__name__ == "TodoListMiddleware" for m in researcher_middleware)
             assert not any(m.__class__.__name__ == "SkillsMiddleware" for m in researcher_middleware)
             assert any(m.__class__.__name__ == "FilesystemMiddleware" for m in researcher_middleware)
             assert any(m.__class__.__name__ == "PatchToolCallsMiddleware" for m in researcher_middleware)
-            assert all(m in researcher_middleware for m in agent.researcher_middleware)
+            assert all(
+                m in researcher_middleware
+                for m in agent.researcher_middleware
+                if not isinstance(m, ModelRetryMiddleware)
+            )
+            assert any(isinstance(m, ModelRetryMiddleware) and m.on_failure == "error" for m in researcher_middleware)
             assert all(m in create.call_args.kwargs["middleware"] for m in agent.orchestrator_middleware)
             assert any(
                 m.__class__.__name__ == "ToolVisibilityMiddleware" for m in create.call_args.kwargs["middleware"]
@@ -1469,6 +1562,278 @@ class TestFinalMarkdownExtraction:
             )
 
             assert output is None
+
+    def test_extract_final_markdown_builds_quantitative_fallback_from_validated_notes(
+        self,
+        mock_llm_provider,
+        real_tool,
+    ):
+        """Validated quantitative notes outrank inline prose and preserve the canonical table."""
+        note = ResearchNotes.model_validate(
+            {
+                "query_topic": "Quarterly revenue",
+                "target_components": ["revenue_table"],
+                "summary": "Revenue increased between the two quarters.",
+                "findings": [
+                    {
+                        "claim": "Q2 revenue exceeded Q1 revenue.",
+                        "evidence": "The canonical dataset contains 10 and 12.",
+                        "source_ids": [1],
+                        "confidence": "high",
+                        "caveats": [],
+                    }
+                ],
+                "gaps": [],
+                "sources": [
+                    {
+                        "id": 1,
+                        "title": "Quarterly filing",
+                        "source_type": "url",
+                        "locator": "https://example.com/filing",
+                    }
+                ],
+                "narrative_notes": "The figures are directly comparable.",
+                "language": "English",
+                "quantitative_datasets": [
+                    {
+                        "dataset_id": "quarterly_revenue",
+                        "title": "Quarterly revenue",
+                        "csv_text": "quarter,revenue\r\nQ1,10\r\nQ2,12\r\n",
+                        "markdown_table": "| Quarter | Revenue |\n| --- | ---: |\n| Q1 | 10 |\n| Q2 | 12 |",
+                        "summary": "Mean revenue is 11.",
+                        "source_ids": [1],
+                        "caveats": ["Values use the filing's reporting currency."],
+                    },
+                    {
+                        "dataset_id": "quarterly_margin",
+                        "title": "Quarterly margin",
+                        "csv_text": "quarter,margin_pct\r\nQ1,50\r\nQ2,52\r\n",
+                        "markdown_table": "| Quarter | Margin |\n| --- | ---: |\n| Q1 | 50% |\n| Q2 | 52% |",
+                        "summary": "Margin increased by two percentage points.",
+                        "source_ids": [1],
+                        "caveats": [],
+                    },
+                ],
+            }
+        )
+        inline = "# Inline answer\n\n" + ("This omits the validated table. " * 20)
+
+        with patch(
+            "aiq_agent.agents.deep_researcher.factory.create_deep_agent",
+            return_value=MagicMock(),
+        ):
+            from aiq_agent.agents.deep_researcher.agent import DeepResearcherAgent
+
+            agent = DeepResearcherAgent(llm_provider=mock_llm_provider, tools=[real_tool])
+            note_files = {
+                "/research_note_01_quarterly.json": {
+                    "content": note.model_dump_json(exclude_none=True),
+                }
+            }
+            output = agent._extract_final_markdown(
+                {
+                    "messages": [AIMessage(content=inline)],
+                    "files": note_files,
+                },
+                final_report_tracker=FinalReportCommitTracker(),
+            )
+            incomplete_output = agent._extract_final_markdown(
+                {
+                    "messages": [AIMessage(content="Wrote /shared/output.md")],
+                    "files": {
+                        **note_files,
+                        "/shared/output.md": {
+                            "content": "# Incomplete\n\n| Other | Value |\n| --- | ---: |\n| X | 1 |",
+                        },
+                    },
+                },
+                final_report_tracker=FinalReportCommitTracker(),
+            )
+            canonical_report = "# Complete\n\n" + "\n\n".join(
+                dataset.markdown_table for dataset in note.quantitative_datasets
+            )
+            complete_output = agent._extract_final_markdown(
+                {
+                    "messages": [AIMessage(content="Wrote /shared/output.md")],
+                    "files": {
+                        **note_files,
+                        "/shared/output.md": {"content": canonical_report},
+                    },
+                },
+                final_report_tracker=committed_tracker(canonical_report),
+            )
+
+        assert output is not None
+        assert "The final synthesis step did not complete" in output
+        assert "| Quarter | Revenue |" in output
+        assert "| Q2 | 12 |" in output
+        assert "| Q2 | 52% |" in output
+        assert "Values use the filing's reporting currency." in output
+        assert "https://example.com/filing" in output
+        assert "This omits the validated table" not in output
+        assert incomplete_output is not None
+        assert "The final synthesis step did not complete" in incomplete_output
+        assert "| Q2 | 12 |" in incomplete_output
+        assert "| Q2 | 52% |" in incomplete_output
+        assert complete_output == canonical_report
+
+    def test_quantitative_fallback_keeps_canonical_table_before_huge_finding_evidence(
+        self,
+        mock_llm_provider,
+        real_tool,
+    ):
+        """Unbounded optional evidence cannot displace a required canonical table."""
+        note = build_quantitative_note(
+            topic="High-volume evidence",
+            dataset_prefix="large_evidence",
+            finding_evidence="e" * 1_100_000,
+        )
+        table = note.quantitative_datasets[0].markdown_table
+
+        with patch(
+            "aiq_agent.agents.deep_researcher.factory.create_deep_agent",
+            return_value=MagicMock(),
+        ):
+            from aiq_agent.agents.deep_researcher.agent import DeepResearcherAgent
+
+            agent = DeepResearcherAgent(llm_provider=mock_llm_provider, tools=[real_tool])
+            output = agent._extract_final_markdown(
+                {
+                    "messages": [AIMessage(content="Wrote /shared/output.md")],
+                    "files": {
+                        "/shared/research_note_01_large.json": {
+                            "content": note.model_dump_json(exclude_none=True),
+                        }
+                    },
+                },
+                final_report_tracker=FinalReportCommitTracker(),
+            )
+
+        assert output is not None
+        assert table in output
+        assert output.index(table) < output.index("### Findings")
+        assert "Bounded fallback notice" in output
+        assert "supporting evidence was truncated or omitted" in output
+        assert len(output) <= 1024 * 1024
+
+    def test_published_digest_requires_only_its_related_report_table(
+        self,
+        mock_llm_provider,
+        real_tool,
+    ):
+        """A published digest does not make unrelated validated datasets report requirements."""
+        note = build_quantitative_note(
+            topic="Published selection",
+            dataset_prefix="published_selection",
+            dataset_count=2,
+        )
+        published_dataset, unrelated_dataset = note.quantitative_datasets
+        report = f"# Published report\n\n{published_dataset.markdown_table}"
+
+        with patch(
+            "aiq_agent.agents.deep_researcher.factory.create_deep_agent",
+            return_value=MagicMock(),
+        ):
+            from aiq_agent.agents.deep_researcher.agent import DeepResearcherAgent
+
+            agent = DeepResearcherAgent(llm_provider=mock_llm_provider, tools=[real_tool])
+            artifact_manager = MagicMock()
+            artifact_manager.published_canonical_digests.return_value = frozenset({published_dataset.csv_sha256})
+            agent.deepagents_runtime.artifact_manager = artifact_manager
+            output = agent._extract_final_markdown(
+                {
+                    "messages": [AIMessage(content="Wrote /shared/output.md")],
+                    "files": {
+                        "/shared/research_note_01_published.json": {
+                            "content": note.model_dump_json(exclude_none=True),
+                        },
+                        "/shared/output.md": {"content": report},
+                    },
+                },
+                final_report_tracker=committed_tracker(report),
+            )
+
+        assert output == report
+        assert unrelated_dataset.markdown_table not in output
+
+    def test_quantitative_fallback_bounds_many_tables_and_reports_omissions(
+        self,
+        mock_llm_provider,
+        real_tool,
+    ):
+        """Many unrelated datasets retain the most relevant tables and disclose omissions."""
+        notes = [
+            build_quantitative_note(
+                topic=f"Topic {index}",
+                dataset_prefix=f"topic_{index}",
+                dataset_count=4,
+                relevance_score=index * 10,
+            )
+            for index in range(6)
+        ]
+
+        with patch(
+            "aiq_agent.agents.deep_researcher.factory.create_deep_agent",
+            return_value=MagicMock(),
+        ):
+            from aiq_agent.agents.deep_researcher.agent import DeepResearcherAgent
+
+            agent = DeepResearcherAgent(llm_provider=mock_llm_provider, tools=[real_tool])
+            required_tables = agent._required_quantitative_tables(notes)
+            fallback = agent._build_research_notes_fallback({}, notes=notes)
+
+        assert len(required_tables) == 4
+        assert fallback is not None
+        report, has_quantitative = fallback
+        assert has_quantitative is True
+        assert all(table in report for table in required_tables)
+        assert all(dataset.markdown_table in report for dataset in notes[-1].quantitative_datasets)
+        assert notes[0].quantitative_datasets[0].markdown_table not in report
+        assert "20 additional validated quantitative tables were omitted" in report
+        assert "Bounded fallback notice" in report
+        assert len(report) <= 1024 * 1024
+
+    def test_extract_final_markdown_falls_back_to_nonquantitative_research_notes(
+        self,
+        mock_llm_provider,
+        real_tool,
+    ):
+        """Writer chatter cannot discard otherwise valid textual research evidence."""
+        note = ResearchNotes.model_validate(
+            {
+                "query_topic": "Platform overview",
+                "target_components": ["overview"],
+                "summary": "A validated research summary.",
+                "findings": [],
+                "gaps": [],
+                "sources": [],
+                "narrative_notes": "Supporting context.",
+                "language": "English",
+            }
+        )
+
+        with patch(
+            "aiq_agent.agents.deep_researcher.factory.create_deep_agent",
+            return_value=MagicMock(),
+        ):
+            from aiq_agent.agents.deep_researcher.agent import DeepResearcherAgent
+
+            agent = DeepResearcherAgent(llm_provider=mock_llm_provider, tools=[real_tool])
+            output = agent._extract_final_markdown(
+                {
+                    "messages": [AIMessage(content="Wrote /shared/output.md")],
+                    "files": {
+                        "/shared/research_note_01_overview.json": {
+                            "content": note.model_dump_json(exclude_none=True),
+                        }
+                    },
+                },
+                final_report_tracker=FinalReportCommitTracker(),
+            )
+
+        assert output is not None
+        assert "## Platform overview" in output
+        assert "A validated research summary." in output
 
     @pytest.mark.asyncio
     async def test_run_fails_on_missing_writer_output_before_citation_verification(

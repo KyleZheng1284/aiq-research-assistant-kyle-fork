@@ -169,11 +169,13 @@ is lifted into `providers.modal`.
 
 ## Artifact runtime
 
-- Generated code writes binaries + a `manifest.json` to `artifact_dir`.
-- Successful `execute` calls trigger a manifest-only checkpoint. Terminal finalization runs
-  one manifest + directory scan on success or failure. On cancellation, that scan runs only
-  when the provider operation lease is immediately available; a busy sandbox is terminated
-  immediately, while completed execute outputs remain preserved by earlier checkpoints.
+- The writer publishes generated files and `manifest.json` under `artifact_dir`; other roles
+  cannot publish durable artifacts.
+- Writer manifest writes and successful writer chart executions trigger a manifest-only
+  checkpoint. Terminal finalization runs one manifest + directory scan on success or failure.
+  On cancellation, that scan runs only when the provider operation lease is immediately
+  available; for a busy sandbox the runtime requests immediate termination without extending
+  the worker's bounded wait, while completed writer outputs remain preserved by earlier checkpoints.
 - The `ArtifactManager` pulls bytes via `download_files`, runs the validation pipeline
   (path-traversal confinement -> extension allowlist -> size cap -> MIME-from-bytes/spoof
   reject -> quota -> SVG sanitize -> sha256), stores metadata in SQL and bytes through the

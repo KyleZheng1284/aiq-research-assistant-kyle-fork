@@ -21,6 +21,7 @@ import json
 import logging
 import posixpath
 import re
+import shlex
 import threading
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -40,6 +41,9 @@ from aiq_agent.common.citation_verification import SourceEntry
 from aiq_agent.common.citation_verification import SourceRegistry
 from aiq_agent.common.citation_verification import extract_sources_from_tool_result
 
+from .models import ResearchNotes
+from .sandbox.artifacts.manifest import parse_manifest
+
 logger = logging.getLogger(__name__)
 
 # Path to this agent's prompts directory
@@ -55,6 +59,158 @@ FINAL_REPORT_STATE_PATHS = (FINAL_REPORT_PATH, "/output.md")
 _UNRESOLVED_SANDBOX_PATH_PATTERN = re.compile(
     r"<\s*sandbox_(?:artifact_dir|workdir)\s*>|\{\{\s*sandbox_(?:artifact_dir|workdir)\s*\}\}"
 )
+_EXECUTE_RESULT_RE = re.compile(
+    r"\n\[Command (?P<outcome>succeeded|failed) with exit code (?P<exit_code>-?\d+)\]"
+    r"(?:\n\[Output was truncated due to size limits\])?\Z"
+)
+_MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r":?-{3,}:?")
+
+
+def _tool_result_failed(result: object) -> bool:
+    """Return whether a tool result represents a failed operation.
+
+    DeepAgents deliberately returns sandbox command results as successful
+    ``ToolMessage`` objects even when the command's process exit code is non-zero.
+    Parse its terminal status marker in addition to the ordinary message status so
+    failed chart commands cannot be checkpointed or mistaken for a successful
+    writer execution attempt.
+    """
+    status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
+    if status == "error":
+        return True
+
+    exit_code = result.get("exit_code") if isinstance(result, dict) else getattr(result, "exit_code", None)
+    if isinstance(exit_code, int):
+        return exit_code != 0
+
+    content = result.get("content") if isinstance(result, dict) else getattr(result, "content", None)
+    if not isinstance(content, str):
+        return False
+    match = _EXECUTE_RESULT_RE.search(content)
+    return bool(match and int(match.group("exit_code")) != 0)
+
+
+def _entry_text(entry: object) -> str | None:
+    """Read text from a DeepAgents state-file entry without changing it."""
+    if isinstance(entry, dict):
+        entry = entry.get("content")
+    if isinstance(entry, bytes):
+        try:
+            return entry.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, list) and all(isinstance(line, str) for line in entry):
+        return "\n".join(entry)
+    return None
+
+
+def _normalize_guard_path(path: str) -> str:
+    """Normalize a POSIX path for artifact-directory ownership checks."""
+    normalized = posixpath.normpath(path)
+    if normalized.startswith("//"):
+        normalized = "/" + normalized.lstrip("/")
+    return normalized
+
+
+def _path_targets_directory(path: object, directory: str) -> bool:
+    """Return whether a path resolves to or below a configured directory."""
+    if not isinstance(path, str) or not path or not directory:
+        return False
+    normalized_path = _normalize_guard_path(path)
+    normalized_dir = _normalize_guard_path(directory)
+    if normalized_path == normalized_dir or normalized_path.startswith(normalized_dir.rstrip("/") + "/"):
+        return True
+    if not posixpath.isabs(normalized_path):
+        # Sandbox execute starts in the per-job workdir, whose direct artifact
+        # child is conventionally addressed as ``aiq-artifacts/...``. Treat any
+        # relative occurrence of that reserved directory name conservatively as
+        # an artifact target, including ``./`` and parent-relative spellings.
+        artifact_basename = PurePosixPath(normalized_dir).name
+        return artifact_basename in PurePosixPath(normalized_path).parts
+    return False
+
+
+def _command_targets_directory(command: object, directory: str) -> bool:
+    """Return whether a shell command directly names the configured directory."""
+    if not isinstance(command, str) or not command.strip() or not directory:
+        return False
+
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = command.split()
+    for token in tokens:
+        candidates = {token, token.strip("<>|&;()")}
+        if "=" in token:
+            candidates.add(token.split("=", maxsplit=1)[1].strip("<>|&;()"))
+        if any(_path_targets_directory(candidate, directory) for candidate in candidates):
+            return True
+
+    # Inline scripts can directly open a literal artifact path inside one shell
+    # token (for example ``python -c 'open("/path/file", "w")'``). Match the
+    # configured absolute directory only at path boundaries to avoid siblings.
+    normalized_dir = _normalize_guard_path(directory).rstrip("/")
+    boundary_pattern = rf"(?<![\w.-]){re.escape(normalized_dir)}(?=$|[/\s'\";|&()<>=,])"
+    return re.search(boundary_pattern, command) is not None
+
+
+def validated_research_notes_from_state(state: object) -> tuple[ResearchNotes, ...]:
+    """Load only schema-valid persisted research notes from DeepAgents state.
+
+    The state-file channel is the durable handoff between researcher and writer.
+    Revalidating here recomputes every canonical CSV digest from the exact
+    persisted ``csv_text`` and prevents stale or model-supplied digest values
+    from opening the writer execution gate.
+    """
+    files = state.get("files", {}) if isinstance(state, dict) else getattr(state, "files", {})
+    if not isinstance(files, dict):
+        return ()
+
+    notes: list[ResearchNotes] = []
+    for path, entry in sorted(files.items(), key=lambda item: str(item[0])):
+        filename = PurePosixPath(str(path)).name
+        if not filename.startswith("research_note_") or not filename.endswith(".json"):
+            continue
+        text = _entry_text(entry)
+        if text is None:
+            logger.warning("Ignoring unreadable persisted research note %s", filename)
+            continue
+        try:
+            payload = json.loads(text)
+            notes.append(ResearchNotes.model_validate(payload))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring invalid persisted research note %s (%s)", filename, type(exc).__name__)
+    return tuple(notes)
+
+
+def _contains_markdown_table(text: str) -> bool:
+    """Return whether text contains a Markdown table with at least one data row."""
+
+    def cells(line: str) -> list[str]:
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|"):
+            stripped = stripped[:-1]
+        return [cell.strip() for cell in stripped.split("|")]
+
+    lines = text.splitlines()
+    for index in range(len(lines) - 2):
+        if any("|" not in lines[offset] for offset in (index, index + 1, index + 2)):
+            continue
+        header_cells = cells(lines[index])
+        separator_cells = cells(lines[index + 1])
+        data_cells = cells(lines[index + 2])
+        if (
+            len(header_cells) >= 1
+            and len(header_cells) == len(separator_cells) == len(data_cells)
+            and all(header_cells)
+            and all(_MARKDOWN_TABLE_SEPARATOR_CELL_RE.fullmatch(cell) for cell in separator_cells)
+        ):
+            return True
+    return False
 
 
 def _normalized_virtual_path(path: object) -> str | None:
@@ -73,26 +229,6 @@ def _tool_file_path(tool_call: object) -> str | None:
     if not isinstance(args, dict):
         return None
     return _normalized_virtual_path(args.get("file_path", args.get("path")))
-
-
-def _entry_text(entry: object) -> str | None:
-    """Read exact text from a DeepAgents state-file entry."""
-    if isinstance(entry, dict):
-        entry = entry.get("content")
-    if isinstance(entry, bytes):
-        try:
-            return entry.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-    if isinstance(entry, str):
-        return entry
-    return None
-
-
-def _tool_result_failed(result: object) -> bool:
-    """Return whether a filesystem tool result reports an error."""
-    status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
-    return status == "error"
 
 
 class FinalReportCommitTracker:
@@ -869,50 +1005,432 @@ class SourceRegistryMiddleware(AgentMiddleware):
         return self._render_source_list_text(self.get_source_entries(mode=mode))
 
 
+class ArtifactDirectoryOwnershipGuardMiddleware(AgentMiddleware):
+    """Reserve durable artifact-directory mutation for the writer role.
+
+    This middleware is installed only on researcher, planner, and orchestrator
+    stacks. It is deliberately independent of artifact capture so ownership is
+    enforced even when a sandbox is configured without a durable store.
+    """
+
+    def __init__(self, artifact_dir: str) -> None:
+        if not artifact_dir:
+            raise ValueError("artifact_dir must not be empty")
+        self.artifact_dir = artifact_dir
+
+    def _targets_artifact_directory(self, tool_call: dict[str, object]) -> bool:
+        tool_name = tool_call.get("name")
+        args = tool_call.get("args")
+        if not isinstance(args, dict):
+            return False
+        if tool_name in {"write_file", "edit_file"}:
+            return _path_targets_directory(args.get("file_path", args.get("path")), self.artifact_dir)
+        if tool_name == "execute":
+            return _command_targets_directory(args.get("command"), self.artifact_dir)
+        return False
+
+    async def awrap_tool_call(self, request, handler):
+        """Reject non-writer artifact publication before physical tool dispatch."""
+        tool_call = request.tool_call if isinstance(getattr(request, "tool_call", None), dict) else {}
+        if not self._targets_artifact_directory(tool_call):
+            return await handler(request)
+        tool_name = str(tool_call.get("name") or "tool")
+        return ToolMessage(
+            content=(
+                "durable_artifact_publication_writer_only: researcher, planner, and orchestrator roles must "
+                "handoff canonical evidence through ResearchNotes; only writer-agent may publish durable artifacts."
+            ),
+            tool_call_id=tool_call.get("id", "artifact-directory-ownership"),
+            name=tool_name,
+            status="error",
+        )
+
+
 class ArtifactHarvestMiddleware(AgentMiddleware):
-    """Checkpoint durable artifacts after successful sandbox execute calls."""
+    """Checkpoint durable artifacts after writer publication milestones."""
 
     def __init__(self, artifact_manager: object) -> None:
         """Store the artifact manager used for best-effort checkpoints."""
         self.artifact_manager = artifact_manager
 
     async def awrap_tool_call(self, request, handler):
-        """Run the tool, then checkpoint manifest-declared artifacts after execute."""
+        """Checkpoint after chart execution or a successful artifact-manifest write."""
         result = await handler(request)
         tool_name = ""
+        tool_args: dict[str, object] = {}
         if hasattr(request, "tool_call") and isinstance(request.tool_call, dict):
             tool_name = request.tool_call.get("name", "")
-        result_status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
-        if tool_name == "execute" and result_status != "error":
+            tool_args = request.tool_call.get("args") or {}
+        should_checkpoint = tool_name == "execute" or (
+            tool_name == "write_file" and self._is_artifact_manifest_write(tool_args)
+        )
+        if should_checkpoint and not _tool_result_failed(result):
             try:
-                captured = await asyncio.to_thread(self.artifact_manager.harvest_after_execute)
+                atomic_harvest = getattr(type(self.artifact_manager), "harvest_after_execute_with_diagnostics", None)
+                if callable(atomic_harvest):
+                    checkpoint = await asyncio.to_thread(self.artifact_manager.harvest_after_execute_with_diagnostics)
+                    captured = getattr(checkpoint, "artifacts", ())
+                    rejections = getattr(checkpoint, "rejections", ())
+                else:
+                    # Compatibility with older/test managers that expose only
+                    # the pre-atomic pair of methods.
+                    captured = await asyncio.to_thread(self.artifact_manager.harvest_after_execute)
+                    rejections = ()
+                    rejection_reader = getattr(self.artifact_manager, "last_harvest_rejections", None)
+                    if callable(rejection_reader):
+                        rejections = rejection_reader()
             except Exception as exc:  # noqa: BLE001 - artifact capture must not fail the agent
                 logger.warning("Artifact checkpoint harvest failed (%s)", type(exc).__name__)
             else:
-                result = self._append_checkpoint_result(result, captured)
+                result = self._append_checkpoint_result(result, captured, rejections)
+        return result
+
+    def _is_artifact_manifest_write(self, args: dict[str, object]) -> bool:
+        """Return whether a write targets this job's artifact manifest exactly."""
+        path = args.get("file_path", args.get("path"))
+        artifact_dir = getattr(self.artifact_manager, "artifact_dir", None)
+        if not isinstance(path, str) or not isinstance(artifact_dir, str):
+            return False
+        return path == f"{artifact_dir.rstrip('/')}/manifest.json"
+
+    @staticmethod
+    def _append_checkpoint_result(result: object, captured: object, rejections: object = ()) -> object:
+        """Tell the model which safe filenames were captured or rejected."""
+        if not isinstance(result, ToolMessage) or not isinstance(result.content, str):
+            return result
+
+        sections: list[str] = []
+        if isinstance(captured, (list, tuple)) and captured:
+            lines = ["Artifact checkpoint captured these exact filenames:"]
+            for artifact in captured[:10]:
+                filename = PurePosixPath(str(getattr(artifact, "filename", ""))).name
+                if not filename:
+                    continue
+                if bool(getattr(artifact, "inline", False)):
+                    lines.append(f"- {filename} (inline): embed as ![caption](artifact://{filename})")
+                else:
+                    lines.append(f"- {filename} (downloadable; not marked inline)")
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        if isinstance(rejections, (list, tuple)) and rejections:
+            lines = ["Artifact checkpoint rejected these files; do not claim they were published:"]
+            for rejection in rejections[:10]:
+                if not isinstance(rejection, (list, tuple)) or len(rejection) != 2:
+                    continue
+                filename = PurePosixPath(str(rejection[0])).name
+                reason = str(rejection[1])
+                if filename and reason:
+                    lines.append(f"- {filename}: {reason}")
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        if not sections:
+            return result
+        content = result.content.rstrip() + "\n\n" + "\n\n".join(sections)
+        return result.model_copy(update={"content": content})
+
+
+class WriterExecuteBudgetMiddleware(AgentMiddleware):
+    """Guard durable publication and bound writer-side chart rendering.
+
+    The limiter sits inside generic tool retry middleware, so every call that can
+    physically reach the sandbox consumes one attempt. Once exhausted, a later
+    model request to execute is ended before tool dispatch. The writer must create
+    the report baseline before its first execution, preserving useful text, table,
+    and already-published CSV output when chart rendering fails. Artifact-directory
+    writes are also refused until persisted researcher output contains canonical
+    data and the complete report/table baseline is present; ordinary report writes
+    remain unaffected.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_attempts: int = 3,
+        output_paths: tuple[str, ...] = ("/shared/output.md", "/output.md"),
+        artifact_manager: object | None = None,
+    ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least one")
+        if not output_paths:
+            raise ValueError("output_paths must not be empty")
+        self.max_attempts = max_attempts
+        self.output_paths = output_paths
+        self.artifact_manager = artifact_manager
+        self._attempts = 0
+        self._attempt_lock = asyncio.Lock()
+
+    @property
+    def attempts(self) -> int:
+        """Return the number of physical execute attempts admitted so far."""
+        return self._attempts
+
+    def _report_baseline_text(self, state: object) -> str | None:
+        files = state.get("files", {}) if isinstance(state, dict) else getattr(state, "files", {})
+        if not isinstance(files, dict):
+            return None
+        for path in self.output_paths:
+            text = _entry_text(files.get(path))
+            if isinstance(text, str) and text.strip() and _contains_markdown_table(text):
+                return text
+        return None
+
+    def _published_canonical_digests(self) -> frozenset[str]:
+        reader = getattr(self.artifact_manager, "published_canonical_digests", None)
+        if not callable(reader):
+            return frozenset()
+        try:
+            values = reader()
+            if not isinstance(values, (set, frozenset, list, tuple)):
+                return frozenset()
+            return frozenset(digest for digest in values if isinstance(digest, str))
+        except Exception as exc:  # noqa: BLE001 - the safe response is to block execution
+            logger.warning("Canonical publication status check failed (%s)", type(exc).__name__)
+            return frozenset()
+
+    def _targets_artifact_directory(self, tool_call: dict[str, object]) -> bool:
+        """Return whether a write/edit tool targets the configured artifact directory."""
+        if tool_call.get("name") not in {"write_file", "edit_file"}:
+            return False
+        args = tool_call.get("args")
+        if not isinstance(args, dict):
+            return False
+        path = args.get("file_path", args.get("path"))
+        artifact_dir = getattr(self.artifact_manager, "artifact_dir", None)
+        return isinstance(artifact_dir, str) and _path_targets_directory(path, artifact_dir)
+
+    def _targets_artifact_execute(self, tool_call: dict[str, object]) -> bool:
+        """Return whether an execute tool directly targets the artifact directory."""
+        if tool_call.get("name") != "execute":
+            return False
+        args = tool_call.get("args")
+        artifact_dir = getattr(self.artifact_manager, "artifact_dir", None)
+        if not isinstance(args, dict) or not isinstance(artifact_dir, str):
+            return False
+        return _command_targets_directory(args.get("command"), artifact_dir)
+
+    @staticmethod
+    def _state_has_canonical_dataset(state: object) -> bool:
+        """Return whether persisted state contains schema-valid canonical evidence."""
+        return any(note.quantitative_datasets for note in validated_research_notes_from_state(state))
+
+    def _required_publication_tables(
+        self,
+        state: object,
+        tool_call: dict[str, object],
+    ) -> tuple[str, ...] | None:
+        """Resolve the exact canonical tables required by one publication write.
+
+        ``None`` means the target expresses canonical publication intent that
+        cannot be tied back to validated researcher output and must fail closed.
+        An empty tuple means the target is a non-dataset artifact and the generic
+        report-first baseline is sufficient.
+        """
+        args = tool_call.get("args")
+        if not isinstance(args, dict):
+            return None
+        raw_path = args.get("file_path", args.get("path"))
+        if not isinstance(raw_path, str):
+            return None
+        filename = PurePosixPath(_normalize_guard_path(raw_path)).name
+        datasets = [
+            dataset for note in validated_research_notes_from_state(state) for dataset in note.quantitative_datasets
+        ]
+
+        if filename.endswith(".csv"):
+            dataset_id = filename.removesuffix(".csv")
+            matches = [dataset for dataset in datasets if dataset.dataset_id == dataset_id]
+            if not matches:
+                return None
+            return tuple(dict.fromkeys(dataset.markdown_table for dataset in matches))
+
+        if filename != "manifest.json":
+            return ()
+        if tool_call.get("name") != "write_file":
+            # An edit patch does not contain the complete post-edit manifest, so
+            # its canonical intent cannot be validated deterministically.
+            return None
+        manifest_text = _entry_text(args.get("content"))
+        if manifest_text is None:
+            return None
+        manifest = parse_manifest(manifest_text)
+        if manifest is None:
+            return None
+
+        canonical_entries = [
+            entry
+            for entry in manifest.artifacts
+            if entry.kind.value == "dataset" and PurePosixPath(entry.path).suffix.lower() == ".csv"
+        ]
+        if not canonical_entries:
+            return None
+
+        required_tables: list[str] = []
+        for entry in canonical_entries:
+            stem = PurePosixPath(entry.path).stem
+            id_matches = {index for index, dataset in enumerate(datasets) if dataset.dataset_id == stem}
+            if entry.expected_sha256 is None:
+                selected = id_matches
+            else:
+                digest_matches = {
+                    index for index, dataset in enumerate(datasets) if dataset.csv_sha256 == entry.expected_sha256
+                }
+                if not digest_matches:
+                    return None
+                selected = digest_matches & id_matches if id_matches else digest_matches
+            if not selected:
+                return None
+            required_tables.extend(datasets[index].markdown_table for index in sorted(selected))
+        return tuple(dict.fromkeys(required_tables))
+
+    @staticmethod
+    def _baseline_contains_tables(baseline: str, tables: tuple[str, ...]) -> bool:
+        """Return whether the baseline contains each required table byte-for-text."""
+        normalized_baseline = baseline.replace("\r\n", "\n").replace("\r", "\n")
+        return all(table.replace("\r\n", "\n").replace("\r", "\n") in normalized_baseline for table in tables)
+
+    @staticmethod
+    def _contains_all_published_canonical_tables(
+        state: object,
+        baseline: str,
+        published_digests: frozenset[str],
+    ) -> bool:
+        tables_by_digest: dict[str, set[str]] = {}
+        for note in validated_research_notes_from_state(state):
+            for dataset in note.quantitative_datasets:
+                if dataset.csv_sha256 in published_digests:
+                    tables_by_digest.setdefault(dataset.csv_sha256, set()).add(dataset.markdown_table)
+
+        if not published_digests.issubset(tables_by_digest):
+            return False
+        return all(table in baseline for digest in published_digests for table in tables_by_digest[digest])
+
+    @staticmethod
+    def _tool_message(request, content: str, *, name: str = "execute") -> ToolMessage:
+        tool_call = request.tool_call if isinstance(getattr(request, "tool_call", None), dict) else {}
+        return ToolMessage(
+            content=content,
+            tool_call_id=tool_call.get("id", "writer-execute-budget"),
+            name=name,
+            status="error",
+        )
+
+    async def awrap_tool_call(self, request, handler):
+        """Admit at most ``max_attempts`` physical writer execute calls."""
+        tool_call = request.tool_call if isinstance(getattr(request, "tool_call", None), dict) else {}
+        publication_write = self._targets_artifact_directory(tool_call)
+        if publication_write:
+            tool_name = str(tool_call.get("name") or "write_file")
+            if not self._state_has_canonical_dataset(request.state):
+                return self._tool_message(
+                    request,
+                    "writer_canonical_dataset_missing: durable artifact publication requires a schema-valid "
+                    "canonical quantitative dataset in persisted ResearchNotes.",
+                    name=tool_name,
+                )
+            baseline = self._report_baseline_text(request.state)
+            if baseline is None:
+                return self._tool_message(
+                    request,
+                    "writer_report_baseline_missing: write the complete report and Markdown-table baseline "
+                    "to /shared/output.md before durable artifact publication.",
+                    name=tool_name,
+                )
+            required_tables = self._required_publication_tables(request.state, tool_call)
+            if required_tables is None:
+                return self._tool_message(
+                    request,
+                    "writer_canonical_dataset_missing: the artifact publication target could not be resolved "
+                    "to a schema-valid canonical dataset in persisted ResearchNotes.",
+                    name=tool_name,
+                )
+            if not self._baseline_contains_tables(baseline, required_tables):
+                return self._tool_message(
+                    request,
+                    "writer_canonical_table_missing: copy the exact canonical Markdown table for this published "
+                    "dataset into /shared/output.md before durable artifact publication.",
+                    name=tool_name,
+                )
+        if tool_call.get("name") != "execute":
+            return await handler(request)
+        if not self._targets_artifact_execute(tool_call):
+            return await handler(request)
+        baseline = self._report_baseline_text(request.state)
+        if baseline is None:
+            return self._tool_message(
+                request,
+                "writer_report_baseline_missing: write the complete report and Markdown-table baseline "
+                "to /shared/output.md before chart execution.",
+            )
+        published_digests = self._published_canonical_digests()
+        if not published_digests:
+            return self._tool_message(
+                request,
+                "writer_canonical_dataset_unpublished: publish and checkpoint the validated canonical CSV "
+                "before chart execution.",
+            )
+        if not self._contains_all_published_canonical_tables(request.state, baseline, published_digests):
+            return self._tool_message(
+                request,
+                "writer_canonical_table_missing: copy the exact canonical Markdown table from the validated "
+                "research note into /shared/output.md before chart execution.",
+            )
+
+        async with self._attempt_lock:
+            if self._attempts >= self.max_attempts:
+                return self._tool_message(
+                    request,
+                    "writer_execute_budget_exhausted: chart execution is disabled; preserve the report, table, "
+                    "and published CSV and finish without a PNG.",
+                )
+            self._attempts += 1
+        result = await handler(request)
+        if self._attempts >= self.max_attempts and _tool_result_failed(result):
+            return self._tool_message(
+                request,
+                "writer_execute_budget_exhausted: chart execution failed at the attempt limit; preserve the "
+                "report, table, and published CSV and finish without a PNG.",
+            )
+        if _tool_result_failed(result) and isinstance(result, ToolMessage) and result.status != "error":
+            return result.model_copy(update={"status": "error"})
         return result
 
     @staticmethod
-    def _append_checkpoint_result(result: object, captured: object) -> object:
-        """Tell the model the exact safe filenames captured from a valid manifest."""
-        if not isinstance(result, ToolMessage) or not isinstance(result.content, str):
-            return result
-        if not isinstance(captured, (list, tuple)) or not captured:
-            return result
+    def _last_ai_message(state: object) -> AIMessage | None:
+        messages = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        return next((message for message in reversed(messages) if isinstance(message, AIMessage)), None)
 
-        lines = ["Artifact checkpoint captured these exact filenames:"]
-        for artifact in captured[:10]:
-            filename = PurePosixPath(str(getattr(artifact, "filename", ""))).name
-            if not filename:
-                continue
-            if bool(getattr(artifact, "inline", False)):
-                lines.append(f"- {filename} (inline): embed as ![caption](artifact://{filename})")
-            else:
-                lines.append(f"- {filename} (downloadable; not marked inline)")
-        if len(lines) == 1:
-            return result
-        content = result.content.rstrip() + "\n\n" + "\n".join(lines)
-        return result.model_copy(update={"content": content})
+    @hook_config(can_jump_to=["end"])
+    async def aafter_model(self, state, runtime):
+        """End a post-exhaustion execute request before it reaches the sandbox."""
+        if self._attempts < self.max_attempts:
+            return None
+        last_message = self._last_ai_message(state)
+        if last_message is None or not any(self._targets_artifact_execute(call) for call in last_message.tool_calls):
+            return None
+
+        tool_messages = [
+            ToolMessage(
+                content=(
+                    "writer_execute_budget_exhausted: no further chart execution is allowed; "
+                    "the existing report, table, and CSV remain the final output."
+                    if self._targets_artifact_execute(call)
+                    else "Tool call cancelled because the writer execution budget is exhausted."
+                ),
+                tool_call_id=call.get("id", "writer-execute-budget"),
+                name=call.get("name"),
+                status="error",
+            )
+            for call in last_message.tool_calls
+        ]
+        return {
+            "jump_to": "end",
+            "messages": [
+                *tool_messages,
+                AIMessage(content="Wrote /shared/output.md\n\nwriter_execute_budget_exhausted"),
+            ],
+        }
 
 
 class PlanPersistenceMiddleware(AgentMiddleware):

@@ -43,6 +43,10 @@ class ManifestEntry(BaseModel):
     caption: str | None = Field(default=None)
     inline: bool = Field(default=False)
     source_files: tuple[str, ...] = Field(default=(), description="Inputs used to produce this artifact")
+    expected_sha256: str | None = Field(
+        default=None,
+        description="Runtime-registered canonical digest required for trusted dataset publication.",
+    )
 
 
 class Manifest(BaseModel):
@@ -59,16 +63,17 @@ def parse_manifest(raw: str) -> Manifest | None:
         raw: The manifest file contents.
 
     Returns:
-        A parsed ``Manifest``, or ``None`` if the content is invalid (a warning is
-        logged; callers fall back to directory scanning).
+        A parsed ``Manifest``, or ``None`` if the content is invalid. Callers
+        distinguish an invalid present manifest from an absent manifest and fail
+        closed rather than downgrading its files to directory-scan artifacts.
     """
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        logger.warning("Artifact manifest is not valid JSON; falling back to scan")
+        logger.warning("Artifact manifest is not valid JSON; rejecting manifest")
         return None
     try:
         return Manifest.model_validate(data)
     except ValidationError:
-        logger.warning("Artifact manifest failed schema validation; falling back to scan")
+        logger.warning("Artifact manifest failed schema validation; rejecting manifest")
         return None

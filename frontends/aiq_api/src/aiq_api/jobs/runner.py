@@ -45,6 +45,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEEP_RESEARCH_FUNCTION_TYPE = "deep_research_agent"
+DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON = "deep_research_workflow_timeout"
+TASK_CANCELLATION_GRACE_SECONDS = 1.0
+SANDBOX_TERMINAL_TEARDOWN_TIMEOUT_SECONDS = 10.0
+
+
+class DeepResearchWorkflowTimeoutError(TimeoutError):
+    """Raised when a deep-research workflow exceeds its configured deadline."""
+
+    reason = DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON
+
+    def __init__(self) -> None:
+        super().__init__(self.reason)
+
+
+def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
+    """Consume a detached task outcome without exposing exception contents."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - detached cleanup must never affect the terminal result
+        logger.debug("Detached cleanup task ended with %s", type(exc).__name__)
 
 
 _DEEP_RESEARCH_AGENT_KWARGS = frozenset(
@@ -58,6 +80,7 @@ _DEEP_RESEARCH_AGENT_KWARGS = frozenset(
         "max_research_concurrency",
         "max_concurrent_source_tool_calls",
         "max_source_tool_batch_size",
+        "max_writer_execute_attempts",
     }
 )
 _CONFIGURABLE_AGENT_KWARGS = frozenset({"config", "job_id"})
@@ -238,6 +261,25 @@ def _write_job_success_if_running_sync(db_url: str, job_id: str, stored_output: 
         return (result.rowcount or 0) == 1
 
 
+def _write_job_timeout_failure_if_running_sync(db_url: str, job_id: str) -> bool:
+    """Compare-and-set a RUNNING job to the stable workflow-timeout failure."""
+    from sqlalchemy import text
+
+    from .event_store import EventStore
+
+    engine = EventStore._get_or_create_sync_engine(db_url)
+    stmt = text(
+        f"UPDATE job_info SET status = 'failure', error = :error, updated_at = {_db_now_expr(db_url)} "
+        "WHERE job_id = :job_id AND status = 'running'"
+    )
+    with engine.begin() as conn:
+        result = conn.execute(
+            stmt,
+            {"error": DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON, "job_id": job_id},
+        )
+        return (result.rowcount or 0) == 1
+
+
 def _run_lease_refresher(db_url: str, job_id: str, stop_event: threading.Event) -> None:
     """Refresh the running-job lease on a dedicated thread until signalled.
 
@@ -257,32 +299,61 @@ async def run_with_cancellation(
     coro,
     monitor: CancellationMonitor,
     event_store: EventStore | BatchingEventStore | None = None,
+    timeout_seconds: float | None = None,
+    cancellation_grace_seconds: float = TASK_CANCELLATION_GRACE_SECONDS,
 ) -> Any:
     """
     Run a coroutine with cancellation monitoring and periodic heartbeats.
 
     Emits job.heartbeat events every 30s so the SSE stream stays alive
     and the ghost job reaper can detect dead workers.
-    Raises asyncio.CancelledError if the monitor detects cancellation.
+    Raises asyncio.CancelledError if the monitor detects cancellation, or
+    DeepResearchWorkflowTimeoutError if the optional deadline expires.
     """
+    import math
     import time
+
+    if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+        raise ValueError("timeout_seconds must be a finite positive number or None")
+    if not math.isfinite(cancellation_grace_seconds) or cancellation_grace_seconds < 0:
+        raise ValueError("cancellation_grace_seconds must be a finite non-negative number")
 
     task = asyncio.create_task(coro)
     monitor.start()
     start_time = time.monotonic()
     last_heartbeat = start_time
+    deadline = start_time + timeout_seconds if timeout_seconds is not None else None
+
+    async def cancel_active_task() -> bool:
+        if task.done():
+            return True
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=cancellation_grace_seconds)
+        if task not in done:
+            logger.warning(
+                "Active workflow task did not stop within the %.3fs cancellation grace period",
+                cancellation_grace_seconds,
+            )
+            return False
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - timeout/cancellation reason remains authoritative
+            logger.debug("Task cleanup after cancellation raised %s", type(exc).__name__)
+        return True
 
     try:
         while not task.done():
             if monitor.is_cancelled:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                await cancel_active_task()
                 raise asyncio.CancelledError("Job cancelled by user")
 
             now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                await cancel_active_task()
+                raise DeepResearchWorkflowTimeoutError
+
             if event_store and (now - last_heartbeat) >= HEARTBEAT_INTERVAL_SECONDS:
                 last_heartbeat = now
                 event_store.store(
@@ -292,10 +363,17 @@ async def run_with_cancellation(
                     }
                 )
 
-            await asyncio.sleep(0.1)
+            sleep_seconds = 0.1 if deadline is None else min(0.1, max(0.0, deadline - now))
+            await asyncio.sleep(sleep_seconds)
 
         return task.result()
     finally:
+        if not task.done():
+            # A cancellation-resistant task must not hold the watchdog open. A second
+            # cancellation request plus result consumer prevents an orphaned exception;
+            # the terminal path separately force-terminates the sandbox runtime.
+            task.cancel()
+            task.add_done_callback(_consume_background_task_result)
         monitor.stop()
 
 
@@ -610,6 +688,8 @@ async def run_agent_job(
     # Sandbox runtime is released on the terminal path; interrupted forces terminate() over close().
     sandbox_runtime: Any | None = None
     interrupted = False
+    timeout_terminal_recorded = False
+    sandbox_teardown_started = False
     logger.info(
         "Dask worker received: agent=%s, config=%s, job_id=%s",
         agent_class_path,
@@ -852,19 +932,35 @@ async def run_agent_job(
                         # Replace NAT's inherited profiler for this invocation rather than adding a
                         # second callback with duplicate LangChain run IDs.
                         with aiq_langchain_profiler_context():
-                            result = await _run_agent(
-                                agent=agent,
-                                input_text=input_text,
-                                builder=builder,
-                                config=config,
-                                function_name=agent_config_name,
-                                function_config=fn_config,
-                                monitor=cancellation_monitor,
-                                available_documents=available_documents,
-                                data_sources=data_sources,
-                                event_store=event_store,
-                                initial_files=initial_files,
-                            )
+                            try:
+                                result = await _run_agent(
+                                    agent=agent,
+                                    input_text=input_text,
+                                    builder=builder,
+                                    config=config,
+                                    function_name=agent_config_name,
+                                    function_config=fn_config,
+                                    monitor=cancellation_monitor,
+                                    available_documents=available_documents,
+                                    data_sources=data_sources,
+                                    event_store=event_store,
+                                    initial_files=initial_files,
+                                    workflow_timeout_seconds=getattr(fn_config, "workflow_timeout_seconds", None),
+                                )
+                            except DeepResearchWorkflowTimeoutError:
+                                # Record the stable terminal failure and start forced teardown here,
+                                # before MCP/exporter context managers unwind. Those external cleanup
+                                # paths are best-effort and must not leave an expired job in RUNNING.
+                                interrupted = True
+                                timeout_terminal_recorded = True
+                                sandbox_teardown_started = True
+                                await _handle_workflow_timeout(
+                                    event_store,
+                                    sandbox_runtime,
+                                    db_url=db_url,
+                                    job_id=job_id,
+                                )
+                                raise
 
                     # Emit WORKFLOW_END event for Phoenix
                     context.intermediate_step_manager.push_intermediate_step(
@@ -890,12 +986,11 @@ async def run_agent_job(
                     # Signal event stream completion
                     event_stream.on_complete()
 
-                    # Harvest artifacts (durable, idempotent) before SUCCESS so clients cannot
-                    # stop streaming before the terminal metadata is persisted. Resource release
-                    # is deferred to the finally block: the provider's close() is unbounded, so
-                    # awaiting it here could strand a finished job in RUNNING if SDK cleanup hangs.
-                    await asyncio.to_thread(
-                        _harvest_sandbox_artifacts,
+                    # Harvest artifacts and then release the provider in one sequential bounded
+                    # operation before SUCCESS. Mark ownership before awaiting it so the finally
+                    # block can never start a second provider thread if this one times out.
+                    sandbox_teardown_started = True
+                    await _teardown_sandbox_bounded(
                         sandbox_runtime,
                         job_id=job_id,
                         interrupted=False,
@@ -935,13 +1030,33 @@ async def run_agent_job(
                     else:
                         logger.warning("Job %s already terminal; skipping success write", job_id)
 
+    except DeepResearchWorkflowTimeoutError:
+        logger.warning("Job %s exceeded the deep-research workflow deadline", job_id)
+        interrupted = True
+        if event_store is None:
+            event_store = BatchingEventStore(EventStore(db_url, job_id))
+
+        # Initialization can fail with the timeout type before the inner execution
+        # boundary exists. Handle that path here; normal watchdog expiry was already
+        # recorded before external async context managers began unwinding.
+        if not timeout_terminal_recorded:
+            timeout_terminal_recorded = True
+            sandbox_teardown_started = True
+            await _handle_workflow_timeout(
+                event_store,
+                sandbox_runtime,
+                db_url=db_url,
+                job_id=job_id,
+            )
+
     except asyncio.CancelledError:
         logger.info("Job %s cancelled", job_id)
         interrupted = True
         if event_store is None:
             event_store = BatchingEventStore(EventStore(db_url, job_id))
 
-        await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=True)
+        sandbox_teardown_started = True
+        await _teardown_sandbox_bounded(sandbox_runtime, job_id=job_id, interrupted=True)
         _store_terminal_event_best_effort(
             event_store,
             {
@@ -959,6 +1074,16 @@ async def run_agent_job(
                 pass
 
     except Exception as e:
+        if timeout_terminal_recorded:
+            # A context-manager cleanup failure must not replace the stable timeout
+            # reason already persisted at the guarded execution boundary.
+            logger.warning(
+                "Job %s cleanup after workflow timeout failed with %s",
+                job_id,
+                type(e).__name__,
+            )
+            interrupted = True
+            return
         logger.exception("Job %s failed: %s", job_id, type(e).__name__)
         if event_store is None:
             event_store = BatchingEventStore(EventStore(db_url, job_id))
@@ -967,7 +1092,6 @@ async def run_agent_job(
         # credentials or internal hostnames, and both the event stream and the
         # stored status are surfaced to the job's caller.
         sanitized_error = f"job failed ({type(e).__name__}); check server logs for details"
-        await asyncio.to_thread(_harvest_sandbox_artifacts, sandbox_runtime, job_id=job_id, interrupted=False)
         _store_terminal_event_best_effort(
             event_store,
             {
@@ -980,6 +1104,8 @@ async def run_agent_job(
         )
         if job_store:
             await job_store.update_status(job_id, JobStatus.FAILURE, error=sanitized_error)
+        # Artifact harvest and provider release happen in the bounded finally-path
+        # teardown after the stable generic failure is visible to callers.
 
     finally:
         # Ensure terminal-path events are not left in the batch buffer.
@@ -991,7 +1117,9 @@ async def run_agent_job(
         if cancellation_monitor:
             cancellation_monitor.stop()
         # Idempotent fallback for failures before a terminal branch finalized the runtime.
-        await asyncio.to_thread(_teardown_sandbox, sandbox_runtime, job_id=job_id, interrupted=interrupted)
+        # Keep it bounded: provider SDK cleanup cannot hold a terminal job worker forever.
+        if not sandbox_teardown_started:
+            await _teardown_sandbox_bounded(sandbox_runtime, job_id=job_id, interrupted=interrupted)
         await _flush_event_store(event_store, job_id=job_id)
         # Clean up job-scoped auth token
         if _auth_token_reset is not None:
@@ -1052,6 +1180,13 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
     if sandbox_runtime is None:
         return
     _harvest_sandbox_artifacts(sandbox_runtime, job_id=job_id, interrupted=interrupted)
+    _release_sandbox(sandbox_runtime, job_id=job_id, interrupted=interrupted)
+
+
+def _release_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: bool) -> None:
+    """Release sandbox resources without attempting artifact harvest."""
+    if sandbox_runtime is None:
+        return
     finalize = getattr(sandbox_runtime, "finalize", None)
     if callable(finalize):
         try:
@@ -1072,6 +1207,165 @@ def _teardown_sandbox(sandbox_runtime: Any | None, *, job_id: str, interrupted: 
         # credential or internal hostname, which must never reach the logs (matches the
         # finalize_artifacts handler above).
         logger.warning("Sandbox cleanup failed for job %s (%s)", job_id, type(exc).__name__)
+
+
+async def _teardown_sandbox_bounded(
+    sandbox_runtime: Any | None,
+    *,
+    job_id: str,
+    interrupted: bool,
+    timeout_seconds: float = SANDBOX_TERMINAL_TEARDOWN_TIMEOUT_SECONDS,
+) -> bool:
+    """Run best-effort terminal harvest/finalize without blocking job completion forever."""
+    if sandbox_runtime is None:
+        return True
+    return await _run_daemon_cleanup_bounded(
+        lambda: _teardown_sandbox(sandbox_runtime, job_id=job_id, interrupted=interrupted),
+        thread_name=f"sandbox-terminal-teardown-{job_id}",
+        operation="Sandbox terminal teardown",
+        job_id=job_id,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+async def _harvest_sandbox_artifacts_bounded(
+    sandbox_runtime: Any | None,
+    *,
+    job_id: str,
+    interrupted: bool,
+    timeout_seconds: float = SANDBOX_TERMINAL_TEARDOWN_TIMEOUT_SECONDS,
+) -> bool:
+    """Checkpoint terminal artifacts without allowing provider I/O to strand job status."""
+    if sandbox_runtime is None:
+        return True
+    return await _run_daemon_cleanup_bounded(
+        lambda: _harvest_sandbox_artifacts(sandbox_runtime, job_id=job_id, interrupted=interrupted),
+        thread_name=f"sandbox-terminal-harvest-{job_id}",
+        operation="Sandbox terminal artifact harvest",
+        job_id=job_id,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+async def _terminate_then_harvest_sandbox_bounded(
+    sandbox_runtime: Any | None,
+    *,
+    job_id: str,
+    timeout_seconds: float = SANDBOX_TERMINAL_TEARDOWN_TIMEOUT_SECONDS,
+) -> bool:
+    """Force timeout teardown before attempting a separate best-effort harvest.
+
+    A timed-out workflow may still own a provider operation. Termination therefore
+    runs first and must return before artifact I/O starts. If termination itself
+    exceeds the bound, its daemon thread may still be touching the provider, so the
+    harvest is deliberately skipped rather than racing a second provider call.
+    """
+    if sandbox_runtime is None:
+        return True
+    termination_completed = await _run_daemon_cleanup_bounded(
+        lambda: _release_sandbox(sandbox_runtime, job_id=job_id, interrupted=True),
+        thread_name=f"sandbox-timeout-terminate-{job_id}",
+        operation="Sandbox forced timeout termination",
+        job_id=job_id,
+        timeout_seconds=timeout_seconds,
+    )
+    if not termination_completed:
+        logger.warning(
+            "Skipping terminal artifact harvest for job %s because forced termination is still running",
+            job_id,
+        )
+        return False
+    return await _harvest_sandbox_artifacts_bounded(
+        sandbox_runtime,
+        job_id=job_id,
+        interrupted=True,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+async def _run_daemon_cleanup_bounded(
+    callback: Callable[[], None],
+    *,
+    thread_name: str,
+    operation: str,
+    job_id: str,
+    timeout_seconds: float,
+) -> bool:
+    """Run a terminal callback in a daemon thread with a finite wait."""
+    import math
+
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be a finite positive number")
+
+    teardown_thread = threading.Thread(
+        target=callback,
+        name=thread_name,
+        daemon=True,
+    )
+    teardown_thread.start()
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while teardown_thread.is_alive():
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(0.05, remaining))
+
+    if teardown_thread.is_alive():
+        logger.warning(
+            "%s exceeded %.3fs for job %s; cleanup continues in the background",
+            operation,
+            timeout_seconds,
+            job_id,
+        )
+        return False
+    return True
+
+
+async def _record_workflow_timeout_best_effort(event_store: Any, *, db_url: str, job_id: str) -> bool:
+    """Claim timeout terminal state with a RUNNING-only CAS, then emit its event."""
+    try:
+        wrote = await asyncio.get_running_loop().run_in_executor(
+            None,
+            _write_job_timeout_failure_if_running_sync,
+            db_url,
+            job_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - timeout cleanup must still proceed
+        logger.warning("Failed to record workflow timeout status for job %s (%s)", job_id, type(exc).__name__)
+        return False
+    if not wrote:
+        logger.info("Job %s already terminal; skipping workflow-timeout status and event", job_id)
+        return False
+
+    _store_terminal_event_best_effort(
+        event_store,
+        {
+            "type": "job.error",
+            "data": {
+                "error": DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON,
+                "error_type": DeepResearchWorkflowTimeoutError.__name__,
+                "reason": DEEP_RESEARCH_WORKFLOW_TIMEOUT_REASON,
+            },
+        },
+    )
+    return True
+
+
+async def _handle_workflow_timeout(
+    event_store: Any,
+    sandbox_runtime: Any | None,
+    *,
+    db_url: str,
+    job_id: str,
+    teardown_timeout_seconds: float = SANDBOX_TERMINAL_TEARDOWN_TIMEOUT_SECONDS,
+) -> bool:
+    """Record timeout failure, force termination, then best-effort harvest."""
+    await _record_workflow_timeout_best_effort(event_store, db_url=db_url, job_id=job_id)
+    return await _terminate_then_harvest_sandbox_bounded(
+        sandbox_runtime,
+        job_id=job_id,
+        timeout_seconds=teardown_timeout_seconds,
+    )
 
 
 def _create_agent_instance(
@@ -1117,6 +1411,7 @@ def _create_agent_instance(
             max_research_concurrency=fn_config.max_research_concurrency,
             max_concurrent_source_tool_calls=fn_config.max_concurrent_source_tool_calls,
             max_source_tool_batch_size=fn_config.max_source_tool_batch_size,
+            max_writer_execute_attempts=fn_config.max_writer_execute_attempts,
         )
 
     if _constructor_accepts_explicit_kwargs(agent_cls, _CONFIGURABLE_AGENT_KWARGS):
@@ -1192,6 +1487,7 @@ async def _run_agent(
     data_sources: list[str] | None = None,
     event_store: EventStore | None = None,
     initial_files: dict[str, Any] | None = None,
+    workflow_timeout_seconds: float | None = None,
 ) -> Any:
     """
     Run the agent, supporting different run() signatures.
@@ -1215,6 +1511,7 @@ async def _run_agent(
                 agent.run(input_text),
                 monitor,
                 event_store=event_store,
+                timeout_seconds=workflow_timeout_seconds,
             )
 
         # Otherwise assume state-based pattern
@@ -1255,22 +1552,27 @@ async def _run_agent(
                 state["available_documents"] = available_documents
 
         async def call_next(current_state: Any) -> Any:
-            return await run_with_cancellation(
-                agent.run(current_state),
-                monitor,
-                event_store=event_store,
-            )
+            return await agent.run(current_state)
 
         if builder is None or config is None or function_name is None or function_config is None:
-            return await call_next(state)
+            invocation = call_next(state)
+        else:
+            invocation = _run_with_configured_function_middleware(
+                builder=builder,
+                config=config,
+                function_name=function_name,
+                function_config=function_config,
+                input_value=state,
+                call_next=call_next,
+            )
 
-        return await _run_with_configured_function_middleware(
-            builder=builder,
-            config=config,
-            function_name=function_name,
-            function_config=function_config,
-            input_value=state,
-            call_next=call_next,
+        # Keep the deadline outside the configured NAT middleware chain so time spent
+        # in function middleware and in the agent both count toward the workflow budget.
+        return await run_with_cancellation(
+            invocation,
+            monitor,
+            event_store=event_store,
+            timeout_seconds=workflow_timeout_seconds,
         )
 
     raise TypeError(f"Agent {type(agent).__name__} does not have a run method")

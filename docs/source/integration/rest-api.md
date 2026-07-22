@@ -304,10 +304,12 @@ curl http://localhost:8000/v1/jobs/async/job/{job_id}/state
 Durable artifacts are generated files such as charts, CSVs, notebooks, or documents
 harvested from a configured deep-research sandbox. Capture is opt-in: the deep researcher
 must have a sandbox and `artifact_capture.enabled: true`, and the API/worker must be able
-to open the artifact store. Successful `execute` calls checkpoint manifest-declared files.
-Success and failure paths perform one idempotent final manifest-plus-directory scan before
-cleanup. Cancellation performs that scan only when the provider is idle; a busy provider
-is terminated without waiting and artifacts from earlier checkpoints remain durable.
+to open the artifact store. Writer manifest writes and successful writer chart executions
+checkpoint manifest-declared files; researcher, planner, source-router, and orchestrator
+execution does not publish durable artifacts. Success and failure paths perform one
+idempotent final manifest-plus-directory scan before cleanup. Cancellation performs that
+scan only when the provider is idle; for a busy provider the runtime requests termination
+without extending the bounded worker wait, and artifacts from earlier checkpoints remain durable.
 Capture remains best-effort, so sandbox execution alone does not guarantee that every
 generated file is persisted.
 

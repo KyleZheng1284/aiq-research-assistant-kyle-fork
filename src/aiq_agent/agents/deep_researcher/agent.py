@@ -37,6 +37,7 @@ from aiq_agent.common.citation_verification import verify_citations
 
 from .custom_middleware import FinalReportCommitTracker
 from .custom_middleware import SourceRegistryMiddleware
+from .custom_middleware import validated_research_notes_from_state
 from .deepagents_runtime import DeepAgentsRuntime
 from .deepagents_runtime import DeepResearchSandboxConfig
 from .deepagents_runtime import DeepResearchSkillsConfig
@@ -44,16 +45,26 @@ from .factory import build_deep_research_graph
 from .factory import build_deep_research_middleware_set
 from .factory import build_deep_research_tool_set
 from .models import DeepResearchAgentState
+from .models import QuantitativeDataset
+from .models import ResearchNotes
 from .tools.source_tool_batching import DEFAULT_MAX_CONCURRENT_SOURCE_TOOL_CALLS
 from .tools.source_tool_batching import DEFAULT_MAX_SOURCE_TOOL_BATCH_SIZE
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_RESEARCH_CONCURRENCY = 6
+DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS = 3
 PARENT_REPORT_CONTEXT_PATH = "/shared/parent_report_context.json"
 
 # Path to this agent's directory (for loading prompts)
 AGENT_DIR = Path(__file__).parent
+
+_MAX_FALLBACK_REPORT_CHARS = 1024 * 1024
+_MAX_REQUIRED_TABLE_CHARS = 3 * _MAX_FALLBACK_REPORT_CHARS // 4
+_MAX_REQUIRED_PUBLISHED_DATASETS = 16
+_MAX_REQUIRED_UNPUBLISHED_DATASETS = 4
+_FALLBACK_OMISSION_NOTICE_RESERVE = 512
+_FALLBACK_TRUNCATION_MARKER = "\n\n_[Additional supporting evidence was truncated.]_"
 
 
 class DeepResearcherAgent:
@@ -79,6 +90,7 @@ class DeepResearcherAgent:
         max_research_concurrency: int = DEFAULT_MAX_RESEARCH_CONCURRENCY,
         max_concurrent_source_tool_calls: int = DEFAULT_MAX_CONCURRENT_SOURCE_TOOL_CALLS,
         max_source_tool_batch_size: int = DEFAULT_MAX_SOURCE_TOOL_BATCH_SIZE,
+        max_writer_execute_attempts: int = DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS,
     ) -> None:
         """
         Initialize the deep researcher agent.
@@ -98,6 +110,8 @@ class DeepResearcherAgent:
                 run_research_batch call.
             max_concurrent_source_tool_calls: Shared source-tool concurrency limit across researcher workers.
             max_source_tool_batch_size: Maximum concrete inputs per batch-capable source tool call.
+            max_writer_execute_attempts: Hard limit on writer-side chart execution attempts,
+                including physical retries.
         """
         self.llm_provider = llm_provider
         self.tools = list(tools) if tools else []
@@ -106,6 +120,7 @@ class DeepResearcherAgent:
         self.max_research_concurrency = max_research_concurrency
         self.max_concurrent_source_tool_calls = max_concurrent_source_tool_calls
         self.max_source_tool_batch_size = max_source_tool_batch_size
+        self.max_writer_execute_attempts = max_writer_execute_attempts
         self.domain_catalog_path = domain_catalog_path
         self.enable_source_router = enable_source_router
         self.enable_citation_verification = enable_citation_verification
@@ -134,6 +149,7 @@ class DeepResearcherAgent:
                 source_registry_middleware=self.source_registry_middleware,
                 enable_source_router=self.enable_source_router,
                 artifact_manager=self.deepagents_runtime.artifact_manager,
+                max_writer_execute_attempts=self.max_writer_execute_attempts,
             )
 
             self.source_tool_names = self.tool_set.source_tool_names
@@ -204,7 +220,7 @@ class DeepResearcherAgent:
         *,
         final_report_tracker: FinalReportCommitTracker,
     ) -> str | None:
-        """Extract only Markdown committed by the writer during this run."""
+        """Extract the current run's writer commit or a validated ResearchNotes fallback."""
         # Resolve result files first, then fall back to the passed-in files (state.files) and
         # finally an empty dict. Without the explicit grouping, `or files or {}` bound only to
         # the else branch, so a dict result lacking a usable "files" key silently discarded
@@ -212,7 +228,226 @@ class DeepResearcherAgent:
         result_files = result.get("files", None) if isinstance(result, dict) else getattr(result, "files", None)
         files = result_files or files or {}
         committed = final_report_tracker.committed_text(files)
-        return committed.strip() if committed is not None else None
+        notes = self._validated_research_notes(files)
+        required_tables = self._required_quantitative_tables(notes)
+        if committed is not None:
+            report = committed.strip()
+            if report and (not required_tables or self._contains_all_canonical_tables(report, required_tables)):
+                return report
+
+        fallback = self._build_research_notes_fallback(files, notes=notes)
+        return fallback[0] if fallback is not None else None
+
+    @staticmethod
+    def _validated_research_notes(files: object) -> list[ResearchNotes]:
+        """Load schema-valid notes through the shared researcher/writer trust boundary."""
+        return list(validated_research_notes_from_state({"files": files}))
+
+    def _required_quantitative_tables(self, notes: list[ResearchNotes]) -> tuple[str, ...]:
+        """Return the bounded canonical tables that the accepted report must preserve."""
+        selected, _ = self._select_required_quantitative_datasets(notes)
+        return tuple(dataset.markdown_table.strip() for _, dataset in selected)
+
+    def _select_required_quantitative_datasets(
+        self,
+        notes: list[ResearchNotes],
+    ) -> tuple[tuple[tuple[ResearchNotes, QuantitativeDataset], ...], int]:
+        """Select report tables by durable publication, then relevance, within hard limits.
+
+        Once a canonical CSV has been durably published, its runtime-trusted digest is the
+        job-lifetime signal that its table belongs in the report. Before any CSV is published,
+        the highest-relevance validated notes provide a deterministic fallback signal. Duplicate
+        CSV digests represent the same canonical serialization and are required only once.
+        """
+        candidates = [
+            (note_index, dataset_index, note, dataset)
+            for note_index, note in enumerate(notes)
+            for dataset_index, dataset in enumerate(note.quantitative_datasets)
+        ]
+        published_digests = self._published_canonical_digests()
+        if published_digests:
+            candidates = [candidate for candidate in candidates if candidate[3].csv_sha256 in published_digests]
+            max_datasets = _MAX_REQUIRED_PUBLISHED_DATASETS
+        else:
+            candidates.sort(
+                key=lambda candidate: (
+                    -(
+                        candidate[2].evidence_judgment.relevance_score
+                        if candidate[2].evidence_judgment is not None
+                        else 0
+                    ),
+                    candidate[0],
+                    candidate[1],
+                )
+            )
+            max_datasets = _MAX_REQUIRED_UNPUBLISHED_DATASETS
+
+        unique_candidates: list[tuple[int, int, ResearchNotes, QuantitativeDataset]] = []
+        seen_digests: set[str] = set()
+        for candidate in candidates:
+            digest = candidate[3].csv_sha256
+            if digest in seen_digests:
+                continue
+            seen_digests.add(digest)
+            unique_candidates.append(candidate)
+
+        selected: list[tuple[ResearchNotes, QuantitativeDataset]] = []
+        selected_chars = 0
+        for _, _, note, dataset in unique_candidates:
+            section_chars = len(self._canonical_table_section(dataset)) + (2 if selected else 0)
+            if len(selected) >= max_datasets or selected_chars + section_chars > _MAX_REQUIRED_TABLE_CHARS:
+                continue
+            selected.append((note, dataset))
+            selected_chars += section_chars
+
+        return tuple(selected), len(unique_candidates) - len(selected)
+
+    def _published_canonical_digests(self) -> frozenset[str]:
+        """Read the artifact manager's job-lifetime set of published canonical digests."""
+        manager = self.deepagents_runtime.artifact_manager
+        reader = getattr(manager, "published_canonical_digests", None) if manager is not None else None
+        if not callable(reader):
+            return frozenset()
+        try:
+            digests = reader()
+        except Exception:  # noqa: BLE001 - report fallback must survive best-effort artifact state reads
+            logger.warning("Unable to read published canonical dataset digests", exc_info=True)
+            return frozenset()
+        if not isinstance(digests, (set, frozenset, list, tuple)):
+            return frozenset()
+        return frozenset(digest for digest in digests if isinstance(digest, str))
+
+    @staticmethod
+    def _canonical_table_section(dataset: QuantitativeDataset) -> str:
+        """Render an exact canonical table with only its validated title added."""
+        return f"### {dataset.title.strip()}\n\n{dataset.markdown_table.strip()}"
+
+    @staticmethod
+    def _contains_all_canonical_tables(report: str, tables: tuple[str, ...]) -> bool:
+        """Check exact canonical table inclusion while tolerating newline style only."""
+        normalized_report = report.replace("\r\n", "\n").replace("\r", "\n")
+        return all(table.replace("\r\n", "\n").replace("\r", "\n") in normalized_report for table in tables)
+
+    def _build_research_notes_fallback(
+        self,
+        files: object,
+        *,
+        notes: list[ResearchNotes] | None = None,
+    ) -> tuple[str, bool] | None:
+        """Build a bounded report directly from validated researcher evidence.
+
+        This is the terminal safety net when the writer fails to create
+        ``output.md``. It performs no new analysis: quantitative tables and
+        summaries are copied from validated ``ResearchNotes`` and source
+        references are assigned deterministically.
+        """
+        notes = notes if notes is not None else self._validated_research_notes(files)
+        if not notes:
+            return None
+
+        source_numbers: dict[tuple[str, str], int] = {}
+        source_rows: list[tuple[int, str, str]] = []
+        local_source_numbers: list[dict[int, int]] = []
+        for note in notes:
+            note_numbers: dict[int, int] = {}
+            for source in note.sources:
+                key = (source.locator.strip(), source.title.strip())
+                number = source_numbers.get(key)
+                if number is None:
+                    number = len(source_rows) + 1
+                    source_numbers[key] = number
+                    source_rows.append((number, source.title.strip() or source.locator, source.locator.strip()))
+                note_numbers[source.id] = number
+            local_source_numbers.append(note_numbers)
+
+        sections = [
+            "# Research Report",
+            (
+                "> The final synthesis step did not complete. This bounded fallback preserves "
+                "the validated researcher evidence and canonical quantitative tables without rerunning analysis."
+            ),
+        ]
+        selected_datasets, omitted_table_count = self._select_required_quantitative_datasets(notes)
+        selected_dataset_objects = {id(dataset) for _, dataset in selected_datasets}
+        if selected_datasets:
+            sections.append("## Canonical quantitative evidence")
+            sections.extend(self._canonical_table_section(dataset) for _, dataset in selected_datasets)
+
+        rendered_chars = sum(len(section) for section in sections) + 2 * (len(sections) - 1)
+        optional_limit = _MAX_FALLBACK_REPORT_CHARS - _FALLBACK_OMISSION_NOTICE_RESERVE
+        optional_evidence_omitted = False
+
+        def append_optional(section: str) -> None:
+            """Append optional evidence without consuming the omission-notice reserve."""
+            nonlocal optional_evidence_omitted
+            nonlocal rendered_chars
+            section = section.strip()
+            if not section:
+                return
+            separator_chars = 2 if sections else 0
+            available = optional_limit - rendered_chars - separator_chars
+            if available <= 0:
+                optional_evidence_omitted = True
+                return
+            if len(section) > available:
+                optional_evidence_omitted = True
+                if available <= len(_FALLBACK_TRUNCATION_MARKER):
+                    return
+                section = section[: available - len(_FALLBACK_TRUNCATION_MARKER)].rstrip()
+                section += _FALLBACK_TRUNCATION_MARKER
+            sections.append(section)
+            rendered_chars += separator_chars + len(section)
+
+        if source_rows:
+            sources = ["## Sources"]
+            for number, title, locator in source_rows:
+                sources.append(f"[{number}] {title}: {locator}")
+            append_optional("\n".join(sources))
+
+        for note, note_numbers in zip(notes, local_source_numbers, strict=True):
+            note_sections = [f"## {note.query_topic.strip() or 'Research findings'}"]
+            if note.summary.strip():
+                note_sections.append(note.summary.strip())
+            if note.findings:
+                findings = ["### Findings"]
+                for finding in note.findings:
+                    citations = sorted(
+                        {note_numbers[source_id] for source_id in finding.source_ids if source_id in note_numbers}
+                    )
+                    citation_text = "".join(f"[{number}]" for number in citations)
+                    evidence = finding.evidence.strip()
+                    line = f"- **{finding.claim.strip()}**"
+                    if evidence:
+                        line += f" {evidence}"
+                    if citation_text:
+                        line += f" {citation_text}"
+                    findings.append(line)
+                note_sections.append("\n".join(findings))
+            for dataset in note.quantitative_datasets:
+                if id(dataset) not in selected_dataset_objects:
+                    continue
+                dataset_section = [f"### {dataset.title} — analysis", dataset.summary.strip()]
+                if dataset.caveats:
+                    dataset_section.extend(["#### Caveats", *[f"- {caveat.strip()}" for caveat in dataset.caveats]])
+                note_sections.append("\n\n".join(part for part in dataset_section if part))
+            if note.gaps:
+                note_sections.append("### Remaining gaps\n" + "\n".join(f"- {gap.description}" for gap in note.gaps))
+            append_optional("\n\n".join(note_sections))
+
+        if omitted_table_count or optional_evidence_omitted:
+            omitted = []
+            if omitted_table_count:
+                noun = "table" if omitted_table_count == 1 else "tables"
+                verb = "was" if omitted_table_count == 1 else "were"
+                omitted.append(f"{omitted_table_count} additional validated quantitative {noun} {verb} omitted")
+            if optional_evidence_omitted:
+                omitted.append("some supporting evidence was truncated or omitted")
+            notice = (
+                "> Bounded fallback notice: " + "; ".join(omitted) + " to keep this report within its safety limit."
+            )
+            sections.append(notice)
+
+        return "\n\n".join(sections).strip(), bool(selected_datasets)
 
     @staticmethod
     def _read_seed_file_text(files: dict[str, Any], path: str) -> str | None:

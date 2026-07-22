@@ -52,7 +52,12 @@ Test coverage:
         - Routes registered when infrastructure available
 """
 
+import json
+from hashlib import sha256
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -266,6 +271,112 @@ class TestRegisterRoutes:
 
         assert mock_app.post.call_count >= 2
         assert mock_app.get.call_count >= 6
+
+
+class TestArtifactRoutes:
+    """End-to-end route contract for a runtime-verified canonical CSV."""
+
+    @pytest.mark.asyncio
+    async def test_canonical_csv_sha_and_exact_bytes_round_trip_through_job_api(self, tmp_path):
+        """The original artifacts API surface returns the canonical digest and bytes."""
+        from fastapi import FastAPI
+        from httpx import ASGITransport
+        from httpx import AsyncClient
+
+        from aiq_agent.agents.deep_researcher.sandbox.artifacts import ArtifactManager
+        from aiq_agent.agents.deep_researcher.sandbox.artifacts import SqlArtifactStore
+        from aiq_agent.agents.deep_researcher.sandbox.config import ArtifactCaptureConfig
+        from aiq_api.routes.jobs import register_job_routes
+
+        job_id = "canonical-api-job"
+        artifact_dir = "/sandbox/canonical-api-job/aiq-artifacts"
+        csv_path = f"{artifact_dir}/revenue.csv"
+        manifest_path = f"{artifact_dir}/manifest.json"
+        csv_bytes = b"quarter,revenue\r\nQ1,22.6\r\nQ2,26.3\r\n"
+        digest = sha256(csv_bytes).hexdigest()
+        manifest = json.dumps(
+            {
+                "version": 1,
+                "artifacts": [
+                    {
+                        "path": csv_path,
+                        "kind": "dataset",
+                        "inline": False,
+                        "expected_sha256": digest,
+                    }
+                ],
+            }
+        ).encode("utf-8")
+
+        class _Backend:
+            files = {manifest_path: manifest, csv_path: csv_bytes}
+
+            def download_files(self, paths):
+                return [
+                    SimpleNamespace(
+                        path=path,
+                        content=self.files.get(path),
+                        error=None if path in self.files else "not found",
+                    )
+                    for path in paths
+                ]
+
+        db_url = f"sqlite:///{tmp_path / 'jobs.db'}"
+        store = SqlArtifactStore(db_url)
+        manager = ArtifactManager(
+            job_id=job_id,
+            backend=_Backend(),
+            store=store,
+            config=ArtifactCaptureConfig(enabled=True),
+            artifact_dir=artifact_dir,
+        )
+        manager.register_canonical_digests([digest])
+        [captured] = manager.harvest_after_execute()
+
+        app = FastAPI()
+        worker = MagicMock()
+        worker._dask_available = True
+        worker._job_store = MagicMock()
+        worker._scheduler_address = "tcp://localhost:8786"
+        worker._db_url = db_url
+        worker._config_file_path = "/path/to/config.yml"
+        worker._log_level = 20
+        worker._use_dask_threads = False
+        worker._front_end_config = SimpleNamespace(expiry_seconds=86400)
+
+        with (
+            patch(
+                "aiq_api.mcp_auth.factory.build_mcp_auth_provider",
+                new=AsyncMock(return_value=MagicMock()),
+            ),
+            patch("aiq_api.routes.auth.register_mcp_auth_routes"),
+            patch(
+                "aiq_api.jobs.crypto.validate_content_encryption_startup_async",
+                new=AsyncMock(),
+            ),
+            patch(
+                "aiq_api.jobs.access.authorize_job_access",
+                new=AsyncMock(return_value=SimpleNamespace(job_id=job_id)),
+            ),
+            patch(
+                "aiq_api.routes.jobs.require_verified_principal",
+                return_value=SimpleNamespace(subject="test-owner"),
+            ),
+        ):
+            await register_job_routes(app, MagicMock(), worker)
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                listing = await client.get(f"/v1/jobs/async/job/{job_id}/artifacts")
+                content = await client.get(f"/v1/jobs/async/job/{job_id}/artifacts/{captured.artifact_id}/content")
+
+        assert listing.status_code == 200
+        [metadata] = listing.json()["artifacts"]
+        assert metadata["sha256"] == digest
+        assert metadata["filename"] == "revenue.csv"
+        assert content.status_code == 200
+        assert content.content == csv_bytes
 
 
 class TestArtifactHelpers:

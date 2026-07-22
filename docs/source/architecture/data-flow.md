@@ -41,7 +41,7 @@ sequenceDiagram
         A->>ES: Store intermediate events
         ES-->>SSE: Push events to client
         SSE-->>C: SSE event data
-        opt Successful sandbox execute with artifact capture enabled
+        opt Writer publication checkpoint with artifact capture enabled
             A->>AS: Checkpoint manifest-declared files
             A->>ES: Store artifact.update metadata
             ES-->>SSE: Push artifact.update
@@ -60,11 +60,13 @@ sequenceDiagram
     SSE-->>C: job.status {status: SUCCESS}
 ```
 
-Artifact checkpoints run after successful sandbox `execute` calls. On a terminal
-success or failure path, the worker performs one idempotent manifest-plus-directory
-scan before sandbox cleanup. Cancellation performs that scan only when the provider
-operation lease is immediately available; otherwise the provider is terminated without
-waiting and artifacts from earlier checkpoints remain durable.
+Artifact checkpoints run after writer manifest writes and successful writer chart
+executions. Researcher, planner, source-router, and orchestrator execution cannot publish
+durable artifacts. On a terminal success or failure path, the worker performs one
+idempotent manifest-plus-directory scan before sandbox cleanup. Cancellation performs that
+scan only when the provider operation lease is immediately available; otherwise the
+runtime requests provider termination without extending the bounded worker wait, and
+artifacts from earlier checkpoints remain durable.
 
 ## Async Job States
 
@@ -182,10 +184,11 @@ events.
 | `todo` | A research task tracked by `TodoListMiddleware` |
 
 Durable sandbox artifacts are a separate persistence contract for generated files such as charts, CSVs,
-notebooks, and documents. Capture is opt-in and best-effort. Successful `execute` calls checkpoint
-manifest-declared files; success/failure terminal paths perform one final manifest-plus-directory scan, while a
-busy cancellation skips that scan rather than waiting on the provider. The durable store, not the replayed event,
-is authoritative for artifact records and bytes. Stored `artifact.update` events provide metadata-only live and
+notebooks, and documents. Capture is opt-in and best-effort. Writer manifest writes and successful writer chart
+executions checkpoint manifest-declared files; execution by other roles does not publish durable artifacts.
+Success/failure terminal paths perform one final manifest-plus-directory scan, while a busy cancellation skips that
+scan rather than waiting on the provider. The durable store, not the replayed event, is authoritative for artifact
+records and bytes. Stored `artifact.update` events provide metadata-only live and
 replayed delivery to clients, including the web UI Files tab. A rejected candidate instead emits top-level
 `artifact.warning`. List authoritative metadata with `GET /v1/jobs/async/job/{job_id}/artifacts` and fetch content with
 `GET /v1/jobs/async/job/{job_id}/artifacts/{artifact_id}/content`. Refer to the

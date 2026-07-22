@@ -22,9 +22,11 @@ import hashlib
 import json
 import logging
 import re
+from contextvars import ContextVar
 from typing import Any
 from typing import cast
 
+from langchain.agents.structured_output import StructuredOutputValidationError
 from langchain.tools import ToolRuntime
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
@@ -36,7 +38,62 @@ from ..models import ResearchQuery
 _NO_TOOL_RUNTIME = cast(ToolRuntime, None)
 logger = logging.getLogger(__name__)
 _NOTE_SLUG_MAX_LENGTH = 64
+_MAX_STRUCTURED_OUTPUT_CORRECTIONS = 2
+_STRUCTURED_OUTPUT_ERROR_MAX_CHARS = 4000
+_structured_output_correction_state: ContextVar[dict[str, Any] | None] = ContextVar(
+    "researcher_structured_output_correction_state",
+    default=None,
+)
 RESEARCHER_AGENT_NAME = "researcher-agent"
+
+
+def _salvage_textual_research_notes(error: StructuredOutputValidationError) -> ResearchNotes | None:
+    """Return valid non-quantitative notes when only a dataset payload is invalid.
+
+    The structured-output exception retains the model's exact tool arguments.
+    Removing ``quantitative_datasets`` is deliberately the only repair made by
+    the runtime: all textual fields still have to satisfy ``ResearchNotes``.
+    """
+    for tool_call in error.ai_message.tool_calls:
+        if tool_call.get("name") != error.tool_name:
+            continue
+        arguments = tool_call.get("args")
+        if not isinstance(arguments, dict) or "quantitative_datasets" not in arguments:
+            continue
+
+        textual_arguments = dict(arguments)
+        textual_arguments["quantitative_datasets"] = []
+        try:
+            return ResearchNotes.model_validate(textual_arguments)
+        except Exception:  # noqa: BLE001 - only a fully valid textual contract is salvageable
+            return None
+    return None
+
+
+def handle_research_notes_structured_error(error: Exception) -> str:
+    """Provide at most two task-local validation-feedback turns to the researcher."""
+    correction_state = _structured_output_correction_state.get()
+    if correction_state is None:
+        raise error
+    if isinstance(error, StructuredOutputValidationError):
+        fallback_note = _salvage_textual_research_notes(error)
+        if fallback_note is not None:
+            correction_state["fallback_note"] = fallback_note
+    correction_count = correction_state["count"]
+    if correction_count >= _MAX_STRUCTURED_OUTPUT_CORRECTIONS:
+        raise error
+
+    correction_count += 1
+    correction_state["count"] = correction_count
+    validation_detail = str(error)
+    if len(validation_detail) > _STRUCTURED_OUTPUT_ERROR_MAX_CHARS:
+        validation_detail = f"{validation_detail[:_STRUCTURED_OUTPUT_ERROR_MAX_CHARS]}..."
+    return (
+        "The ResearchNotes response failed validation. "
+        f"This is bounded correction {correction_count} of {_MAX_STRUCTURED_OUTPUT_CORRECTIONS}. "
+        "Preserve valid textual findings and sources, correct the quantitative dataset fields, and return "
+        f"ResearchNotes without doing more research. Validation error: {validation_detail}"
+    )
 
 
 def format_research_request(query: ResearchQuery) -> str:
@@ -83,25 +140,40 @@ async def _run_research_query(
 ) -> ResearchNotes:
     """Run one researcher worker and return its structured notes."""
     async with semaphore:
+        correction_state: dict[str, Any] = {"count": 0, "fallback_note": None}
+        correction_token = _structured_output_correction_state.set(correction_state)
         try:
-            result = await researcher_runnable.ainvoke(
-                researcher_invoke_state(query, runtime),
-                config=researcher_invoke_config(runtime, callbacks),
-            )
-        except Exception as exc:  # noqa: BLE001 - captured as per-item failure
-            raise RuntimeError(f"researcher worker failed for query {query.query!r}: {exc}") from exc
+            try:
+                result = await researcher_runnable.ainvoke(
+                    researcher_invoke_state(query, runtime),
+                    config=researcher_invoke_config(runtime, callbacks),
+                )
+            except StructuredOutputValidationError as exc:
+                note = _salvage_textual_research_notes(exc) or correction_state["fallback_note"]
+                if note is not None:
+                    logger.warning(
+                        "Omitting invalid quantitative dataset publication after bounded structured-output corrections "
+                        "for query %r",
+                        query.query,
+                    )
+                    return note
+                raise RuntimeError(f"researcher worker failed for query {query.query!r}: {exc}") from exc
+            except Exception as exc:  # noqa: BLE001 - captured as per-item failure
+                raise RuntimeError(f"researcher worker failed for query {query.query!r}: {exc}") from exc
 
-        try:
-            structured = result.get("structured_response") if isinstance(result, dict) else None
-            if structured is None:
-                raise ValueError("researcher worker did not return structured ResearchNotes")
-            note = ResearchNotes.model_validate(structured)
-        except Exception as exc:  # noqa: BLE001 - captured as per-item failure
-            raise ValueError(
-                f"researcher worker returned invalid ResearchNotes for query {query.query!r}: {exc}"
-            ) from exc
+            try:
+                structured = result.get("structured_response") if isinstance(result, dict) else None
+                if structured is None:
+                    raise ValueError("researcher worker did not return structured ResearchNotes")
+                note = ResearchNotes.model_validate(structured)
+            except Exception as exc:  # noqa: BLE001 - captured as per-item failure
+                raise ValueError(
+                    f"researcher worker returned invalid ResearchNotes for query {query.query!r}: {exc}"
+                ) from exc
 
-        return note
+            return note
+        finally:
+            _structured_output_correction_state.reset(correction_token)
 
 
 def _research_note_slug(text: str) -> str:
@@ -135,15 +207,50 @@ def _persist_research_notes(
     backend: Any | None,
     queries: list[ResearchQuery],
     notes: list[ResearchNotes],
-) -> None:
-    """Persist returned ResearchNotes into parent /shared state."""
-    if backend is None or not notes:
-        return
+) -> bool:
+    """Persist returned ResearchNotes into parent /shared state.
 
-    responses = backend.upload_files(_research_note_files(queries, notes))
+    Returns whether the notes were durably handed to the configured backend.
+    """
+    if backend is None or not notes:
+        return False
+
+    note_files = _research_note_files(queries, notes)
+    responses = list(backend.upload_files(note_files))
+    if len(responses) != len(note_files):
+        raise RuntimeError("failed to persist every research note file")
     errors = [f"{response.path}: {response.error}" for response in responses if getattr(response, "error", None)]
     if errors:
         raise RuntimeError(f"failed to persist research note file(s): {'; '.join(errors)}")
+    return True
+
+
+def _canonical_dataset_digests(notes: list[ResearchNotes]) -> list[str]:
+    """Recompute and verify canonical CSV digests at the publication trust boundary."""
+    digests: list[str] = []
+    for note in notes:
+        for dataset in note.quantitative_datasets:
+            runtime_digest = hashlib.sha256(dataset.csv_text.encode("utf-8")).hexdigest()
+            if dataset.csv_sha256 != runtime_digest:
+                raise ValueError("canonical dataset digest no longer matches its validated csv_text")
+            digests.append(runtime_digest)
+    return digests
+
+
+def _register_canonical_dataset_digests(
+    *,
+    artifact_manager: Any | None,
+    notes: list[ResearchNotes],
+    expected_digests: list[str] | None = None,
+) -> None:
+    """Register reverified canonical CSV digests with the job artifact manager."""
+    if artifact_manager is None:
+        return
+    digests = _canonical_dataset_digests(notes)
+    if expected_digests is not None and digests != expected_digests:
+        raise ValueError("canonical dataset digests changed before artifact registration")
+    if digests:
+        artifact_manager.register_canonical_digests(digests)
 
 
 async def _run_research_queries(
@@ -190,6 +297,7 @@ def build_research_batch_tool(
     max_research_concurrency: int,
     backend: Any | None = None,
     source_registry_middleware: Any | None = None,
+    artifact_manager: Any | None = None,
 ) -> BaseTool:
     """Build an orchestrator-only tool that runs researcher tasks concurrently."""
 
@@ -216,7 +324,15 @@ def build_research_batch_tool(
         )
         if source_registry_middleware is not None:
             source_registry_middleware.register_research_note_sources(notes)
-        _persist_research_notes(backend=backend, queries=successful_queries, notes=notes)
+        canonical_digests = _canonical_dataset_digests(notes)
+        notes_persisted = _persist_research_notes(backend=backend, queries=successful_queries, notes=notes)
+        if canonical_digests and artifact_manager is not None and not notes_persisted:
+            raise RuntimeError("canonical dataset digests cannot be registered before ResearchNotes persistence")
+        _register_canonical_dataset_digests(
+            artifact_manager=artifact_manager,
+            notes=notes,
+            expected_digests=canonical_digests,
+        )
 
         if errors:
             retained_detail = ""

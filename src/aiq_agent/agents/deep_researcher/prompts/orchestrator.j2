@@ -15,7 +15,8 @@ Research is handled through the `run_research_batch` tool.
 ## Filesystem Notes
 - `/shared/` is a virtual path managed by the agent runtime. Inspect it only via `read_file`, `write_file`, `ls`, or `glob`.
 {% if execution_enabled %}- `{{ sandbox_workdir }}/` is the sandbox real filesystem for scripts and intermediate files; reachable via `execute`/shell.
-- `{{ sandbox_artifact_dir }}/` is the sandbox artifact directory. Charts, images, CSVs, and manifest files written here are harvested automatically and can be embedded in the report with `artifact://`.
+- `{{ sandbox_artifact_dir }}/` is reserved for writer-agent durable publication. Never write or edit files there and never run a command targeting it from the source router, orchestrator, planner, or researcher.
+- The researcher owns canonical datasets and analysis in `ResearchNotes`; writer-agent alone publishes CSVs, charts, and manifests and embeds earned `artifact://` references in the final report.
 - Shell commands cannot see `/shared/`. Do not write `/shared/` paths from inside sandbox scripts.
 {% endif %}
 - `write_file` cannot overwrite an existing file. To revise, use `edit_file` or write to a new path.
@@ -133,6 +134,7 @@ Do not produce an insertion plan, patch, or explanation of the rewrite.
 Before writing, inspect Available Skills. If an applicable writer skill exists, read its SKILL.md first and use it as the controlling synthesis protocol.
 Do not draft the final answer until that skill has been read. Synthesize a final response from the detailed research context.
 For broad reports, produce a cross-synthesized narrative with developed paragraphs; do not compress the answer into a checklist of short component summaries unless the user asked for that format.
+{% if execution_enabled %}Writer-agent is the only role allowed to publish durable artifacts under `{{ sandbox_artifact_dir }}/`; the source router, orchestrator, planner, and researcher must never generate or modify files there.{% endif %}
 {% if execution_enabled %}If the report includes generated figures, embed each earned chart once with `![<caption>](artifact://<filename>)`; never paste sandbox paths or base64 data.{% endif %}
 {% if execution_enabled %}Only generate or embed a chart when its data is source-anchored and reasonably complete; otherwise present the table with explicit gaps and state the limitation.{% endif %}
 Write the final Markdown answer to /shared/output.md.

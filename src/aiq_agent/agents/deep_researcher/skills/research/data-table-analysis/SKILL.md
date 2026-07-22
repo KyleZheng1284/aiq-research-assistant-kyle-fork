@@ -6,7 +6,11 @@ description: >
 
 # Data Table Analysis Skill
 
-Generate accurate, source-grounded tables and computed quantitative summaries using Python/pandas. This skill produces text artifacts that can be read and included in the final report.
+Generate accurate, source-grounded tables and computed quantitative summaries using Python/pandas.
+This skill is the canonical quantitative evidence producer: it returns runtime-validated CSV
+text and a Markdown table produced from the same successful DataFrame, plus calculations,
+provenance, and caveats in `ResearchNotes`. The runtime does not compare the Markdown table
+with the CSV, and this skill never publishes durable files.
 
 ## Required Execution Standard
 
@@ -15,8 +19,35 @@ To ensure the calculation is reproducible and useful, you MUST:
 2. **Preserve Provenance:** Keep source URLs, filing names, or note references in the input table when available.
 3. **Normalize Units:** Convert currencies, magnitudes, periods, and date labels into consistent fields before comparing values.
 4. **Compute Deterministically:** Call the `execute` tool to run Python/pandas for arithmetic, rankings, growth rates, aggregates, and formatting. Do not hand-compute these values in prose.
-5. **Return Text Outputs:** Include the markdown, CSV, or JSON output in your returned `ResearchNotes` (e.g. a `ResearchFinding`'s `evidence` and/or `narrative_notes`). Do not call `write_file`; `run_research_batch` persists your returned notes.
+5. **Create One Canonical Dataset per Final DataFrame:** Generate `csv_text` and
+   `markdown_table` from the same successfully analyzed DataFrame and return them in
+   `ResearchNotes.quantitative_datasets`, up to four independently useful datasets per note.
+   `csv_text` is the sole canonical serialization for downstream durable publication.
 6. **Report Caveats:** Include assumptions, missing values, restatements, estimated figures, or non-comparable metrics in the output notes.
+7. **Do Not Publish:** Never call `write_file` or `edit_file`, write under
+   `sandbox_artifact_dir`, create `manifest.json`, render a PNG, or emit an `artifact://`
+   reference. The writer owns durable artifact publication and visualization.
+
+## QuantitativeDataset Contract
+
+For each independently useful table, append one `QuantitativeDataset` to
+`ResearchNotes.quantitative_datasets`:
+
+- `dataset_id`: lowercase stable identifier matching `[a-z0-9][a-z0-9_-]{0,63}`.
+- `title`: concise, non-empty human-readable title.
+- `csv_text`: exact UTF-8 CSV returned by the successful pandas run.
+- `markdown_table`: report-ready table produced from the same DataFrame and columns.
+- `summary`: interpretation of the calculations, rankings, or statistics already computed.
+- `source_ids`: unique IDs that exist in the enclosing `ResearchNotes.sources` list.
+- `caveats`: assumptions, gaps, estimates, restatements, and comparability limitations.
+
+Do not calculate, guess, or return `csv_sha256`; the runtime validates `csv_text` and computes
+the trusted digest after the structured response is accepted.
+
+Keep each dataset report-sized: at least one data row, no more than 5,000 rows or 128 columns,
+and no more than 64 KiB of UTF-8 CSV. A note may contain at most four datasets. Headers must be
+non-empty, unique, and free of surrounding whitespace. Use valid quoted CSV with consistent row
+widths and no blank records, BOM, NUL, DEL, or other control characters beyond tab/newlines.
 
 ## Data honesty
 
@@ -46,17 +77,26 @@ so it must be honest about what is and isn't known:
    - validates data types,
    - standardizes units and period labels,
    - computes the requested metrics,
-   - prints markdown, CSV, JSON, and data-quality notes as text.
+   - prints `csv_text`, `markdown_table`, summary statistics, and data-quality notes as text,
+   - creates `csv_text` and `markdown_table` from the same final DataFrame and column order,
    - uses your sandbox working directory (`sandbox_workdir`) for any sandbox-local input or output files, and writes any script file at the job-unique path your instructions specify (the `<job_id>_<name>.py` form) so a shared sandbox never reuses a stale leftover from another job.
    - does not read from or write to `/shared/...` inside the sandbox process.
 
-4. Inspect the `execute` output. If the code fails, fix the code and call `execute` again. Do not continue with hand-computed fallback tables unless the sandbox or pandas is unavailable.
+4. Inspect the `execute` output. If the code fails, fix the code and call `execute` again. Do
+   not continue with hand-computed fallback tables unless the sandbox or pandas is unavailable.
+   Do not start a separate repair loop after the structured-output validator rejects a dataset;
+   return the supported narrative findings and let the bounded response correction handle it.
 
-5. Return the final outputs from the successful `execute` run in your `ResearchNotes` — put the markdown table, CSV, or JSON into a `ResearchFinding`'s `evidence` and/or `narrative_notes`. Do not call `write_file`/`edit_file`; `run_research_batch` persists your returned notes under `/shared/` automatically.
+5. Return the final outputs from the successful `execute` run as a
+   `ResearchNotes.quantitative_datasets` entry. Findings may explain the numbers, but they are
+   not a substitute for the canonical dataset. Do not call `write_file`/`edit_file`;
+   `run_research_batch` persists the structured notes under `/shared/` automatically.
 
 6. In the response or report, cite the original sources for the input figures. Computed columns should be clearly labeled as calculations.
 
-**Required Tool Use:** For tasks that request calculated tables, growth rates, rankings, summary statistics, normalization, CSV, or JSON, this skill requires at least one `execute` call that runs Python/pandas before writing the final artifacts.
+**Required Tool Use:** For tasks that request calculated tables, growth rates, rankings,
+summary statistics, normalization, CSV, or JSON, this skill requires at least one `execute`
+call that runs Python/pandas before returning the canonical dataset.
 
 ---
 
@@ -85,10 +125,15 @@ so it must be honest about what is and isn't known:
 
 ## Output Formats
 
-Return text outputs in your `ResearchNotes` for synthesis:
-- a Markdown table - tables and explanatory notes for report inclusion.
-- CSV text - normalized tabular data for reuse.
-- a JSON block - structured records, assumptions, and summary metrics.
+Return one canonical `QuantitativeDataset` per independently useful final DataFrame, up to
+four per `ResearchNotes`, for synthesis:
+
+- `markdown_table` for report inclusion.
+- exact `csv_text` for writer-owned durable publication.
+- `summary`, `source_ids`, and `caveats` for interpretation and provenance.
+
+Additional JSON may appear in findings when useful, but it must not become a second canonical
+row representation that can diverge from `csv_text`.
 
 **Note:** Label each output clearly (e.g. an "AI capex 8Q growth" table) so the writer can use it.
 
@@ -134,8 +179,9 @@ display_cols = [
     "source",
     "notes",
 ]
-markdown_table = df[display_cols].to_markdown(index=False, floatfmt=".1f")
-csv_text = df[display_cols].to_csv(index=False)
+final_df = df[display_cols]
+markdown_table = final_df.to_markdown(index=False, floatfmt=".1f")
+csv_text = final_df.to_csv(index=False, lineterminator="\n")
 ```
 
 ### B. Rank Entities by Latest Comparable Period

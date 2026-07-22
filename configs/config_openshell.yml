@@ -120,9 +120,10 @@ functions:
     _type: deep_research_skills
     agents:
       researcher-agent: [research]
-      writer-agent: [synthesis, research]
+      writer-agent: [synthesis]
     require_sandbox:
       - research
+      - synthesis
 
   deep_research_sandbox:
     _type: deep_research_sandbox
@@ -161,6 +162,7 @@ functions:
   deep_research_agent:
     _type: deep_research_agent
     enable_citation_verification: true
+    workflow_timeout_seconds: ${AIQ_DEEP_RESEARCH_WORKFLOW_TIMEOUT_SECONDS:-3600}
     orchestrator_llm: nemotron_super_llm
     source_router_llm: nemotron_super_llm
     researcher_llm: nemotron_super_llm

@@ -43,6 +43,7 @@ Your output will be used to write a cited final answer. Produce **in-depth, deta
 - **Analysis**: provide in-depth analysis of the findings, including comparisons, contrasts, and implications when relevant
 - **Component coverage**: Use the `target_components` from the ResearchQuery to identify which final-answer components these notes support.
 - **Evidence judgment**: Set `evidence_judgment` with a 0-100 usefulness score, confidence, and short rationale based on relevance to the assigned query, target_components, source quality, specificity, and unresolved gaps.
+- **Canonical quantitative evidence**: When `data-table-analysis` produces a table, return each final DataFrame as one `quantitative_datasets` entry containing its exact `csv_text`, matching `markdown_table`, computed summary, source IDs, and caveats. The writer publishes those exact results; it must not redo your analysis.
 - **Language**: You MUST match the language specified in `/shared/plan.json` when available; otherwise match the language of the query for your synthesis and findings e.g. If the query is in Chinese, write your synthesis and findings in Chinese.
 
 ## Tool Use
@@ -50,7 +51,7 @@ Your output will be used to write a cited final answer. Produce **in-depth, deta
 {% if execution_enabled %}- `execute` runs shell commands in the sandbox only.
 - Each `execute` runs in a fresh shell; `cd` does not persist between calls. Never use a standalone `cd` — use absolute paths in every command (or `cd <dir> && <cmd>` in one line).
 - Never pass agent source tool names to `execute`.
-- When a skill has you run code, write scripts and intermediate files under `{{ sandbox_workdir }}` and durable artifacts (charts, CSVs, plus their `manifest.json`) under `{{ sandbox_artifact_dir }}` exactly as the skill describes. Both are per-job paths, so use them verbatim and do not write artifacts to any other location (the runtime only harvests `{{ sandbox_artifact_dir }}`).
+- When a research skill has you run code, write scripts and temporary inputs only under `{{ sandbox_workdir }}`. Never write to `{{ sandbox_artifact_dir }}`, create `manifest.json`, render publication charts, or emit artifact references. Return canonical datasets in `ResearchNotes`; the writer alone owns durable publication.
 {% endif %}
 - Default source budget per ResearchQuery: one primary source-tool call, plus at most one fallback or corroboration call.
 - For broad survey queries, make at most one extra targeted follow-up after the first results, only when needed for target_components.
@@ -75,6 +76,8 @@ Source rules:
 - For internal documents, set `source_type` to `internal_document` and `locator` to the document/page citation.
 - For URL-less structured tool sources, set `source_type` to `tool` and `locator` to the raw tool name.
 - Findings must cite sources by `source_ids`.
+- Quantitative-dataset `source_ids` must be unique and must reference IDs present in this note's `sources` list.
+- Do not calculate or guess `csv_sha256`; the runtime computes it from validated `csv_text`.
 - Put short exact quotes, if needed, inside `evidence`; do not create separate quote fields.
 - Use empty lists for no gaps/caveats.
 

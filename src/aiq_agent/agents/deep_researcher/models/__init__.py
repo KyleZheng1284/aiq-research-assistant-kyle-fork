@@ -18,6 +18,7 @@ from .subagent_contracts import AnswerComponent
 from .subagent_contracts import AnswerStrategy
 from .subagent_contracts import Constraint
 from .subagent_contracts import EvidenceJudgment
+from .subagent_contracts import QuantitativeDataset
 from .subagent_contracts import ResearchFinding
 from .subagent_contracts import ResearchGap
 from .subagent_contracts import ResearchNotes
@@ -34,6 +35,7 @@ __all__ = [
     "Constraint",
     "DeepResearchAgentState",
     "EvidenceJudgment",
+    "QuantitativeDataset",
     "ResearchFinding",
     "ResearchGap",
     "ResearchNotes",

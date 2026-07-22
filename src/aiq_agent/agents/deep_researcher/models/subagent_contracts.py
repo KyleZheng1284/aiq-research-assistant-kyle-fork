@@ -15,12 +15,33 @@
 
 """Structured response contracts for deep researcher planning, research, and synthesis."""
 
+from __future__ import annotations
+
+import csv
+import hashlib
+import io
 from typing import ClassVar
 from typing import Literal
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import field_validator
+from pydantic import model_validator
+
+_DATASET_ID_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,63}$"
+_MAX_DATASETS_PER_NOTE = 4
+_MAX_CSV_BYTES_PER_DATASET = 64 * 1024
+_MAX_CSV_BYTES_PER_NOTE = 128 * 1024
+_MAX_CSV_DATA_ROWS = 5_000
+_MAX_CSV_COLUMNS = 128
+_MAX_DATASET_TITLE_CHARS = 256
+_MAX_MARKDOWN_TABLE_CHARS = 64 * 1024
+_MAX_DATASET_SUMMARY_CHARS = 8 * 1024
+_MAX_DATASET_CAVEATS = 32
+_MAX_DATASET_CAVEAT_CHARS = 2 * 1024
+_MAX_DATASET_SOURCE_IDS = 128
+_ALLOWED_CSV_CONTROLS = frozenset({"\t", "\n", "\r"})
 
 
 class _StrictContract(BaseModel):
@@ -178,6 +199,172 @@ class EvidenceJudgment(_StrictContract):
     rationale: str = Field(description="Concise explanation of the relevance score and confidence.")
 
 
+class QuantitativeDataset(_StrictContract):
+    """Canonical quantitative evidence produced by a researcher worker.
+
+    ``csv_text`` is the sole canonical serialization. Validation inspects it but
+    never normalizes or reserializes it, and ``csv_sha256`` is always recomputed
+    from its exact UTF-8 bytes rather than trusted from model output.
+    """
+
+    model_config: ClassVar[ConfigDict] = {
+        "extra": "forbid",
+        "frozen": True,
+        "revalidate_instances": "always",
+    }
+
+    dataset_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=_DATASET_ID_PATTERN,
+        description="Stable lowercase identifier containing letters, digits, underscores, or hyphens.",
+    )
+    title: str = Field(
+        min_length=1,
+        max_length=_MAX_DATASET_TITLE_CHARS,
+        description="Concise human-facing dataset title.",
+    )
+    csv_text: str = Field(description="Exact UTF-8 CSV serialization of the canonical dataset.")
+    markdown_table: str = Field(
+        min_length=1,
+        max_length=_MAX_MARKDOWN_TABLE_CHARS,
+        description="Markdown rendering derived from the same canonical dataset.",
+    )
+    summary: str = Field(
+        min_length=1,
+        max_length=_MAX_DATASET_SUMMARY_CHARS,
+        description="Computed statistics and interpretation of the canonical dataset.",
+    )
+    source_ids: list[int] = Field(
+        default_factory=list,
+        max_length=_MAX_DATASET_SOURCE_IDS,
+        description="IDs from the enclosing ResearchNotes sources that support this dataset.",
+    )
+    caveats: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_DATASET_CAVEATS,
+        description="Dataset-specific limitations and normalization caveats.",
+    )
+    csv_sha256: str = Field(
+        default="",
+        frozen=True,
+        description="Runtime-computed SHA-256 of the exact UTF-8 csv_text; model-provided values are ignored.",
+    )
+
+    @field_validator("title", "markdown_table", "summary")
+    @classmethod
+    def _reject_blank_descriptive_fields(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("dataset descriptive fields must not be blank")
+        return value
+
+    @field_validator("caveats")
+    @classmethod
+    def _validate_caveats(cls, caveats: list[str]) -> list[str]:
+        for caveat in caveats:
+            if not caveat.strip():
+                raise ValueError("dataset caveats must not be blank")
+            if len(caveat) > _MAX_DATASET_CAVEAT_CHARS:
+                raise ValueError(f"dataset caveats must not exceed {_MAX_DATASET_CAVEAT_CHARS} characters")
+        return caveats
+
+    @field_validator("source_ids")
+    @classmethod
+    def _validate_source_ids(cls, source_ids: list[int]) -> list[int]:
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("dataset source_ids must be unique")
+        return source_ids
+
+    @field_validator("csv_sha256", mode="before")
+    @classmethod
+    def _ignore_model_digest(cls, _value: object) -> str:
+        return ""
+
+    @model_validator(mode="after")
+    def _validate_csv_and_compute_digest(self) -> QuantitativeDataset:
+        csv_bytes = self.csv_text.encode("utf-8")
+        if not csv_bytes:
+            raise ValueError("csv_text must not be empty")
+        if len(csv_bytes) > _MAX_CSV_BYTES_PER_DATASET:
+            raise ValueError(f"csv_text must not exceed {_MAX_CSV_BYTES_PER_DATASET} UTF-8 bytes")
+        if self.csv_text.startswith("\ufeff") or "\ufeff" in self.csv_text:
+            raise ValueError("csv_text must not contain a byte-order mark")
+        if any(_is_forbidden_csv_control(character) for character in self.csv_text):
+            raise ValueError("csv_text contains a forbidden control character")
+        _validate_csv_quote_placement(self.csv_text)
+
+        try:
+            reader = csv.reader(io.StringIO(self.csv_text, newline=""), strict=True)
+            header = next(reader)
+            if not header:
+                raise ValueError("csv_text must contain a header row")
+            if len(header) > _MAX_CSV_COLUMNS:
+                raise ValueError(f"csv_text must not exceed {_MAX_CSV_COLUMNS} columns")
+            if any(not column or column != column.strip() for column in header):
+                raise ValueError("CSV header names must be non-empty and trimmed")
+            if len(header) != len(set(header)):
+                raise ValueError("CSV header names must be unique")
+
+            row_count = 0
+            for row in reader:
+                row_count += 1
+                if row_count > _MAX_CSV_DATA_ROWS:
+                    raise ValueError(f"csv_text must not exceed {_MAX_CSV_DATA_ROWS} data rows")
+                if not row or all(not cell.strip() for cell in row):
+                    raise ValueError("csv_text must not contain blank records")
+                if len(row) != len(header):
+                    raise ValueError("every CSV data row must match the header width")
+            if row_count == 0:
+                raise ValueError("csv_text must contain at least one data row")
+        except csv.Error as exc:
+            raise ValueError(f"csv_text is not valid strict CSV: {exc}") from exc
+
+        object.__setattr__(self, "csv_sha256", hashlib.sha256(csv_bytes).hexdigest())
+        return self
+
+
+def _is_forbidden_csv_control(character: str) -> bool:
+    """Return whether a character is unsafe in canonical CSV text."""
+    codepoint = ord(character)
+    return (codepoint < 32 and character not in _ALLOWED_CSV_CONTROLS) or codepoint == 127
+
+
+def _validate_csv_quote_placement(csv_text: str) -> None:
+    """Reject quote placement that ``csv.reader(strict=True)`` accepts leniently.
+
+    The standard-library parser treats a quote inside an unquoted field as a
+    literal character even in strict mode. Such input is not portable CSV and
+    downstream readers may interpret it differently. This state check inspects
+    the original text without normalizing or reserializing it.
+    """
+    field_start = "field_start"
+    unquoted = "unquoted"
+    quoted = "quoted"
+    after_quote = "after_quote"
+    state = field_start
+
+    for character in csv_text:
+        if state == field_start:
+            if character == '"':
+                state = quoted
+            elif character not in {",", "\r", "\n"}:
+                state = unquoted
+        elif state == unquoted:
+            if character == '"':
+                raise ValueError("csv_text contains malformed quote placement")
+            if character in {",", "\r", "\n"}:
+                state = field_start
+        elif state == quoted:
+            if character == '"':
+                state = after_quote
+        elif character == '"':
+            state = quoted
+        elif character in {",", "\r", "\n"}:
+            state = field_start
+        else:
+            raise ValueError("csv_text contains malformed quote placement")
+
+
 class ResearchNotes(_StrictContract):
     """Structured notes produced by a researcher worker."""
 
@@ -193,3 +380,40 @@ class ResearchNotes(_StrictContract):
         default=None,
         description="Researcher self-assessment of this note's usefulness for final synthesis.",
     )
+    quantitative_datasets: list[QuantitativeDataset] = Field(
+        default_factory=list,
+        max_length=_MAX_DATASETS_PER_NOTE,
+        description="Validated canonical quantitative evidence for durable publication by the writer.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_quantitative_dataset_references(self) -> ResearchNotes:
+        if not self.quantitative_datasets:
+            return self
+
+        source_ids = [source.id for source in self.sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("ResearchNotes source IDs must be unique when quantitative datasets are present")
+
+        known_source_ids = set(source_ids)
+        dataset_ids = [dataset.dataset_id for dataset in self.quantitative_datasets]
+        if len(dataset_ids) != len(set(dataset_ids)):
+            raise ValueError("quantitative dataset IDs must be unique within ResearchNotes")
+
+        unknown_source_ids = sorted(
+            {
+                source_id
+                for dataset in self.quantitative_datasets
+                for source_id in dataset.source_ids
+                if source_id not in known_source_ids
+            }
+        )
+        if unknown_source_ids:
+            raise ValueError(f"quantitative datasets reference unknown source IDs: {unknown_source_ids}")
+
+        total_csv_bytes = sum(len(dataset.csv_text.encode("utf-8")) for dataset in self.quantitative_datasets)
+        if total_csv_bytes > _MAX_CSV_BYTES_PER_NOTE:
+            raise ValueError(
+                f"aggregate quantitative CSV content must not exceed {_MAX_CSV_BYTES_PER_NOTE} UTF-8 bytes"
+            )
+        return self

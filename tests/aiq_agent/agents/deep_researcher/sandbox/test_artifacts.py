@@ -64,8 +64,11 @@ class _FakeBackend:
         return SimpleNamespace(output="\n".join(self.files), exit_code=0)
 
 
-def _manifest_bytes(path: str, kind: str = "image") -> bytes:
-    return json.dumps({"version": 1, "artifacts": [{"path": path, "kind": kind, "inline": True}]}).encode("utf-8")
+def _manifest_bytes(path: str, kind: str = "image", expected_sha256: str | None = None) -> bytes:
+    entry = {"path": path, "kind": kind, "inline": True}
+    if expected_sha256 is not None:
+        entry["expected_sha256"] = expected_sha256
+    return json.dumps({"version": 1, "artifacts": [entry]}).encode("utf-8")
 
 
 def _make_manager(store: Any, files: dict[str, bytes], **capture: Any) -> tuple[ArtifactManager, list]:
@@ -90,6 +93,12 @@ class TestManifest:
 
     def test_parse_invalid_returns_none(self) -> None:
         assert parse_manifest("not json{") is None
+
+    def test_parse_expected_sha256(self) -> None:
+        digest = "a" * 64
+        manifest = parse_manifest(_manifest_bytes(f"{_ARTIFACT_DIR}/data.csv", "dataset", digest).decode())
+        assert manifest is not None
+        assert manifest.artifacts[0].expected_sha256 == digest
 
 
 class TestSniffMime:
@@ -236,6 +245,18 @@ class TestHarvest:
         assert len(captured) == 1
         assert captured[0].filename == "chart.png"
 
+    def test_noncanonical_csv_scan_without_manifest_remains_backward_compatible(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/legacy.csv"
+        csv_bytes = b"label,value\nA,1\n"
+        manager, _ = _make_manager(store, {csv_path: csv_bytes})
+
+        captured = manager.final_harvest()
+
+        assert [artifact.filename for artifact in captured] == ["legacy.csv"]
+        assert captured[0].kind == ArtifactKind.TABLE
+        assert captured[0].sha256 == sha256(csv_bytes).hexdigest()
+
     def test_final_harvest_unions_manifest_and_scan(self, tmp_path: Any) -> None:
         # A manifest that declares only the PNG must not hide a sibling CSV at job end.
         store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
@@ -252,6 +273,355 @@ class TestHarvest:
 
         names = sorted(a.filename for a in captured)
         assert names == ["chart.csv", "chart.png"]
+
+    def test_canonical_dataset_capture_requires_registered_exact_digest(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        csv_bytes = b"quarter,revenue\nQ1,22.6\nQ2,26.3\n"
+        digest = sha256(csv_bytes).hexdigest()
+        files = {
+            f"{_ARTIFACT_DIR}/manifest.json": _manifest_bytes(csv_path, "dataset", digest),
+            csv_path: csv_bytes,
+        }
+        manager, emitted = _make_manager(store, files)
+        manager.register_canonical_digests([digest])
+
+        captured = manager.final_harvest()
+
+        assert len(captured) == 1
+        assert captured[0].kind == ArtifactKind.DATASET
+        assert captured[0].sha256 == digest
+        assert b"".join(store.open_bytes("job-1", captured[0].artifact_id)) == csv_bytes
+        assert emitted[0]["data"]["sha256"] == digest
+        assert manager.last_harvest_rejections() == ()
+        assert manager.has_published_canonical_dataset() is True
+        assert manager.published_canonical_digests() == frozenset({digest})
+
+    def test_accepted_canonical_path_cannot_later_downgrade_to_legacy_capture(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        manifest_path = f"{_ARTIFACT_DIR}/manifest.json"
+        original_bytes = b"quarter,revenue\nQ1,22.6\n"
+        digest = sha256(original_bytes).hexdigest()
+        files = {
+            manifest_path: _manifest_bytes(csv_path, "dataset", digest),
+            csv_path: original_bytes,
+        }
+        manager, _ = _make_manager(store, files)
+        manager.register_canonical_digests([digest])
+
+        assert [artifact.filename for artifact in manager.harvest_after_execute()] == ["revenue.csv"]
+        files[csv_path] = b"quarter,revenue\nQ1,999\n"
+        files[manifest_path] = _manifest_bytes(csv_path, "table")
+
+        assert manager.harvest_after_execute() == []
+        assert manager.last_harvest_rejections() == (("revenue.csv", "canonical_dataset_digest_missing"),)
+        [stored] = store.list("job-1")
+        assert b"".join(store.open_bytes("job-1", stored.artifact_id)) == original_bytes
+
+    def test_legacy_duplicate_before_canonical_entry_cannot_bypass_digest_validation(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        manifest_path = f"{_ARTIFACT_DIR}/manifest.json"
+        manifest = json.dumps(
+            {
+                "version": 1,
+                "artifacts": [
+                    {"path": csv_path, "kind": "table"},
+                    {"path": csv_path, "kind": "dataset", "expected_sha256": "a" * 64},
+                ],
+            }
+        ).encode("utf-8")
+        manager, _ = _make_manager(
+            store,
+            {manifest_path: manifest, csv_path: b"quarter,revenue\nQ1,22.6\n"},
+        )
+
+        assert manager.final_harvest() == []
+        assert manager.last_harvest_rejections() == (("revenue.csv", "canonical_dataset_digest_unregistered"),)
+        assert store.list("job-1") == []
+
+    def test_conflicting_canonical_declarations_for_one_path_fail_closed(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        manifest_path = f"{_ARTIFACT_DIR}/manifest.json"
+        csv_bytes = b"quarter,revenue\nQ1,22.6\n"
+        digest = sha256(csv_bytes).hexdigest()
+        other_digest = "a" * 64
+        manifest = json.dumps(
+            {
+                "version": 1,
+                "artifacts": [
+                    {"path": csv_path, "kind": "dataset", "expected_sha256": digest},
+                    {"path": csv_path, "kind": "dataset", "expected_sha256": other_digest},
+                ],
+            }
+        ).encode("utf-8")
+        manager, _ = _make_manager(store, {manifest_path: manifest, csv_path: csv_bytes})
+        manager.register_canonical_digests([digest, other_digest])
+
+        assert manager.final_harvest() == []
+        assert manager.last_harvest_rejections() == (("revenue.csv", "canonical_dataset_digest_mismatch"),)
+        assert store.list("job-1") == []
+
+    def test_final_scan_does_not_reject_a_checkpointed_canonical_dataset(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        csv_bytes = b"quarter,revenue\nQ1,22.6\n"
+        digest = sha256(csv_bytes).hexdigest()
+        files = {
+            f"{_ARTIFACT_DIR}/manifest.json": _manifest_bytes(csv_path, "dataset", digest),
+            csv_path: csv_bytes,
+        }
+        manager, emitted = _make_manager(store, files)
+        manager.register_canonical_digests([digest])
+
+        assert [artifact.filename for artifact in manager.harvest_after_execute()] == ["revenue.csv"]
+        assert manager.final_harvest() == []
+
+        assert manager.last_harvest_rejections() == ()
+        assert [event for event in emitted if event["type"] == "artifact.warning"] == []
+
+    def test_canonical_path_with_download_failure_cannot_downgrade_to_legacy_capture(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        manifest_path = f"{_ARTIFACT_DIR}/manifest.json"
+        csv_bytes = b"quarter,revenue\nQ1,22.6\n"
+        digest = sha256(csv_bytes).hexdigest()
+        files = {manifest_path: _manifest_bytes(csv_path, "dataset", digest)}
+        manager, _ = _make_manager(store, files)
+        manager.register_canonical_digests([digest])
+
+        assert manager.harvest_after_execute() == []
+        files[csv_path] = csv_bytes
+        files[manifest_path] = _manifest_bytes(csv_path, "table")
+
+        assert manager.harvest_after_execute() == []
+        assert manager.last_harvest_rejections() == (("revenue.csv", "canonical_dataset_digest_missing"),)
+        assert store.list("job-1") == []
+
+    @pytest.mark.parametrize("failure", ["exception", "empty", "unreadable"])
+    def test_unreadable_manifest_fails_closed_without_directory_scan(self, tmp_path: Any, failure: str) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/legacy.csv"
+        manifest_path = f"{_ARTIFACT_DIR}/manifest.json"
+        manager, _ = _make_manager(store, {csv_path: b"label,value\nA,1\n"})
+
+        def fail_manifest_download(paths: list[str]) -> list[Any]:
+            assert paths == [manifest_path]
+            if failure == "exception":
+                raise RuntimeError("transport unavailable")
+            if failure == "empty":
+                return []
+            return [SimpleNamespace(path=manifest_path, content=None, error="permission denied")]
+
+        original_download = manager.backend.download_files
+
+        def download(paths: list[str]) -> list[Any]:
+            if paths != [manifest_path]:
+                return original_download(paths)
+            return fail_manifest_download(paths)
+
+        manager.backend.download_files = download  # type: ignore[method-assign]
+
+        assert manager.final_harvest() == []
+        assert manager.last_harvest_rejections() == (("manifest.json", "artifact_manifest_invalid"),)
+        assert store.list("job-1") == []
+
+    def test_expected_digest_on_non_csv_does_not_mark_canonical_dataset_published(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        json_path = f"{_ARTIFACT_DIR}/data.json"
+        data = b'{"quarter":"Q1","revenue":22.6}'
+        digest = sha256(data).hexdigest()
+        files = {
+            f"{_ARTIFACT_DIR}/manifest.json": _manifest_bytes(json_path, "dataset", digest),
+            json_path: data,
+        }
+        manager, _ = _make_manager(store, files)
+        manager.register_canonical_digests([digest])
+
+        assert manager.harvest_after_execute() == []
+        assert manager.last_harvest_rejections() == (("data.json", "canonical_dataset_digest_missing"),)
+        assert manager.published_canonical_digests() == frozenset()
+        assert manager.has_published_canonical_dataset() is False
+        assert store.list("job-1") == []
+
+    def test_invalid_present_manifest_fails_closed_without_scan_downgrade(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        manifest_path = f"{_ARTIFACT_DIR}/manifest.json"
+        manifest = json.dumps(
+            {
+                "version": 1,
+                "artifacts": [
+                    {"path": csv_path, "kind": "dataset", "expected_sha256": "a" * 64},
+                    {"path": f"{_ARTIFACT_DIR}/bad.png", "kind": "not-a-kind"},
+                ],
+            }
+        ).encode("utf-8")
+        manager, _ = _make_manager(
+            store,
+            {
+                manifest_path: manifest,
+                csv_path: b"quarter,revenue\nQ1,22.6\n",
+            },
+        )
+
+        assert manager.harvest_after_execute() == []
+        assert manager.last_harvest_rejections() == (("manifest.json", "artifact_manifest_invalid"),)
+        manager.backend.files[manifest_path] = json.dumps({"version": 1, "artifacts": []}).encode("utf-8")
+        assert manager.harvest_after_execute() == []
+        assert manager.final_harvest() == []
+        assert store.list("job-1") == []
+        assert manager.has_published_canonical_dataset() is False
+
+    def test_invalid_manifest_recovers_only_through_a_valid_explicit_entry(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        manifest_path = f"{_ARTIFACT_DIR}/manifest.json"
+        csv_bytes = b"quarter,revenue\nQ1,22.6\n"
+        digest = sha256(csv_bytes).hexdigest()
+        files = {
+            manifest_path: b"not-json",
+            csv_path: csv_bytes,
+        }
+        manager, _ = _make_manager(store, files)
+
+        assert manager.harvest_after_execute() == []
+        manager.register_canonical_digests([digest])
+        files[manifest_path] = _manifest_bytes(csv_path, "dataset", digest)
+
+        captured = manager.harvest_after_execute()
+
+        assert [artifact.filename for artifact in captured] == ["revenue.csv"]
+        assert manager.has_published_canonical_dataset() is True
+
+    @pytest.mark.parametrize(
+        ("manifest_digest", "registered_digest", "reason"),
+        [
+            (None, None, "canonical_dataset_digest_missing"),
+            ("a" * 64, None, "canonical_dataset_digest_unregistered"),
+            ("a" * 64, "a" * 64, "canonical_dataset_digest_mismatch"),
+        ],
+    )
+    def test_rejects_untrusted_canonical_dataset_with_stable_reason(
+        self,
+        tmp_path: Any,
+        manifest_digest: str | None,
+        registered_digest: str | None,
+        reason: str,
+    ) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        files = {
+            f"{_ARTIFACT_DIR}/manifest.json": _manifest_bytes(csv_path, "dataset", manifest_digest),
+            csv_path: b"quarter,revenue\nQ1,22.6\n",
+        }
+        manager, emitted = _make_manager(store, files)
+        if registered_digest is not None:
+            manager.register_canonical_digests([registered_digest])
+
+        assert manager.harvest_after_execute() == []
+
+        warnings = [event for event in emitted if event["type"] == "artifact.warning"]
+        assert warnings[-1]["data"] == {"path": csv_path, "reason": reason}
+        assert store.list("job-1") == []
+
+    def test_rejected_canonical_path_cannot_be_recaptured_by_final_scan(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        manifest_path = f"{_ARTIFACT_DIR}/manifest.json"
+        files = {
+            manifest_path: _manifest_bytes(csv_path, "dataset"),
+            csv_path: b"quarter,revenue\nQ1,22.6\n",
+        }
+        manager, _ = _make_manager(store, files)
+
+        assert manager.harvest_after_execute() == []
+        del manager.backend.files[manifest_path]
+        assert manager.final_harvest() == []
+        assert store.list("job-1") == []
+
+    def test_rejected_canonical_path_cannot_downgrade_and_can_recover_with_valid_digest(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/revenue.csv"
+        manifest_path = f"{_ARTIFACT_DIR}/manifest.json"
+        csv_bytes = b"quarter,revenue\nQ1,22.6\n"
+        digest = sha256(csv_bytes).hexdigest()
+        files = {
+            manifest_path: _manifest_bytes(csv_path, "dataset"),
+            csv_path: csv_bytes,
+        }
+        manager, _ = _make_manager(store, files)
+
+        assert manager.harvest_after_execute() == []
+        assert manager.last_harvest_rejections() == (
+            (csv_path.rsplit("/", maxsplit=1)[-1], "canonical_dataset_digest_missing"),
+        )
+
+        files[manifest_path] = _manifest_bytes(csv_path, "table")
+        assert manager.harvest_after_execute() == []
+        assert manager.last_harvest_rejections() == (("revenue.csv", "canonical_dataset_digest_missing"),)
+        assert store.list("job-1") == []
+
+        manager.register_canonical_digests([digest])
+        files[manifest_path] = _manifest_bytes(csv_path, "dataset", digest)
+        captured = manager.harvest_after_execute()
+
+        assert [artifact.filename for artifact in captured] == ["revenue.csv"]
+        assert manager.last_harvest_rejections() == ()
+        assert manager.has_published_canonical_dataset() is True
+
+    def test_harvest_rejection_diagnostics_are_bounded(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        manifest_path = f"{_ARTIFACT_DIR}/manifest.json"
+        entries = [{"path": f"{_ARTIFACT_DIR}/dataset_{index}.csv", "kind": "dataset"} for index in range(40)]
+        manager, _ = _make_manager(
+            store,
+            {manifest_path: json.dumps({"version": 1, "artifacts": entries}).encode("utf-8")},
+        )
+
+        assert manager.harvest_after_execute() == []
+        diagnostics = manager.last_harvest_rejections()
+        assert len(diagnostics) == 32
+        assert all(reason == "canonical_dataset_digest_missing" for _path, reason in diagnostics)
+
+    def test_noncanonical_manifest_csv_remains_backward_compatible(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/legacy.csv"
+        csv_bytes = b"label,value\nA,1\n"
+        files = {
+            f"{_ARTIFACT_DIR}/manifest.json": _manifest_bytes(csv_path, "table"),
+            csv_path: csv_bytes,
+        }
+        manager, _ = _make_manager(store, files)
+
+        captured = manager.final_harvest()
+
+        assert [artifact.filename for artifact in captured] == ["legacy.csv"]
+        assert captured[0].sha256 == sha256(csv_bytes).hexdigest()
+
+    def test_csv_dataset_manifest_kind_is_reserved_for_canonical_publication(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        csv_path = f"{_ARTIFACT_DIR}/dataset.csv"
+        files = {
+            f"{_ARTIFACT_DIR}/manifest.json": _manifest_bytes(csv_path, "dataset"),
+            csv_path: b"label,value\nA,1\n",
+        }
+        manager, _ = _make_manager(store, files)
+
+        assert manager.final_harvest() == []
+        assert manager.last_harvest_rejections() == (("dataset.csv", "canonical_dataset_digest_missing"),)
+
+    def test_canonical_digest_registration_is_strict_and_idempotent(self, tmp_path: Any) -> None:
+        store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
+        manager, _ = _make_manager(store, {})
+        digest = "a" * 64
+
+        manager.register_canonical_digests([digest, digest])
+        assert manager._trusted_canonical_digests == {digest}
+        with pytest.raises(ValueError, match="lowercase SHA-256"):
+            manager.register_canonical_digests(["A" * 64])
 
     def test_rejects_mime_spoof(self, tmp_path: Any) -> None:
         # A file claiming .png but with non-image content must be rejected.

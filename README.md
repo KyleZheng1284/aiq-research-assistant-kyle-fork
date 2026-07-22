@@ -66,7 +66,7 @@ The NVIDIA AI-Q Blueprint is an enterprise-grade research agent built on the [NV
 - **Report follow-up** — Ask questions about a completed report, create a child-job cosmetic rewrite, or run delta research with the parent report as context.
 - **Workflow configuration** — YAML configs define agents, tools, LLMs, and routing behavior so you can tune workflows without code changes.
 - **Modular workflows** — All agents (orchestration node, shallow researcher, deep researcher, clarifier) are composable; each can run standalone or as part of the full pipeline.
-- **Skills, sandbox execution, and durable outputs** — Built-in research/synthesis skills run code through a provider-neutral sandbox contract. Modal is fresh per job; the experimental OpenShell profile uses one shared, pre-provisioned sandbox and is not a multi-tenant isolation boundary. Opt-in rich-file capture checkpoints manifest-declared files after successful sandbox commands, finalizes on success/failure, stores bytes in SQL or S3-compatible storage, and delivers metadata to the Files tab live and on replay.
+- **Skills, sandbox execution, and durable outputs** — Built-in research/synthesis skills run code through a provider-neutral sandbox contract. The Modal and experimental OpenShell profiles create one sandbox per job; OpenShell shared attachment is debug-only. Opt-in rich-file capture checkpoints writer-published manifests and successful writer chart executions, finalizes on success/failure, stores bytes in SQL or S3-compatible storage, and delivers metadata to the Files tab live and on replay.
 - **Portable Agent Skills** — `aiq-deploy` selects, starts, and validates an AI-Q deployment; `aiq-research` calls routed chat and async research from compatible coding harnesses.
 - **Data source registry** — UI toggles and request payloads can select web, paper, enterprise, collaboration, and knowledge-layer sources per message.
 - **Expanded sources** — Paper search supports Serper, SerpAPI, and SearchAPI; You.com adds web, contents, general-research, and finance-research tools; Nimble adds configurable web search; focused profiles demonstrate DuckDuckGo news, Polymarket, OpenSearch, and Azure AI Search knowledge retrieval.
@@ -285,7 +285,7 @@ The `configs/` directory holds YAML workflow configs that define agents, tools, 
 | `config_web_default_guardrails.yml` | GPT-OSS-120B; Nemotron 3 Super; Nemotron Mini summary | LlamaIndex profile with workflow Guardrails attached and async deep-agent Guardrails selected; shallow middleware is defined but not attached. |
 | `config_web_frag_mcp_auth.yml` | Nemotron 3 Super | Foundational RAG plus an opt-in protected per-user OAuth MCP source example. Requires a real MCP endpoint and shared token store. |
 | `config_domain_routing_and_skills.yml` | Nemotron 3 Super; Nemotron Mini summary | Direct deep-research profile with domain routing, DuckDuckGo news, Polymarket, enabled Serper paper search, LlamaIndex, built-in skills, and a fresh per-job Modal sandbox. |
-| `config_openshell.yml` | GPT-OSS-120B; Nemotron 3 Super; Nemotron Mini summary | Experimental web/API skills profile with artifact capture over one shared, pre-provisioned OpenShell sandbox; trusted single-operator use only. |
+| `config_openshell.yml` | GPT-OSS-120B; Nemotron 3 Super; Nemotron Mini summary | Experimental web/API skills profile with artifact capture in one policy-bound OpenShell sandbox per job; shared attachment is debug-only. |
 | `config_mcp.yml` | Nemotron 3 Super 120B | Standalone MCP server. Public NIM + Tavily research with PostgreSQL-backed stateless submit/poll/report. Requires `NVIDIA_API_KEY`, `TAVILY_API_KEY`, and `AIQ_CHECKPOINT_DB`. |
 
 ## Ways to Run the Agents
@@ -461,9 +461,9 @@ indicate availability in a published release.
 - [x] **[NeMo Guardrails](docs/source/customization/guardrails.md) Integration:** Opt-in middleware for selected workflow, shallow-researcher, and deep-researcher boundaries.
 - [ ] **[NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) Integration:** Reduce latency via priority scheduling at scale.
 - [x] **Per-user MCP OAuth:** Connect each signed-in user to protected MCP data sources through the UI.
-- [x] **Skills & Sandboxing:** Support built-in deep-research skills through a provider-neutral contract. Modal is fresh per job; the experimental OpenShell profile is shared and not a multi-tenant isolation boundary.
+- [x] **Skills & Sandboxing:** Support built-in deep-research skills through a provider-neutral contract. The Modal and experimental OpenShell profiles create one sandbox per job; OpenShell shared attachment is debug-only and not a multi-tenant isolation boundary.
 - [x] **Report Follow-up and Rewriting:** Answer against a completed report, submit cosmetic child rewrites, and run delta research with parent-report context.
-- [x] **Durable Sandbox Artifacts:** Opt-in manifest checkpoints after successful sandbox commands, terminal harvesting on success/failure, SQL or S3-compatible byte storage, and live/replayed Files-tab access.
+- [x] **Durable Sandbox Artifacts:** Opt-in checkpoints after writer manifest writes and successful writer chart executions, terminal harvesting on success/failure, SQL or S3-compatible byte storage, and live/replayed Files-tab access.
 - [ ] **Custom Skill Management:** Add UI and lifecycle controls for user-provided skill bundles.
 - [ ] **Dynamic Model Routing:** Allow sub-agents to automatically select the optimal model per task.
 - [ ] **Resource Management:** Implement configurable token caps and tool-call budgets.

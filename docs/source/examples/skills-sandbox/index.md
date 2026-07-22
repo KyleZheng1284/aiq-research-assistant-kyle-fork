@@ -6,9 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # Example: Deep Research Skills and Sandbox
 
 This example shows how to run AI-Q deep research with DeepAgents skills and a provider-backed sandbox. The reference
-profile uses Modal; AI-Q also includes an experimental OpenShell profile for a trusted, single-operator environment.
+profile uses Modal; AI-Q also includes an experimental OpenShell profile that creates a policy-bound sandbox per job.
 
-Skills let a research agent discover task-specific instructions only when they are relevant. A skill can teach the agent a repeatable workflow, such as extracting numeric facts, normalizing a table, running calculations, and producing reusable text artifacts. The sandbox runs code-based work outside the AI-Q process. Isolation depends on the provider: Modal creates a fresh sandbox for each job, while the experimental OpenShell profile attaches jobs to one pre-provisioned shared sandbox.
+Skills let a research agent discover task-specific instructions only when they are relevant. A skill can teach the agent a repeatable workflow, such as extracting numeric facts, normalizing a table, running calculations, and producing reusable text artifacts. The sandbox runs code-based work outside the AI-Q process. Both shipped profiles create a distinct sandbox for each job. OpenShell shared-sandbox attachment is a debug-only escape hatch and is not a production isolation mode.
 
 For more background, refer to the LangChain DeepAgents docs:
 
@@ -23,9 +23,12 @@ The example config enables:
 - a fresh per-job Modal sandbox for Python execution
 - Python packages useful for analysis, including `pandas`, `numpy`, `matplotlib`, and `pillow`
 - virtual `/shared/` files for text artifacts that the orchestrator and subagents can read during the report workflow
-- durable capture of supported charts and data files for async API jobs
+- durable capture of supported files, including canonical CSV and chart publication, through the async job artifact API
 
-The current built-in example skill is `data-table-analysis`. It is intended for quantitative research tasks where the agent must normalize researched facts and compute tabular outputs such as growth rates, rankings, summary statistics, CSV, JSON, or markdown tables.
+The researcher-side `data-table-analysis` skill normalizes facts, performs calculations, and returns runtime-validated
+canonical CSV plus a Markdown table that the skill contract requires to come from the same DataFrame. The writer-side
+`chart-generation` skill publishes those exact CSV bytes and optionally renders a chart from the published CSV. The
+runtime intentionally does not compare or regenerate the Markdown table, and the writer does not repeat the analysis.
 
 **Models and report quality:** For clearer tables, stronger reasoning over numbers, and more reliable use of the data-table-analysis skill end-to-end, prefer **frontier-class models** for the orchestrator, planner, and researcher in your config ([Swapping models](../../customization/swapping-models.md)). Smaller or faster models may complete runs but often produce weaker structured outputs and more formatting mistakes in long reports.
 
@@ -68,6 +71,7 @@ functions:
         - synthesis
     require_sandbox:
       - research
+      - synthesis
 
   deep_research_sandbox:
     _type: deep_research_sandbox
@@ -88,6 +92,7 @@ functions:
   deep_research_agent:
     _type: deep_research_agent
     enable_citation_verification: false
+    workflow_timeout_seconds: ${AIQ_DEEP_RESEARCH_WORKFLOW_TIMEOUT_SECONDS:-3600}
     skills: deep_research_skills
     sandbox: deep_research_sandbox
 ```
@@ -101,10 +106,16 @@ job database by default. For production, use S3-compatible object storage by set
 `AIQ_ARTIFACT_S3_BUCKET`, and the standard AWS credentials; set `AIQ_ARTIFACT_S3_ENDPOINT_URL` for MinIO or another
 compatible service. See [Production Artifact Storage](../../deployment/production.md#artifact-storage) for all options.
 
-To evaluate OpenShell instead, use `configs/config_openshell.yml` after running `scripts/setup_openshell.sh`. That profile
-is experimental: it attaches every job to one named, pre-provisioned sandbox. Per-job working directories avoid ordinary
-filename collisions but are not an access-control or multi-tenant isolation boundary. Do not run mutually untrusted jobs
-concurrently in that profile.
+```{important}
+`chart-generation` moved from the `research` collection to `synthesis`. When upgrading a custom profile, assign
+`researcher-agent: [research]` and `writer-agent: [synthesis]`, and include both collections under `require_sandbox`.
+Remove `research` from the writer; durable publication is writer-owned, while analysis remains researcher-owned.
+```
+
+To evaluate OpenShell instead, use `configs/config_openshell.yml` after running
+`scripts/openshell/setup_openshell.sh`. That experimental profile creates one policy-bound sandbox per job and deletes
+owned sandboxes during terminal cleanup. Attaching to an existing shared sandbox requires the explicit debug settings
+`allow_shared_sandbox: true` and `existing_sandbox_name`; that mode is not a multi-tenant isolation boundary.
 
 ## Run AI-Q
 
@@ -113,6 +124,9 @@ dotenv -f deploy/.env run .venv/bin/nat run \
   --config_file configs/config_domain_routing_and_skills.yml \
   --input "Compare the top 10 publicly traded semiconductor companies by 2024 revenue. Build a markdown table with revenue, YoY growth, market cap, and gross margin. Then rank them and compute summary statistics. Use the data analysis tool for all calculations."
 ```
+
+This CLI path validates sandbox analysis and report generation, but it does not expose the async job artifact API. Start
+the served API below and submit an async job to validate durable artifact capture, listing, and download.
 
 For API or UI testing:
 
@@ -149,10 +163,13 @@ Expected behavior:
 
 1. The planner identifies that a skill should be used for structured quantitative analysis.
 2. Researchers gather source-grounded input figures.
-3. A matching researcher or writer reads the relevant `SKILL.md`.
-4. The agent calls `execute` to run Python/pandas in the configured sandbox provider.
-5. The agent writes markdown, CSV, or JSON text artifacts to `/shared/...` with `write_file`.
-6. The final report cites the original sources for input figures and labels computed columns as calculations.
+3. The researcher reads `data-table-analysis`, calls `execute` for Python/pandas calculations, and returns canonical
+   `csv_text`, a Markdown table, summary statistics, provenance, and caveats in validated `ResearchNotes`.
+4. AI-Q computes and registers a SHA-256 digest over the exact UTF-8 CSV text.
+5. The writer writes the complete `/shared/output.md` baseline, then reads `chart-generation` to publish the exact CSV.
+6. CSV-only requests finish without chart execution. Chart requests render only from the published CSV and, by
+   default, stop after three failed writer execution attempts while preserving the report, table, and CSV.
+7. The final report cites the original sources for input figures and labels computed columns as calculations.
 
 ## Skill Files
 
@@ -162,12 +179,16 @@ Built-in deep research skills live under:
 src/aiq_agent/agents/deep_researcher/skills/
 ```
 
-Each skill should be a directory with a `SKILL.md` file:
+Each skill belongs to the collection for its owning role and has a `SKILL.md` file:
 
 ```text
 src/aiq_agent/agents/deep_researcher/skills/
-`-- my-skill/
-    `-- SKILL.md
+|-- research/
+|   `-- my-analysis-skill/
+|       `-- SKILL.md
+`-- synthesis/
+    `-- my-publication-skill/
+        `-- SKILL.md
 ```
 
 At minimum, `SKILL.md` needs frontmatter with a stable `name` and a clear `description`:
@@ -200,24 +221,35 @@ Skill descriptions matter because DeepAgents uses the frontmatter description to
 
 To add a built-in AI-Q deep research skill:
 
-1. Create a new directory under `src/aiq_agent/agents/deep_researcher/skills/`.
+1. Choose the owning collection: `research` for evidence generation and analysis, or `synthesis` for report writing and
+   durable publication. Create the skill directory under that collection.
 2. Add a `SKILL.md` file with frontmatter and workflow instructions.
 3. Put optional helper scripts, references, or templates inside the same skill directory.
 4. Reference any helper files from `SKILL.md` so the agent knows when to read or run them.
 5. Keep workflow instructions generic enough to handle variations of the task, but concrete enough to force required tool calls.
 6. Run with `configs/config_domain_routing_and_skills.yml` and test a query that should trigger the new skill.
 
-No config change is required for additional built-in skills inside an enabled collection. AI-Q collects available skill directories at runtime and exposes them to DeepAgents through an internal `/skills/` source.
+No config change is required only when the chosen collection is already assigned to the owning agent. AI-Q collects
+available skill directories at runtime and exposes enabled collections to DeepAgents through an internal `/skills/`
+source.
 
 ## Notes and Limitations
 
-- The reference config uses a fresh Modal sandbox for code execution. The experimental OpenShell config uses one shared,
-  pre-provisioned sandbox and is suitable only for trusted single-operator use, not multi-tenant isolation.
-- Text artifacts that need to survive for the report should be written through DeepAgents filesystem tools to `/shared/...`.
+- The reference Modal and experimental OpenShell profiles create one sandbox per job. OpenShell shared attachment is an
+  explicit debug escape hatch and is not a production or multi-tenant isolation mode.
+- Plans, research notes, and the report use DeepAgents virtual paths under `/shared/`. Downloadable datasets and charts
+  are writer-published under the configured sandbox artifact directory.
 - `/shared/` is a virtual DeepAgents filesystem path. Use `ls`, `read_file`, `write_file`, and `edit_file` for `/shared/`; do not inspect `/shared/` with shell commands through `execute`.
 - The sandbox is configured with `network: blocked`, so research should happen through AI-Q search tools, not from sandbox code.
-- The reference profile enables durable sandbox artifact capture, which requires the async API's job-scoped artifact
-  store. Successful `execute` calls checkpoint manifest-declared files, and success/failure terminal paths perform one
-  final best-effort scan. A busy cancellation skips that scan and preserves earlier checkpoints. Direct `nat run` does
-  not provide that store, and adding a sandbox alone does not guarantee that every generated file is persisted or
-  embedded in the report.
+- Durable sandbox artifact capture is opt-in (`artifact_capture.enabled: true`) and requires the async API's job-scoped
+  artifact store. Direct `nat run` does not provide that store.
+  Writer manifest writes and successful chart execution checkpoint declared files, and terminal paths perform one final
+  best-effort scan. A busy cancellation skips that scan and preserves earlier checkpoints. Adding a sandbox alone does
+  not guarantee that every generated file is persisted or embedded in the report.
+- Canonical dataset manifests must carry the runtime-registered digest. Missing, unregistered, or mismatched digests are
+  rejected, and the final directory scan cannot recapture a rejected canonical path.
+- `workflow_timeout_seconds` is disabled by default in the library. The shipped sandbox profiles set it from
+  `AIQ_DEEP_RESEARCH_WORKFLOW_TIMEOUT_SECONDS` with a 3600-second fallback. When the timeout wins the terminal-state
+  race, the job fails with `deep_research_workflow_timeout`, requests forced sandbox termination, and bounds how long
+  the worker waits. It then attempts a separate bounded terminal harvest only if termination returned; otherwise it
+  skips harvest to avoid concurrent provider I/O.

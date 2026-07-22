@@ -63,10 +63,13 @@ and [Production Considerations](../../deployment/production.md#artifact-storage)
   caps (`AIQ_MAX_SANDBOXES_PER_PRINCIPAL` / `AIQ_MAX_SANDBOXES_GLOBAL`, default-off) bound
   concurrency and cost.
 - Custom client-supplied job IDs must not be reused for a new job.
-- Manifest checkpoints preserve completed artifacts after successful sandbox commands. The
-  terminal finalizer harvests once before cleanup on success/failure; cancellation harvests
-  only when the provider is idle and otherwise terminates immediately.
-- The runtime closes provider sessions on success, failure, cancellation, and timeout.
+- Writer manifest writes and successful writer chart executions checkpoint declared artifacts;
+  execution by other roles does not publish durable artifacts. The terminal finalizer harvests
+  once before cleanup on success/failure; cancellation harvests only when the provider is idle
+  and otherwise requests immediate termination without extending the worker's bounded wait.
+- The runtime requests provider cleanup on success, failure, cancellation, and timeout. Provider
+  calls are bounded from the worker's perspective; a hung provider cannot be guaranteed to have
+  completed cleanup when that wait expires.
 - Per-job OpenShell mode requires `delete_on_exit: true`. A persistent shared sandbox is
   possible only through the explicit debug attachment settings.
 - OpenShell provisioning and authenticated gateway lifecycle have separate owners. See the
