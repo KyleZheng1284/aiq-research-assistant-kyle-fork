@@ -79,8 +79,10 @@ def test_wrapper_uses_generated_policy_and_single_pytest_target(
 ) -> None:
     monkeypatch.delenv("AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION", raising=False)
     monkeypatch.delenv("AIQ_OPENSHELL_POLICY_FILE", raising=False)
+    monkeypatch.setenv("AIQ_OPENSHELL_WORKSPACE", "")
     args = wrapper._args([])
 
+    assert args.workspace == "default"
     assert args.policy == "configs/openshell/generated/aiq-openshell-policy.yaml"
     assert args.expected_gateway_version is None
     assert wrapper._command()[-1] == _LIVE_TEST

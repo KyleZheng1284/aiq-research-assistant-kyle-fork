@@ -228,6 +228,8 @@ def test_setup_is_provisioning_only_and_migrates_old_lifecycle_flags() -> None:
     assert "--reinstall-package" not in source
     assert "uv sync --dev --inexact" in source
     assert 'uv pip install "deepagents' not in source
+    assert 'export AIQ_OPENSHELL_WORKSPACE="${AIQ_OPENSHELL_WORKSPACE:-default}"' in source
+    assert 'export AIQ_OPENSHELL_WORKSPACE="default"' not in source
 
     result = subprocess.run(
         [str(_SETUP_SCRIPT), "--gateway-name", "old"],

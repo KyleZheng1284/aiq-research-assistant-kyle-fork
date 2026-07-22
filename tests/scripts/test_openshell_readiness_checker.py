@@ -344,6 +344,37 @@ def test_probe_rejects_sdk_without_request_label_support(checker: ModuleType, tm
     assert client.delete_calls == 0
 
 
+@pytest.mark.parametrize("method_name", ["create", "list", "wait_ready", "get", "delete", "wait_deleted"])
+def test_probe_rejects_sdk_without_workspace_support(
+    checker: ModuleType,
+    tmp_path: Path,
+    method_name: str,
+) -> None:
+    client = _Client()
+    setattr(client, method_name, lambda: None)
+    with (
+        _provider_helpers(client),
+        _fake_runtime(client),
+        patch.object(checker.importlib.metadata, "version", return_value="1.2.3"),
+        patch.object(checker, "_version_from_cli", return_value="1.2.3"),
+        pytest.raises(checker.ReadinessError, match="request_labels_unsupported"),
+    ):
+        checker.run_check(_config(checker, tmp_path))
+
+    assert client.delete_calls == 0
+
+
+def test_parser_treats_empty_workspace_as_default(
+    checker: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIQ_OPENSHELL_WORKSPACE", "")
+
+    args = checker._parser().parse_args(["--policy-file", "policy.yaml", "--openshell-bin", "openshell"])
+
+    assert args.workspace == "default"
+
+
 def test_probe_classifies_effective_policy_that_remains_pending(checker: ModuleType, tmp_path: Path) -> None:
     client = _Client(status=1)
     with (

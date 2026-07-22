@@ -221,8 +221,12 @@ def run_check(config: ReadinessConfig) -> tuple[str, str]:
         }
         if None in version_identities or len(version_identities) != 1:
             raise ReadinessError("version_mismatch")
+        workspace_methods = ("create", "list", "wait_ready", "get", "delete", "wait_deleted")
         if (
-            not _accepts_keyword(client.create, "workspace")
+            any(
+                not _accepts_keyword(getattr(client, method_name, None), "workspace")
+                for method_name in workspace_methods
+            )
             or not _accepts_keyword(client.create, "name")
             or not _accepts_keyword(client.create, "labels")
             or not _accepts_keyword(client.list, "label_selector")
@@ -283,7 +287,7 @@ def run_check(config: ReadinessConfig) -> tuple[str, str]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gateway-name", default=None)
-    parser.add_argument("--workspace", default=os.getenv("AIQ_OPENSHELL_WORKSPACE", "default"))
+    parser.add_argument("--workspace", default=os.getenv("AIQ_OPENSHELL_WORKSPACE") or "default")
     parser.add_argument("--image-name", default="aiq-openshell-demo:latest")
     parser.add_argument("--policy-file", type=Path, required=True)
     parser.add_argument("--openshell-bin", type=Path, required=True)

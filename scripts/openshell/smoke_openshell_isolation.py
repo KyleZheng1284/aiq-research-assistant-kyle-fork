@@ -31,7 +31,7 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--workspace",
-        default=os.getenv("AIQ_OPENSHELL_WORKSPACE", "default"),
+        default=os.getenv("AIQ_OPENSHELL_WORKSPACE") or "default",
         help="OpenShell workspace that scopes live-test sandbox operations",
     )
     parser.add_argument(

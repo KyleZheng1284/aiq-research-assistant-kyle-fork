@@ -237,6 +237,7 @@ def provider_factory(
     ) -> Any:
         openshell_config: dict[str, object] = {
             "gateway": live_runtime.config.gateway,
+            "workspace": live_runtime.config.workspace,
             "policy": str(policy_path or live_runtime.config.policy_path),
             "image": live_runtime.config.image,
             "require_hard_landlock": not live_runtime.config.allow_best_effort,

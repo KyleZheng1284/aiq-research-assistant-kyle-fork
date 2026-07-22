@@ -790,7 +790,7 @@ wired into the launcher, config, and live suite. These are optional overrides
 for custom shells or remote gateways:
 
   export AIQ_OPENSHELL_GATEWAY_NAME="openshell"
-  export AIQ_OPENSHELL_WORKSPACE="default"
+  export AIQ_OPENSHELL_WORKSPACE="${AIQ_OPENSHELL_WORKSPACE:-default}"
   export AIQ_OPENSHELL_IMAGE="$IMAGE_NAME"
   export AIQ_OPENSHELL_POLICY_FILE="$POLICY_FILE"
   export AIQ_OPENSHELL_EXPECTED_GATEWAY_VERSION="$OPENSHELL_VERSION"
