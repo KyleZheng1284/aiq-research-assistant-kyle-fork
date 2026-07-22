@@ -53,6 +53,7 @@ from .tools.source_tool_batching import DEFAULT_MAX_SOURCE_TOOL_BATCH_SIZE
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_RESEARCH_CONCURRENCY = 6
+DEFAULT_MAX_RESEARCHER_EXECUTE_ATTEMPTS = 3
 DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS = 3
 PARENT_REPORT_CONTEXT_PATH = "/shared/parent_report_context.json"
 
@@ -90,6 +91,7 @@ class DeepResearcherAgent:
         max_research_concurrency: int = DEFAULT_MAX_RESEARCH_CONCURRENCY,
         max_concurrent_source_tool_calls: int = DEFAULT_MAX_CONCURRENT_SOURCE_TOOL_CALLS,
         max_source_tool_batch_size: int = DEFAULT_MAX_SOURCE_TOOL_BATCH_SIZE,
+        max_researcher_execute_attempts: int = DEFAULT_MAX_RESEARCHER_EXECUTE_ATTEMPTS,
         max_writer_execute_attempts: int = DEFAULT_MAX_WRITER_EXECUTE_ATTEMPTS,
     ) -> None:
         """
@@ -110,6 +112,7 @@ class DeepResearcherAgent:
                 run_research_batch call.
             max_concurrent_source_tool_calls: Shared source-tool concurrency limit across researcher workers.
             max_source_tool_batch_size: Maximum concrete inputs per batch-capable source tool call.
+            max_researcher_execute_attempts: Hard limit on physical researcher code-execution attempts.
             max_writer_execute_attempts: Hard limit on writer-side chart execution attempts,
                 including physical retries.
         """
@@ -120,6 +123,7 @@ class DeepResearcherAgent:
         self.max_research_concurrency = max_research_concurrency
         self.max_concurrent_source_tool_calls = max_concurrent_source_tool_calls
         self.max_source_tool_batch_size = max_source_tool_batch_size
+        self.max_researcher_execute_attempts = max_researcher_execute_attempts
         self.max_writer_execute_attempts = max_writer_execute_attempts
         self.domain_catalog_path = domain_catalog_path
         self.enable_source_router = enable_source_router
@@ -149,6 +153,7 @@ class DeepResearcherAgent:
                 source_registry_middleware=self.source_registry_middleware,
                 enable_source_router=self.enable_source_router,
                 artifact_manager=self.deepagents_runtime.artifact_manager,
+                max_researcher_execute_attempts=self.max_researcher_execute_attempts,
                 max_writer_execute_attempts=self.max_writer_execute_attempts,
             )
 
@@ -211,6 +216,7 @@ class DeepResearcherAgent:
             enable_source_router=self.enable_source_router,
             max_research_concurrency=self.max_research_concurrency,
             final_report_tracker=final_report_tracker,
+            max_researcher_execute_attempts=self.max_researcher_execute_attempts,
         )
 
     def _extract_final_markdown(

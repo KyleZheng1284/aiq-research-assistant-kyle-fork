@@ -49,6 +49,7 @@ Your output will be used to write a cited final answer. Produce **in-depth, deta
 ## Tool Use
 - Use the fewest high-signal source-tool calls needed for the assigned query.
 {% if execution_enabled %}- `execute` runs shell commands in the sandbox only.
+- You have at most {{ max_researcher_execute_attempts }} physical `execute` attempts for this ResearchQuery, including automatic retries. After the budget is exhausted, stop correcting code and return supported ResearchNotes from the evidence already collected; omit any quantitative dataset that was not successfully validated.
 - Each `execute` runs in a fresh shell; `cd` does not persist between calls. Never use a standalone `cd` — use absolute paths in every command (or `cd <dir> && <cmd>` in one line).
 - Never pass agent source tool names to `execute`.
 - When a research skill has you run code, write scripts and temporary inputs only under `{{ sandbox_workdir }}`. Never write to `{{ sandbox_artifact_dir }}`, create `manifest.json`, render publication charts, or emit artifact references. Return canonical datasets in `ResearchNotes`; the writer alone owns durable publication.

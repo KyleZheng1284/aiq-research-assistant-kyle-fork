@@ -70,6 +70,7 @@ def test_researcher_hands_off_canonical_dataset_without_publishing() -> None:
         execution_enabled=True,
         sandbox_workdir="/sandbox/job-123",
         sandbox_artifact_dir="/sandbox/job-123/aiq-artifacts",
+        max_researcher_execute_attempts=3,
         user_info=None,
         tools=[],
         available_documents=None,

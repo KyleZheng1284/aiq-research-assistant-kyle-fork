@@ -208,6 +208,7 @@ class ArtifactManager:
         self._final_harvest_result: list[Artifact] = []
         self._seen: set[tuple[str, str]] = set()
         self._trusted_canonical_digests: set[str] = set()
+        self._trusted_canonical_paths: dict[str, str] = {}
         self._canonical_manifest_paths: set[str] = set()
         self._rejected_manifest_paths: dict[str, str] = {}
         self._last_harvest_rejections: list[tuple[str, str]] = []
@@ -231,6 +232,29 @@ class ArtifactManager:
             raise ValueError("canonical dataset digests must be lowercase SHA-256 values")
         with self._lock:
             self._trusted_canonical_digests.update(normalized)
+
+    def register_canonical_datasets(self, datasets: Iterable[tuple[str, str]]) -> None:
+        """Register canonical dataset paths and digests as one fail-closed identity."""
+        identities: dict[str, str] = {}
+        for dataset_id, digest in datasets:
+            if not isinstance(dataset_id, str) or not dataset_id or PurePosixPath(dataset_id).name != dataset_id:
+                raise ValueError("canonical dataset ids must be non-empty path-safe names")
+            if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+                raise ValueError("canonical dataset digests must be lowercase SHA-256 values")
+            path_key = self._path_key(f"{self.artifact_dir}/{dataset_id}.csv")
+            existing = identities.get(path_key)
+            if existing is not None and existing != digest:
+                raise ValueError("canonical dataset path has conflicting digests")
+            identities[path_key] = digest
+
+        with self._lock:
+            for path_key, digest in identities.items():
+                existing = self._trusted_canonical_paths.get(path_key)
+                if existing is not None and existing != digest:
+                    raise ValueError("canonical dataset path has conflicting digests")
+            self._trusted_canonical_paths.update(identities)
+            self._trusted_canonical_digests.update(identities.values())
+            self._canonical_manifest_paths.update(identities)
 
     def last_harvest_rejections(self) -> tuple[tuple[str, str], ...]:
         """Return bounded rejection diagnostics from the most recent harvest.
@@ -566,6 +590,16 @@ class ArtifactManager:
             if not path or path.endswith(f"/{_MANIFEST_NAME}"):
                 continue
             path_key = self._path_key(path)
+            trusted_digest = self._trusted_canonical_paths.get(path_key)
+            if trusted_digest is not None:
+                entries.append(
+                    ManifestEntry(
+                        path=path,
+                        kind=ArtifactKind.DATASET,
+                        expected_sha256=trusted_digest,
+                    )
+                )
+                continue
             if path_key in self._canonical_manifest_paths:
                 continue
             if path_key in self._rejected_manifest_paths:
@@ -596,9 +630,20 @@ class ArtifactManager:
         # Canonical publication is a CSV dataset manifest entry. Any use of the
         # canonical digest field permanently places that path behind this trust
         # boundary, including malformed declarations and later retries.
+        path_key = self._path_key(entry.path)
+        trusted_path_digest = self._trusted_canonical_paths.get(path_key)
+        if trusted_path_digest is not None:
+            if entry.expected_sha256 is not None and entry.expected_sha256 != trusted_path_digest:
+                self._reject_canonical(entry.path, _CANONICAL_DIGEST_MISMATCH)
+                return None
+            entry = entry.model_copy(
+                update={
+                    "kind": ArtifactKind.DATASET,
+                    "expected_sha256": trusted_path_digest,
+                }
+            )
         canonical_dataset = self._is_canonical_dataset(entry)
         canonical_declaration = self._is_canonical_declaration(entry)
-        path_key = self._path_key(entry.path)
         if canonical_declaration:
             self._canonical_manifest_paths.add(path_key)
         if path_key in self._canonical_manifest_paths and not canonical_dataset:
@@ -607,6 +652,9 @@ class ArtifactManager:
             self._reject_canonical(entry.path, _CANONICAL_DIGEST_MISSING)
             return None
         if canonical_dataset:
+            if self._trusted_canonical_paths and trusted_path_digest is None:
+                self._reject_canonical(entry.path, _CANONICAL_DIGEST_UNREGISTERED)
+                return None
             if entry.expected_sha256 is None:
                 self._reject_canonical(entry.path, _CANONICAL_DIGEST_MISSING)
                 return None

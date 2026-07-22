@@ -32,6 +32,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 from langchain_core.tools import tool
 
+from ..custom_middleware import researcher_execute_budget_scope
 from ..models import ResearchNotes
 from ..models import ResearchQuery
 
@@ -143,23 +144,24 @@ async def _run_research_query(
         correction_state: dict[str, Any] = {"count": 0, "fallback_note": None}
         correction_token = _structured_output_correction_state.set(correction_state)
         try:
-            try:
-                result = await researcher_runnable.ainvoke(
-                    researcher_invoke_state(query, runtime),
-                    config=researcher_invoke_config(runtime, callbacks),
-                )
-            except StructuredOutputValidationError as exc:
-                note = _salvage_textual_research_notes(exc) or correction_state["fallback_note"]
-                if note is not None:
-                    logger.warning(
-                        "Omitting invalid quantitative dataset publication after bounded structured-output corrections "
-                        "for query %r",
-                        query.query,
+            with researcher_execute_budget_scope():
+                try:
+                    result = await researcher_runnable.ainvoke(
+                        researcher_invoke_state(query, runtime),
+                        config=researcher_invoke_config(runtime, callbacks),
                     )
-                    return note
-                raise RuntimeError(f"researcher worker failed for query {query.query!r}: {exc}") from exc
-            except Exception as exc:  # noqa: BLE001 - captured as per-item failure
-                raise RuntimeError(f"researcher worker failed for query {query.query!r}: {exc}") from exc
+                except StructuredOutputValidationError as exc:
+                    note = _salvage_textual_research_notes(exc) or correction_state["fallback_note"]
+                    if note is not None:
+                        logger.warning(
+                            "Omitting invalid quantitative dataset publication after bounded structured-output "
+                            "corrections for query %r",
+                            query.query,
+                        )
+                        return note
+                    raise RuntimeError(f"researcher worker failed for query {query.query!r}: {exc}") from exc
+                except Exception as exc:  # noqa: BLE001 - captured as per-item failure
+                    raise RuntimeError(f"researcher worker failed for query {query.query!r}: {exc}") from exc
 
             try:
                 structured = result.get("structured_response") if isinstance(result, dict) else None
@@ -225,32 +227,40 @@ def _persist_research_notes(
     return True
 
 
-def _canonical_dataset_digests(notes: list[ResearchNotes]) -> list[str]:
-    """Recompute and verify canonical CSV digests at the publication trust boundary."""
-    digests: list[str] = []
+def _canonical_dataset_identities(notes: list[ResearchNotes]) -> list[tuple[str, str]]:
+    """Recompute canonical path identities and reject conflicting dataset ids."""
+    identities: dict[str, str] = {}
     for note in notes:
         for dataset in note.quantitative_datasets:
             runtime_digest = hashlib.sha256(dataset.csv_text.encode("utf-8")).hexdigest()
             if dataset.csv_sha256 != runtime_digest:
                 raise ValueError("canonical dataset digest no longer matches its validated csv_text")
-            digests.append(runtime_digest)
-    return digests
+            existing = identities.get(dataset.dataset_id)
+            if existing is not None and existing != runtime_digest:
+                raise ValueError("canonical dataset id has conflicting digests")
+            identities[dataset.dataset_id] = runtime_digest
+    return list(identities.items())
 
 
-def _register_canonical_dataset_digests(
+def _canonical_dataset_digests(notes: list[ResearchNotes]) -> list[str]:
+    """Return reverified canonical CSV digests at the publication trust boundary."""
+    return [digest for _, digest in _canonical_dataset_identities(notes)]
+
+
+def _register_canonical_datasets(
     *,
     artifact_manager: Any | None,
     notes: list[ResearchNotes],
-    expected_digests: list[str] | None = None,
+    expected_identities: list[tuple[str, str]] | None = None,
 ) -> None:
-    """Register reverified canonical CSV digests with the job artifact manager."""
+    """Register reverified canonical CSV path identities with the artifact manager."""
     if artifact_manager is None:
         return
-    digests = _canonical_dataset_digests(notes)
-    if expected_digests is not None and digests != expected_digests:
-        raise ValueError("canonical dataset digests changed before artifact registration")
-    if digests:
-        artifact_manager.register_canonical_digests(digests)
+    identities = _canonical_dataset_identities(notes)
+    if expected_identities is not None and identities != expected_identities:
+        raise ValueError("canonical dataset identities changed before artifact registration")
+    if identities:
+        artifact_manager.register_canonical_datasets(identities)
 
 
 async def _run_research_queries(
@@ -324,14 +334,14 @@ def build_research_batch_tool(
         )
         if source_registry_middleware is not None:
             source_registry_middleware.register_research_note_sources(notes)
-        canonical_digests = _canonical_dataset_digests(notes)
+        canonical_identities = _canonical_dataset_identities(notes)
         notes_persisted = _persist_research_notes(backend=backend, queries=successful_queries, notes=notes)
-        if canonical_digests and artifact_manager is not None and not notes_persisted:
-            raise RuntimeError("canonical dataset digests cannot be registered before ResearchNotes persistence")
-        _register_canonical_dataset_digests(
+        if canonical_identities and artifact_manager is not None and not notes_persisted:
+            raise RuntimeError("canonical dataset identities cannot be registered before ResearchNotes persistence")
+        _register_canonical_datasets(
             artifact_manager=artifact_manager,
             notes=notes,
-            expected_digests=canonical_digests,
+            expected_identities=canonical_identities,
         )
 
         if errors:

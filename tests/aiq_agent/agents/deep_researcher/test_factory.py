@@ -33,6 +33,7 @@ from aiq_agent.agents.deep_researcher.custom_middleware import FinalReportCommit
 from aiq_agent.agents.deep_researcher.custom_middleware import FinalReportCommitTracker
 from aiq_agent.agents.deep_researcher.custom_middleware import FinalReportOwnershipGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import RequiredOutputFileMiddleware
+from aiq_agent.agents.deep_researcher.custom_middleware import ResearcherExecuteBudgetMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRegistryMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRoutingGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import TodoSuppressionMiddleware
@@ -240,9 +241,14 @@ def test_middleware_set_wires_publication_and_execute_guards_only_on_writer():
         tool_set=tool_set,
         source_registry_middleware=registry,
         artifact_manager=manager,
+        max_researcher_execute_attempts=4,
         max_writer_execute_attempts=2,
     )
 
+    researcher_limiter = next(
+        item for item in middleware_set.researcher if isinstance(item, ResearcherExecuteBudgetMiddleware)
+    )
+    assert researcher_limiter.max_attempts == 4
     assert not any(isinstance(item, WriterExecuteBudgetMiddleware) for item in middleware_set.researcher)
     assert not any(isinstance(item, WriterExecuteBudgetMiddleware) for item in middleware_set.planner)
     assert not any(isinstance(item, WriterExecuteBudgetMiddleware) for item in middleware_set.orchestrator)

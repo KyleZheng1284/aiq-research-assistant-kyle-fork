@@ -283,6 +283,7 @@ class TestDeepResearcherAgent:
                 max_research_concurrency=2,
                 max_concurrent_source_tool_calls=3,
                 max_source_tool_batch_size=4,
+                max_researcher_execute_attempts=2,
                 max_writer_execute_attempts=2,
             )
 
@@ -291,6 +292,7 @@ class TestDeepResearcherAgent:
             assert agent.max_research_concurrency == 2
             assert agent.max_concurrent_source_tool_calls == 3
             assert agent.max_source_tool_batch_size == 4
+            assert agent.max_researcher_execute_attempts == 2
             assert agent.max_writer_execute_attempts == 2
             assert agent.domain_catalog_path == "configs/domain_catalogs/deep_research_domain_catalog.yml"
             assert agent.enable_source_router is False
@@ -323,6 +325,7 @@ class TestDeepResearcherAgent:
             max_research_concurrency=2,
             max_concurrent_source_tool_calls=3,
             max_source_tool_batch_size=4,
+            max_researcher_execute_attempts=2,
             max_writer_execute_attempts=2,
             workflow_timeout_seconds=120,
             domain_catalog_path="configs/domain_catalogs/deep_research_domain_catalog.yml",
@@ -338,6 +341,7 @@ class TestDeepResearcherAgent:
         assert config.max_research_concurrency == 2
         assert config.max_concurrent_source_tool_calls == 3
         assert config.max_source_tool_batch_size == 4
+        assert config.max_researcher_execute_attempts == 2
         assert config.max_writer_execute_attempts == 2
         assert config.workflow_timeout_seconds == 120
         assert config.enable_source_router is False
@@ -347,15 +351,18 @@ class TestDeepResearcherAgent:
         assert config.sandbox.packages == ("matplotlib", "pillow")
 
     def test_convergence_limits_are_bounded_and_watchdog_defaults_disabled(self):
-        """The library stays opt-in for deadlines while writer execution is bounded by default."""
+        """The library stays opt-in for deadlines while physical execution is bounded by default."""
         from pydantic import ValidationError
 
         from aiq_agent.agents.deep_researcher.register import DeepResearchAgentConfig
 
         config = DeepResearchAgentConfig(orchestrator_llm="llm")
 
+        assert config.max_researcher_execute_attempts == 3
         assert config.max_writer_execute_attempts == 3
         assert config.workflow_timeout_seconds is None
+        with pytest.raises(ValidationError):
+            DeepResearchAgentConfig(orchestrator_llm="llm", max_researcher_execute_attempts=0)
         with pytest.raises(ValidationError):
             DeepResearchAgentConfig(orchestrator_llm="llm", max_writer_execute_attempts=0)
         with pytest.raises(ValidationError):

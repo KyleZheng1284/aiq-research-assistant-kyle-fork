@@ -165,7 +165,7 @@ Expected behavior:
 2. Researchers gather source-grounded input figures.
 3. The researcher reads `data-table-analysis`, calls `execute` for Python/pandas calculations, and returns canonical
    `csv_text`, a Markdown table, summary statistics, provenance, and caveats in validated `ResearchNotes`.
-4. AI-Q computes and registers a SHA-256 digest over the exact UTF-8 CSV text.
+4. AI-Q registers the canonical dataset ID, artifact path, and SHA-256 digest over the exact UTF-8 CSV text.
 5. The writer writes the complete `/shared/output.md` baseline, then reads `chart-generation` to publish the exact CSV.
 6. CSV-only requests finish without chart execution. Chart requests render only from the published CSV and, by
    default, stop after three failed writer execution attempts while preserving the report, table, and CSV.
@@ -246,8 +246,9 @@ source.
   Writer manifest writes and successful chart execution checkpoint declared files, and terminal paths perform one final
   best-effort scan. A busy cancellation skips that scan and preserves earlier checkpoints. Adding a sandbox alone does
   not guarantee that every generated file is persisted or embedded in the report.
-- Canonical dataset manifests must carry the runtime-registered digest. Missing, unregistered, or mismatched digests are
-  rejected, and the final directory scan cannot recapture a rejected canonical path.
+- Canonical dataset manifests must carry the runtime-registered path and digest. Missing, moved, unregistered, or
+  mismatched identities are rejected. Registered canonical paths remain digest-protected during the final directory
+  scan even when no manifest was written.
 - `workflow_timeout_seconds` is disabled by default in the library. The shipped sandbox profiles set it from
   `AIQ_DEEP_RESEARCH_WORKFLOW_TIMEOUT_SECONDS` with a 3600-second fallback. When the timeout wins the terminal-state
   race, the job fails with `deep_research_workflow_timeout`, requests forced sandbox termination, and bounds how long

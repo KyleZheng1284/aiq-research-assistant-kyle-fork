@@ -46,12 +46,14 @@ from aiq_agent.agents.deep_researcher.custom_middleware import FinalReportCommit
 from aiq_agent.agents.deep_researcher.custom_middleware import FinalReportOwnershipGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import PlanPersistenceMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import RequiredOutputFileMiddleware
+from aiq_agent.agents.deep_researcher.custom_middleware import ResearcherExecuteBudgetMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRegistryMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import SourceRoutingGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import TodoSuppressionMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ToolNameSanitizationMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ToolVisibilityMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import WriterExecuteBudgetMiddleware
+from aiq_agent.agents.deep_researcher.custom_middleware import researcher_execute_budget_scope
 from aiq_agent.agents.deep_researcher.tools.source_registry import build_get_verified_sources_tool
 from aiq_agent.common.citation_verification import SourceEntry
 from aiq_agent.common.data_source_registry import populate_from_config
@@ -1419,6 +1421,72 @@ class TestArtifactHarvestMiddleware:
         assert "accepted.csv" not in rejected.content
 
 
+class TestResearcherExecuteBudgetMiddleware:
+    """Researcher code execution is task-local and physically bounded."""
+
+    @staticmethod
+    def _request() -> MagicMock:
+        request = MagicMock()
+        request.tool_call = {
+            "name": "execute",
+            "id": "research-execute-1",
+            "args": {"command": "python analyze.py"},
+        }
+        return request
+
+    @pytest.mark.asyncio
+    async def test_generic_retries_cannot_exceed_researcher_budget(self) -> None:
+        middleware = ResearcherExecuteBudgetMiddleware(max_attempts=3)
+        retry = ToolRetryMiddleware(max_retries=3, initial_delay=0, backoff_factor=0)
+        request = self._request()
+        physical = AsyncMock(side_effect=RuntimeError("analysis failed"))
+
+        with researcher_execute_budget_scope() as budget_state:
+            result = await retry.awrap_tool_call(
+                request,
+                lambda current_request: middleware.awrap_tool_call(current_request, physical),
+            )
+
+        assert result.status == "error"
+        assert "researcher_execute_budget_exhausted" in result.content
+        assert budget_state["attempts"] == 3
+        assert physical.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_allows_one_correction_then_ends_repeat_loop(self) -> None:
+        middleware = ResearcherExecuteBudgetMiddleware(max_attempts=1)
+        request = self._request()
+        model_state = {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[request.tool_call],
+                )
+            ]
+        }
+
+        with researcher_execute_budget_scope():
+            await middleware.awrap_tool_call(request, AsyncMock(return_value="analysis complete"))
+            correction = await middleware.aafter_model(model_state, runtime=None)
+            terminal = await middleware.aafter_model(model_state, runtime=None)
+
+        assert correction["jump_to"] == "model"
+        assert "Do not call execute again" in correction["messages"][-1].content
+        assert terminal["jump_to"] == "end"
+        assert terminal["messages"][-1].content == "researcher_execute_budget_exhausted"
+
+    @pytest.mark.asyncio
+    async def test_execute_is_unmodified_outside_worker_scope(self) -> None:
+        middleware = ResearcherExecuteBudgetMiddleware(max_attempts=1)
+        request = self._request()
+        handler = AsyncMock(return_value="analysis complete")
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "analysis complete"
+        handler.assert_awaited_once_with(request)
+
+
 class TestWriterExecuteBudgetMiddleware:
     """Writer execution is baseline-gated and physically bounded."""
 
@@ -1439,7 +1507,7 @@ class TestWriterExecuteBudgetMiddleware:
         request.tool_call = {
             "name": tool_name,
             "id": "tc1",
-            "args": args if args is not None else {"command": "python chart.py /shared/aiq-artifacts"},
+            "args": args if args is not None else {"command": "python make_chart.py /shared/aiq-artifacts"},
         }
         return request
 
@@ -1518,7 +1586,7 @@ class TestWriterExecuteBudgetMiddleware:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
-    async def test_artifact_publication_write_requires_valid_canonical_state(self, tool_name: str) -> None:
+    async def test_noncanonical_csv_write_does_not_require_quantitative_state(self, tool_name: str) -> None:
         middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
         handler = AsyncMock(return_value="physically wrote artifact")
         request = self._request(
@@ -1528,13 +1596,11 @@ class TestWriterExecuteBudgetMiddleware:
 
         result = await middleware.awrap_tool_call(request, handler)
 
-        assert result.status == "error"
-        assert result.name == tool_name
-        assert "writer_canonical_dataset_missing" in result.content
-        handler.assert_not_awaited()
+        assert result == "physically wrote artifact"
+        handler.assert_awaited_once_with(request)
 
     @pytest.mark.asyncio
-    async def test_invalid_research_note_cannot_open_artifact_publication_gate(self) -> None:
+    async def test_invalid_research_note_does_not_reclassify_generic_csv_as_canonical(self) -> None:
         middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
         handler = AsyncMock(return_value="physically wrote artifact")
         invalid_note = self._research_note()
@@ -1550,8 +1616,8 @@ class TestWriterExecuteBudgetMiddleware:
 
         result = await middleware.awrap_tool_call(request, handler)
 
-        assert "writer_canonical_dataset_missing" in result.content
-        handler.assert_not_awaited()
+        assert result == "physically wrote artifact"
+        handler.assert_awaited_once_with(request)
 
     @pytest.mark.asyncio
     async def test_report_write_outside_artifact_directory_needs_no_canonical_state(self) -> None:
@@ -1565,6 +1631,36 @@ class TestWriterExecuteBudgetMiddleware:
         result = await middleware.awrap_tool_call(request, handler)
 
         assert result == "report written"
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("filename", ["report.pdf", "analysis.ipynb", "results.json", "diagram.png"])
+    async def test_generic_artifact_writes_need_no_canonical_dataset(self, filename: str) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="artifact written")
+        request = self._request(
+            "write_file",
+            args={"file_path": f"/shared/aiq-artifacts/{filename}", "content": "generic artifact"},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "artifact written"
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_generic_artifact_execute_does_not_consume_chart_budget(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="notebook exported")
+        request = self._request(
+            files={},
+            args={"command": "python export_notebook.py /shared/aiq-artifacts/report.pdf"},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "notebook exported"
+        assert middleware.attempts == 0
         handler.assert_awaited_once_with(request)
 
     @pytest.mark.asyncio
@@ -1702,6 +1798,26 @@ class TestWriterExecuteBudgetMiddleware:
         handler.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_manifest_with_only_generic_artifacts_needs_no_canonical_dataset(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager(published=False))
+        handler = AsyncMock(return_value="manifest written")
+        manifest = json.dumps(
+            {
+                "version": 1,
+                "artifacts": [{"path": "/shared/aiq-artifacts/report.pdf", "kind": "document"}],
+            }
+        )
+        request = self._request(
+            "write_file",
+            args={"file_path": "/shared/aiq-artifacts/manifest.json", "content": manifest},
+        )
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "manifest written"
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
     async def test_unrelated_writer_execute_passes_without_consuming_chart_budget(self) -> None:
         middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager())
         handler = AsyncMock(return_value="analysis complete")
@@ -1722,7 +1838,7 @@ class TestWriterExecuteBudgetMiddleware:
         handler = AsyncMock(return_value="chart complete")
         request = self._request(
             files=self._baseline(),
-            args={"command": "python chart.py ./aiq-artifacts"},
+            args={"command": "python make_chart.py ./aiq-artifacts"},
         )
 
         result = await middleware.awrap_tool_call(request, handler)
@@ -1810,6 +1926,20 @@ class TestWriterExecuteBudgetMiddleware:
         handler.assert_awaited_once_with(request)
 
     @pytest.mark.asyncio
+    async def test_crlf_report_table_opens_execute_gate(self) -> None:
+        middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=self._manager())
+        handler = AsyncMock(return_value="ok")
+        files = self._baseline()
+        files["/shared/output.md"]["content"] = files["/shared/output.md"]["content"].replace("\n", "\r\n")
+        request = self._request(files=files)
+
+        result = await middleware.awrap_tool_call(request, handler)
+
+        assert result == "ok"
+        assert middleware.attempts == 1
+        handler.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
     async def test_generic_retries_cannot_reach_fourth_physical_execute(self) -> None:
         manager = self._manager()
         middleware = WriterExecuteBudgetMiddleware(max_attempts=3, artifact_manager=manager)
@@ -1851,7 +1981,7 @@ class TestWriterExecuteBudgetMiddleware:
                         {
                             "name": "execute",
                             "id": "tc2",
-                            "args": {"command": "python chart.py /shared/aiq-artifacts"},
+                            "args": {"command": "python make_chart.py /shared/aiq-artifacts"},
                         }
                     ],
                 )

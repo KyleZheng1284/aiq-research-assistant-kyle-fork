@@ -162,6 +162,7 @@ functions:
   deep_research_agent:
     _type: deep_research_agent
     enable_citation_verification: true
+    max_researcher_execute_attempts: 3
     workflow_timeout_seconds: ${AIQ_DEEP_RESEARCH_WORKFLOW_TIMEOUT_SECONDS:-3600}
     orchestrator_llm: nemotron_super_llm
     source_router_llm: nemotron_super_llm

@@ -468,6 +468,7 @@ functions:
     max_research_concurrency: 6
     max_concurrent_source_tool_calls: 5
     max_source_tool_batch_size: 4
+    max_researcher_execute_attempts: 3
     max_writer_execute_attempts: 3
     # Optional; shipped sandbox profiles default this environment-backed value to 3600.
     workflow_timeout_seconds: null
@@ -491,6 +492,7 @@ functions:
 | `max_research_concurrency` | `int` | `6` | Maximum `ResearchQuery` objects accepted and run concurrently by one `run_research_batch` call. |
 | `max_concurrent_source_tool_calls` | `int` | `5` | Shared cap on concurrent source-tool calls across all researcher workers in the run. |
 | `max_source_tool_batch_size` | `int` | `4` | Maximum concrete inputs accepted by a batch-capable source-tool wrapper in one call. |
+| `max_researcher_execute_attempts` | `int` | `3` | Maximum physical code executions per researcher worker. Generic tool retries cannot exceed this limit. |
 | `max_writer_execute_attempts` | `int` | `3` | Maximum physical writer-side chart executions. Generic tool retries cannot exceed this limit. |
 | `workflow_timeout_seconds` | `float` or `None` | `None` | Optional wall-clock deadline for async deep research. When timeout wins the terminal-state race, the job fails with `deep_research_workflow_timeout`, requests forced sandbox termination, and bounds how long the worker waits. |
 | `verbose` | `bool` | `true` | Enable verbose logging. |

@@ -30,7 +30,8 @@ from aiq_agent.agents.deep_researcher.factory import build_researcher_runnable
 from aiq_agent.agents.deep_researcher.models import ResearchNotes
 from aiq_agent.agents.deep_researcher.models import ResearchQuery
 from aiq_agent.agents.deep_researcher.tools.research import _canonical_dataset_digests
-from aiq_agent.agents.deep_researcher.tools.research import _register_canonical_dataset_digests
+from aiq_agent.agents.deep_researcher.tools.research import _canonical_dataset_identities
+from aiq_agent.agents.deep_researcher.tools.research import _register_canonical_datasets
 from aiq_agent.agents.deep_researcher.tools.research import _research_note_files
 from aiq_agent.agents.deep_researcher.tools.research import _run_research_query
 from aiq_agent.agents.deep_researcher.tools.research import build_research_batch_tool
@@ -158,13 +159,14 @@ def test_research_note_persistence_preserves_canonical_csv_and_digest_exactly():
     assert ResearchNotes.model_validate(persisted).quantitative_datasets[0].csv_text == csv_text
 
 
-def test_validated_canonical_digests_are_registered_with_job_artifact_manager():
+def test_validated_canonical_identities_are_registered_with_job_artifact_manager():
     note = _quantitative_note("quarter,revenue\nQ1,22.6\n")
     artifact_manager = MagicMock()
 
-    _register_canonical_dataset_digests(artifact_manager=artifact_manager, notes=[note])
+    _register_canonical_datasets(artifact_manager=artifact_manager, notes=[note])
 
-    artifact_manager.register_canonical_digests.assert_called_once_with([note.quantitative_datasets[0].csv_sha256])
+    dataset = note.quantitative_datasets[0]
+    artifact_manager.register_canonical_datasets.assert_called_once_with([(dataset.dataset_id, dataset.csv_sha256)])
 
 
 def test_digest_registration_recomputes_and_rejects_a_stale_model_copy():
@@ -177,7 +179,7 @@ def test_digest_registration_recomputes_and_rejects_a_stale_model_copy():
 
 
 @pytest.mark.asyncio
-async def test_research_batch_registers_validated_digest_before_returning_notes():
+async def test_research_batch_registers_validated_identity_before_returning_notes():
     note = _quantitative_note("quarter,revenue\nQ1,22.6\n")
     artifact_manager = MagicMock()
 
@@ -209,7 +211,8 @@ async def test_research_batch_registers_validated_digest_before_returning_notes(
         }
     )
 
-    artifact_manager.register_canonical_digests.assert_called_once_with([note.quantitative_datasets[0].csv_sha256])
+    dataset = note.quantitative_datasets[0]
+    artifact_manager.register_canonical_datasets.assert_called_once_with([(dataset.dataset_id, dataset.csv_sha256)])
 
 
 @pytest.mark.asyncio
@@ -242,7 +245,7 @@ async def test_research_batch_refuses_digest_registration_without_note_persisten
             }
         )
 
-    artifact_manager.register_canonical_digests.assert_not_called()
+    artifact_manager.register_canonical_datasets.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -260,7 +263,7 @@ async def test_research_batch_persists_notes_before_registering_digest():
             return [SimpleNamespace(path=path, error=None) for path, _content in files]
 
     artifact_manager = MagicMock()
-    artifact_manager.register_canonical_digests.side_effect = lambda _digests: events.append("register")
+    artifact_manager.register_canonical_datasets.side_effect = lambda _identities: events.append("register")
     batch_tool = build_research_batch_tool(
         researcher_runnable=_ResearcherRunnable(),
         callbacks=[],
@@ -320,14 +323,22 @@ async def test_research_batch_does_not_register_digest_when_persistence_fails():
             }
         )
 
-    artifact_manager.register_canonical_digests.assert_not_called()
+    artifact_manager.register_canonical_datasets.assert_not_called()
 
 
 def test_digest_registration_is_a_noop_without_datasets_or_manager():
     note = _quantitative_note("quarter,revenue\nQ1,22.6\n").model_copy(update={"quantitative_datasets": []})
     artifact_manager = MagicMock()
 
-    _register_canonical_dataset_digests(artifact_manager=artifact_manager, notes=[note])
-    _register_canonical_dataset_digests(artifact_manager=None, notes=[_quantitative_note("a\n1\n")])
+    _register_canonical_datasets(artifact_manager=artifact_manager, notes=[note])
+    _register_canonical_datasets(artifact_manager=None, notes=[_quantitative_note("a\n1\n")])
 
-    artifact_manager.register_canonical_digests.assert_not_called()
+    artifact_manager.register_canonical_datasets.assert_not_called()
+
+
+def test_canonical_identity_rejects_one_dataset_id_with_conflicting_digests():
+    first = _quantitative_note("quarter,revenue\nQ1,22.6\n")
+    second = _quantitative_note("quarter,revenue\nQ1,99\n")
+
+    with pytest.raises(ValueError, match="id has conflicting digests"):
+        _canonical_dataset_identities([first, second])

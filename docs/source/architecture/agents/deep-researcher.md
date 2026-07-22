@@ -204,6 +204,7 @@ for configuration details.
 | `domain_catalog_path` | `str` or `None` | `None` | Optional YAML or JSON domain catalog used by the source router |
 | `enable_source_router` | `bool` | `true` | Run the advisory source-router stage before planning |
 | `max_research_concurrency` | `int` | `6` | Maximum `ResearchQuery` items accepted and run concurrently per batch call |
+| `max_researcher_execute_attempts` | `int` | `3` | Physical code-execution limit per researcher worker, including generic retries |
 | `max_writer_execute_attempts` | `int` | `3` | Physical writer chart-execution limit, including generic retries |
 | `workflow_timeout_seconds` | `float` or `None` | `None` | Optional async workflow deadline; expiry fails with `deep_research_workflow_timeout` |
 | `skills` | `FunctionRef`, inline `deep_research_skills`, or `None` | `None` | Optional built-in skill assignments by agent name |
@@ -225,6 +226,7 @@ functions:
     enable_source_router: true
     enable_citation_verification: true
     max_research_concurrency: 6
+    max_researcher_execute_attempts: 3
     max_writer_execute_attempts: 3
     workflow_timeout_seconds: 3600
     verbose: true
@@ -293,9 +295,15 @@ The batch tool returns the notes to the orchestrator and persists them under
 notes remain registered and persisted; only failed or missing queries are
 eligible for another call.
 
+Each researcher worker has a task-local physical `execute` budget, including
+automatic retries. After exhaustion, it gets one correction turn to return
+supported `ResearchNotes`; a repeated execution request ends that worker rather
+than waiting for the workflow's global deadline.
+
 Canonical CSV is parsed strictly without normalization or reserialization. AI-Q
 computes its SHA-256 digest from the exact UTF-8 text, persists that value, and
-registers it with the job-scoped artifact manager before writer execution.
+registers its dataset ID, artifact path, and digest with the job-scoped artifact
+manager before writer execution.
 Within an artifact manifest, a ``.csv`` entry with ``kind: dataset`` is reserved
 for this canonical publication contract and must include ``expected_sha256``.
 Legacy or noncanonical CSV outputs remain supported through directory scanning

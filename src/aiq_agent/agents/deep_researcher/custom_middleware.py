@@ -23,6 +23,9 @@ import posixpath
 import re
 import shlex
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from pathlib import PurePosixPath
 
@@ -64,6 +67,25 @@ _EXECUTE_RESULT_RE = re.compile(
     r"(?:\n\[Output was truncated due to size limits\])?\Z"
 )
 _MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r":?-{3,}:?")
+_researcher_execute_budget_state: ContextVar[dict[str, object] | None] = ContextVar(
+    "researcher_execute_budget_state",
+    default=None,
+)
+
+
+@contextmanager
+def researcher_execute_budget_scope() -> Iterator[dict[str, object]]:
+    """Create task-local researcher execution accounting for one worker run."""
+    state: dict[str, object] = {
+        "attempts": 0,
+        "notice_sent": False,
+        "lock": asyncio.Lock(),
+    }
+    token = _researcher_execute_budget_state.set(state)
+    try:
+        yield state
+    finally:
+        _researcher_execute_budget_state.reset(token)
 
 
 def _tool_result_failed(result: object) -> bool:
@@ -1131,17 +1153,125 @@ class ArtifactHarvestMiddleware(AgentMiddleware):
         return result.model_copy(update={"content": content})
 
 
+class ResearcherExecuteBudgetMiddleware(AgentMiddleware):
+    """Bound physical researcher execution and one post-budget correction turn."""
+
+    def __init__(self, *, max_attempts: int = 3) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least one")
+        self.max_attempts = max_attempts
+
+    @staticmethod
+    def _active_state() -> dict[str, object] | None:
+        return _researcher_execute_budget_state.get()
+
+    @staticmethod
+    def _tool_message(request, content: str) -> ToolMessage:
+        tool_call = request.tool_call if isinstance(getattr(request, "tool_call", None), dict) else {}
+        return ToolMessage(
+            content=content,
+            tool_call_id=tool_call.get("id", "researcher-execute-budget"),
+            name="execute",
+            status="error",
+        )
+
+    async def awrap_tool_call(self, request, handler):
+        """Admit at most ``max_attempts`` physical execute calls per researcher worker."""
+        tool_call = request.tool_call if isinstance(getattr(request, "tool_call", None), dict) else {}
+        if tool_call.get("name") != "execute":
+            return await handler(request)
+
+        state = self._active_state()
+        if state is None:
+            return await handler(request)
+        lock = state["lock"]
+        if not isinstance(lock, asyncio.Lock):
+            raise RuntimeError("researcher execute budget scope is invalid")
+        async with lock:
+            attempts = int(state["attempts"])
+            if attempts >= self.max_attempts:
+                return self._tool_message(
+                    request,
+                    "researcher_execute_budget_exhausted: no further code execution is allowed; "
+                    "return supported ResearchNotes from the evidence already collected.",
+                )
+            state["attempts"] = attempts + 1
+
+        result = await handler(request)
+        if int(state["attempts"]) >= self.max_attempts and _tool_result_failed(result):
+            return self._tool_message(
+                request,
+                "researcher_execute_budget_exhausted: code execution failed at the attempt limit; "
+                "return supported ResearchNotes without further execution.",
+            )
+        if _tool_result_failed(result) and isinstance(result, ToolMessage) and result.status != "error":
+            return result.model_copy(update={"status": "error"})
+        return result
+
+    @staticmethod
+    def _last_ai_message(state: object) -> AIMessage | None:
+        messages = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        return next((message for message in reversed(messages) if isinstance(message, AIMessage)), None)
+
+    @hook_config(can_jump_to=["model", "end"])
+    async def aafter_model(self, state, runtime):
+        """Allow one correction turn after exhaustion, then end a repeated execute loop."""
+        budget_state = self._active_state()
+        if budget_state is None or int(budget_state["attempts"]) < self.max_attempts:
+            return None
+        last_message = self._last_ai_message(state)
+        if last_message is None or not any(call.get("name") == "execute" for call in last_message.tool_calls):
+            return None
+
+        tool_messages = [
+            ToolMessage(
+                content=(
+                    "researcher_execute_budget_exhausted: no further code execution is allowed; "
+                    "return supported ResearchNotes from existing evidence."
+                    if call.get("name") == "execute"
+                    else "Tool call cancelled because the researcher execution budget is exhausted."
+                ),
+                tool_call_id=call.get("id", "researcher-execute-budget"),
+                name=call.get("name"),
+                status="error",
+            )
+            for call in last_message.tool_calls
+        ]
+        if not bool(budget_state["notice_sent"]):
+            budget_state["notice_sent"] = True
+            return {
+                "jump_to": "model",
+                "messages": [
+                    *tool_messages,
+                    HumanMessage(
+                        content=(
+                            "The researcher code-execution budget is exhausted. Do not call execute again. "
+                            "Return schema-valid ResearchNotes using only supported evidence already collected; "
+                            "omit quantitative datasets that were not successfully validated."
+                        )
+                    ),
+                ],
+            }
+        return {
+            "jump_to": "end",
+            "messages": [
+                *tool_messages,
+                AIMessage(content="researcher_execute_budget_exhausted"),
+            ],
+        }
+
+
 class WriterExecuteBudgetMiddleware(AgentMiddleware):
     """Guard durable publication and bound writer-side chart rendering.
 
     The limiter sits inside generic tool retry middleware, so every call that can
     physically reach the sandbox consumes one attempt. Once exhausted, a later
     model request to execute is ended before tool dispatch. The writer must create
-    the report baseline before its first execution, preserving useful text, table,
-    and already-published CSV output when chart rendering fails. Artifact-directory
-    writes are also refused until persisted researcher output contains canonical
-    data and the complete report/table baseline is present; ordinary report writes
-    remain unaffected.
+    the report baseline before its first chart execution, preserving useful text,
+    table, and already-published CSV output when rendering fails. Canonical CSV and
+    manifest writes also require their exact validated table baseline. Generic
+    documents, notebooks, JSON, and unrelated images remain writer-owned but are
+    not subject to the quantitative publication gate.
     """
 
     def __init__(
@@ -1172,7 +1302,7 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
             return None
         for path in self.output_paths:
             text = _entry_text(files.get(path))
-            if isinstance(text, str) and text.strip() and _contains_markdown_table(text):
+            if isinstance(text, str) and text.strip():
                 return text
         return None
 
@@ -1201,38 +1331,39 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
         return isinstance(artifact_dir, str) and _path_targets_directory(path, artifact_dir)
 
     def _targets_artifact_execute(self, tool_call: dict[str, object]) -> bool:
-        """Return whether an execute tool directly targets the artifact directory."""
+        """Return whether an execute call follows the canonical chart contract."""
         if tool_call.get("name") != "execute":
             return False
         args = tool_call.get("args")
         artifact_dir = getattr(self.artifact_manager, "artifact_dir", None)
         if not isinstance(args, dict) or not isinstance(artifact_dir, str):
             return False
-        return _command_targets_directory(args.get("command"), artifact_dir)
-
-    @staticmethod
-    def _state_has_canonical_dataset(state: object) -> bool:
-        """Return whether persisted state contains schema-valid canonical evidence."""
-        return any(note.quantitative_datasets for note in validated_research_notes_from_state(state))
+        command = args.get("command")
+        if not _command_targets_directory(command, artifact_dir) or not isinstance(command, str):
+            return False
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return False
+        return any(PurePosixPath(token.rstrip(";&|")).name == "make_chart.py" for token in tokens)
 
     def _required_publication_tables(
         self,
         state: object,
         tool_call: dict[str, object],
-    ) -> tuple[str, ...] | None:
-        """Resolve the exact canonical tables required by one publication write.
+    ) -> tuple[bool, tuple[str, ...] | None]:
+        """Resolve whether a write is canonical and its required report tables.
 
-        ``None`` means the target expresses canonical publication intent that
-        cannot be tied back to validated researcher output and must fail closed.
-        An empty tuple means the target is a non-dataset artifact and the generic
-        report-first baseline is sufficient.
+        The boolean is false for generic artifacts. For canonical writes, ``None``
+        means the declared identity cannot be tied to validated researcher output
+        and must fail closed.
         """
         args = tool_call.get("args")
         if not isinstance(args, dict):
-            return None
+            return False, ()
         raw_path = args.get("file_path", args.get("path"))
         if not isinstance(raw_path, str):
-            return None
+            return False, ()
         filename = PurePosixPath(_normalize_guard_path(raw_path)).name
         datasets = [
             dataset for note in validated_research_notes_from_state(state) for dataset in note.quantitative_datasets
@@ -1242,21 +1373,21 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
             dataset_id = filename.removesuffix(".csv")
             matches = [dataset for dataset in datasets if dataset.dataset_id == dataset_id]
             if not matches:
-                return None
-            return tuple(dict.fromkeys(dataset.markdown_table for dataset in matches))
+                return False, ()
+            return True, tuple(dict.fromkeys(dataset.markdown_table for dataset in matches))
 
         if filename != "manifest.json":
-            return ()
+            return False, ()
         if tool_call.get("name") != "write_file":
             # An edit patch does not contain the complete post-edit manifest, so
             # its canonical intent cannot be validated deterministically.
-            return None
+            return bool(datasets), None if datasets else ()
         manifest_text = _entry_text(args.get("content"))
         if manifest_text is None:
-            return None
+            return False, ()
         manifest = parse_manifest(manifest_text)
         if manifest is None:
-            return None
+            return False, ()
 
         canonical_entries = [
             entry
@@ -1264,7 +1395,7 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
             if entry.kind.value == "dataset" and PurePosixPath(entry.path).suffix.lower() == ".csv"
         ]
         if not canonical_entries:
-            return None
+            return False, ()
 
         required_tables: list[str] = []
         for entry in canonical_entries:
@@ -1276,13 +1407,11 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
                 digest_matches = {
                     index for index, dataset in enumerate(datasets) if dataset.csv_sha256 == entry.expected_sha256
                 }
-                if not digest_matches:
-                    return None
-                selected = digest_matches & id_matches if id_matches else digest_matches
+                selected = digest_matches & id_matches
             if not selected:
-                return None
+                return True, None
             required_tables.extend(datasets[index].markdown_table for index in sorted(selected))
-        return tuple(dict.fromkeys(required_tables))
+        return True, tuple(dict.fromkeys(required_tables))
 
     @staticmethod
     def _baseline_contains_tables(baseline: str, tables: tuple[str, ...]) -> bool:
@@ -1304,7 +1433,12 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
 
         if not published_digests.issubset(tables_by_digest):
             return False
-        return all(table in baseline for digest in published_digests for table in tables_by_digest[digest])
+        normalized_baseline = baseline.replace("\r\n", "\n").replace("\r", "\n")
+        return all(
+            table.replace("\r\n", "\n").replace("\r", "\n") in normalized_baseline
+            for digest in published_digests
+            for table in tables_by_digest[digest]
+        )
 
     @staticmethod
     def _tool_message(request, content: str, *, name: str = "execute") -> ToolMessage:
@@ -1322,36 +1456,30 @@ class WriterExecuteBudgetMiddleware(AgentMiddleware):
         publication_write = self._targets_artifact_directory(tool_call)
         if publication_write:
             tool_name = str(tool_call.get("name") or "write_file")
-            if not self._state_has_canonical_dataset(request.state):
-                return self._tool_message(
-                    request,
-                    "writer_canonical_dataset_missing: durable artifact publication requires a schema-valid "
-                    "canonical quantitative dataset in persisted ResearchNotes.",
-                    name=tool_name,
-                )
-            baseline = self._report_baseline_text(request.state)
-            if baseline is None:
-                return self._tool_message(
-                    request,
-                    "writer_report_baseline_missing: write the complete report and Markdown-table baseline "
-                    "to /shared/output.md before durable artifact publication.",
-                    name=tool_name,
-                )
-            required_tables = self._required_publication_tables(request.state, tool_call)
-            if required_tables is None:
-                return self._tool_message(
-                    request,
-                    "writer_canonical_dataset_missing: the artifact publication target could not be resolved "
-                    "to a schema-valid canonical dataset in persisted ResearchNotes.",
-                    name=tool_name,
-                )
-            if not self._baseline_contains_tables(baseline, required_tables):
-                return self._tool_message(
-                    request,
-                    "writer_canonical_table_missing: copy the exact canonical Markdown table for this published "
-                    "dataset into /shared/output.md before durable artifact publication.",
-                    name=tool_name,
-                )
+            canonical_write, required_tables = self._required_publication_tables(request.state, tool_call)
+            if canonical_write:
+                if required_tables is None:
+                    return self._tool_message(
+                        request,
+                        "writer_canonical_dataset_missing: the artifact publication target could not be resolved "
+                        "to a schema-valid canonical dataset in persisted ResearchNotes.",
+                        name=tool_name,
+                    )
+                baseline = self._report_baseline_text(request.state)
+                if baseline is None:
+                    return self._tool_message(
+                        request,
+                        "writer_report_baseline_missing: write the complete report and Markdown-table baseline "
+                        "to /shared/output.md before canonical dataset publication.",
+                        name=tool_name,
+                    )
+                if not self._baseline_contains_tables(baseline, required_tables):
+                    return self._tool_message(
+                        request,
+                        "writer_canonical_table_missing: copy the exact canonical Markdown table for this published "
+                        "dataset into /shared/output.md before durable artifact publication.",
+                        name=tool_name,
+                    )
         if tool_call.get("name") != "execute":
             return await handler(request)
         if not self._targets_artifact_execute(tool_call):
