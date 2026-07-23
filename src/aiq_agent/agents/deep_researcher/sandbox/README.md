@@ -23,7 +23,7 @@ config YAML (sandbox.provider + providers.<name>)
         -> registry.create_sandbox_backend  --(fail-closed capability gate)-->  SandboxProvider
                                                                                      |
 DeepAgentsRuntime (deepagents_runtime.py) holds the provider and composes:           |
-   CompositeBackend(default = provider, routes = {/shared/, /skills/ -> StateBackend})
+   CompositeBackend(default = provider, routes = {/shared/ -> StateBackend, /skills/ -> FilesystemBackend})
         - workdir (default route): real sandbox FS, reached via execute. The EFFECTIVE
           workdir is per-job: <configured workdir>/<job_id> (e.g. /sandbox/<job_id>), with
           artifacts nested at <job_id>/aiq-artifacts. See "Workspace isolation" below.
@@ -191,10 +191,11 @@ is lifted into `providers.modal`.
   when the provider operation lease is immediately available; terminal handling prioritizes
   termination for a busy sandbox, while completed execute outputs remain preserved by earlier
   checkpoints.
-- The `ArtifactManager` pulls bytes via `download_files`, runs the validation pipeline
-  (path-traversal confinement -> extension allowlist -> size cap -> MIME-from-bytes/spoof
-  reject -> quota -> active-content rejection -> sha256), stores metadata in SQL and bytes
-  through the configured artifact blob provider, then emits an
+- Before downloading, the `ArtifactManager` checks path-traversal confinement, the
+  extension allowlist, and the artifact-count quota. It then pulls bytes via
+  `download_files`, applies the size cap, cumulative-byte quota, MIME-from-bytes/spoof
+  rejection, active-content rejection, and SHA-256 hashing, stores metadata in SQL and
+  bytes through the configured artifact blob provider, then emits an
   `artifact.update` event (durable metadata + `content_url`, never bytes or URL-as-text).
 - Reports reference artifacts as `![caption](artifact://<filename-or-id>)`; the report
   postprocessor rewrites filename refs to durable ids and drops unknown/foreign refs.
@@ -351,7 +352,7 @@ sequenceDiagram
             alt A candidate is accepted
                 Runtime->>Artifacts: Store metadata and bytes
                 Runtime->>Events: Persist artifact.update
-            else A candidate is rejected
+            else A classified candidate rejection emits a warning
                 Runtime->>Events: Persist artifact.warning
             end
         end
