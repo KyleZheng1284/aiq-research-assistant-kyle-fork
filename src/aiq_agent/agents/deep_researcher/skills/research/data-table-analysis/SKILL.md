@@ -24,12 +24,12 @@ To ensure the calculation is reproducible and useful, you MUST:
    `ResearchNotes.quantitative_datasets`, up to four independently useful datasets per note.
    `csv_text` is the sole canonical serialization for downstream durable publication.
 6. **Report Caveats:** Include assumptions, missing values, restatements, estimated figures, or non-comparable metrics in the output notes.
-7. **Keep Exploration Temporary:** You may render an exploratory chart under
-   `sandbox_workdir` when it materially helps analyze or validate the data. Treat it as
-   disposable working state: never return, publish, or reference it in the final report.
+7. **Recommend, Do Not Render:** When a visualization would materially improve the final
+   report, add a concise recommendation to `ResearchNotes.narrative_notes` containing the
+   canonical `dataset_id`, chart type, axes or series, and rationale. Do not render a chart.
    Never call `write_file` or `edit_file`, write under `sandbox_artifact_dir`, create
-   `manifest.json`, or emit an `artifact://` reference. The writer alone renders and
-   publishes final charts from the validated canonical dataset.
+   `manifest.json`, or emit an `artifact://` reference. The writer alone decides whether to
+   render and publish final charts from the validated canonical dataset.
 
 ## QuantitativeDataset Contract
 
