@@ -55,7 +55,7 @@ class _FakeBackend:
     def download_files(self, paths: list[str]) -> list[Any]:
         self.download_calls.append(list(paths))
         return [
-            SimpleNamespace(path=p, content=self.files.get(p), error=None if p in self.files else "not found")
+            SimpleNamespace(path=p, content=self.files.get(p), error=None if p in self.files else "file_not_found")
             for p in paths
         ]
 
@@ -441,7 +441,7 @@ class TestHarvest:
         assert manager.last_harvest_rejections() == (("revenue.csv", "canonical_dataset_digest_missing"),)
         assert store.list("job-1") == []
 
-    @pytest.mark.parametrize("failure", ["exception", "empty", "unreadable"])
+    @pytest.mark.parametrize("failure", ["exception", "empty", "unreadable", "ambiguous_not_found"])
     def test_unreadable_manifest_fails_closed_without_directory_scan(self, tmp_path: Any, failure: str) -> None:
         store = SqlArtifactStore(f"sqlite:///{tmp_path}/jobs.db")
         csv_path = f"{_ARTIFACT_DIR}/legacy.csv"
@@ -454,6 +454,8 @@ class TestHarvest:
                 raise RuntimeError("transport unavailable")
             if failure == "empty":
                 return []
+            if failure == "ambiguous_not_found":
+                return [SimpleNamespace(path=manifest_path, content=None, error="backend route not found: HTTP 404")]
             return [SimpleNamespace(path=manifest_path, content=None, error="permission denied")]
 
         original_download = manager.backend.download_files

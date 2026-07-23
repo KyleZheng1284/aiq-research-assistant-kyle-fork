@@ -1763,6 +1763,44 @@ class TestFinalMarkdownExtraction:
         assert output == report
         assert unrelated_dataset.markdown_table not in output
 
+    def test_published_digest_without_validated_dataset_fails_closed(
+        self,
+        mock_llm_provider,
+        real_tool,
+    ):
+        """A durable canonical identity cannot outlive its validated ResearchNotes dataset."""
+        note = build_quantitative_note(
+            topic="Orphaned publication",
+            dataset_prefix="orphaned_publication",
+        )
+        report = f"# Published report\n\n{note.quantitative_datasets[0].markdown_table}"
+
+        with patch(
+            "aiq_agent.agents.deep_researcher.factory.create_deep_agent",
+            return_value=MagicMock(),
+        ):
+            from aiq_agent.agents.deep_researcher.agent import DeepResearcherAgent
+
+            agent = DeepResearcherAgent(llm_provider=mock_llm_provider, tools=[real_tool])
+            artifact_manager = MagicMock()
+            artifact_manager.published_canonical_digests.return_value = frozenset({"f" * 64})
+            agent.deepagents_runtime.artifact_manager = artifact_manager
+            files = {
+                "/shared/research_note_01_orphaned.json": {
+                    "content": note.model_dump_json(exclude_none=True),
+                },
+                "/shared/output.md": {"content": report},
+            }
+
+            committed_output = agent._extract_final_markdown(
+                {"messages": [AIMessage(content="Wrote /shared/output.md")], "files": files},
+                final_report_tracker=committed_tracker(report),
+            )
+            fallback = agent._build_research_notes_fallback(files)
+
+        assert committed_output is None
+        assert fallback is None
+
     def test_quantitative_fallback_bounds_many_tables_and_reports_omissions(
         self,
         mock_llm_provider,

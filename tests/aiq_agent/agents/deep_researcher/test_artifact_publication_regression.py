@@ -65,7 +65,11 @@ class _FakeSandbox:
 
     def download_files(self, paths: list[str]) -> list[Any]:
         return [
-            SimpleNamespace(path=path, content=self.files.get(path), error=None if path in self.files else "not found")
+            SimpleNamespace(
+                path=path,
+                content=self.files.get(path),
+                error=None if path in self.files else "file_not_found",
+            )
             for path in paths
         ]
 

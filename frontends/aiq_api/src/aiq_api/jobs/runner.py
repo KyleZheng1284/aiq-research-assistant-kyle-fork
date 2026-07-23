@@ -80,6 +80,7 @@ _DEEP_RESEARCH_AGENT_KWARGS = frozenset(
         "max_research_concurrency",
         "max_concurrent_source_tool_calls",
         "max_source_tool_batch_size",
+        "max_researcher_execute_attempts",
         "max_writer_execute_attempts",
     }
 )
@@ -1411,6 +1412,7 @@ def _create_agent_instance(
             max_research_concurrency=fn_config.max_research_concurrency,
             max_concurrent_source_tool_calls=fn_config.max_concurrent_source_tool_calls,
             max_source_tool_batch_size=fn_config.max_source_tool_batch_size,
+            max_researcher_execute_attempts=fn_config.max_researcher_execute_attempts,
             max_writer_execute_attempts=fn_config.max_writer_execute_attempts,
         )
 

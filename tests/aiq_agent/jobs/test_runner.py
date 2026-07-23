@@ -2636,6 +2636,7 @@ class TestAsyncJobRunnerAgentFactory:
                 max_research_concurrency=None,
                 max_concurrent_source_tool_calls=None,
                 max_source_tool_batch_size=None,
+                max_researcher_execute_attempts=None,
                 max_writer_execute_attempts=None,
             ):
                 self.llm_provider = llm_provider
@@ -2653,6 +2654,7 @@ class TestAsyncJobRunnerAgentFactory:
                 self.max_research_concurrency = max_research_concurrency
                 self.max_concurrent_source_tool_calls = max_concurrent_source_tool_calls
                 self.max_source_tool_batch_size = max_source_tool_batch_size
+                self.max_researcher_execute_attempts = max_researcher_execute_attempts
                 self.max_writer_execute_attempts = max_writer_execute_attempts
 
         fn_config = DeepResearchAgentConfig(
@@ -2665,6 +2667,7 @@ class TestAsyncJobRunnerAgentFactory:
             max_research_concurrency=2,
             max_concurrent_source_tool_calls=3,
             max_source_tool_batch_size=4,
+            max_researcher_execute_attempts=6,
             max_writer_execute_attempts=5,
         )
 
@@ -2691,6 +2694,7 @@ class TestAsyncJobRunnerAgentFactory:
         assert agent.max_research_concurrency == 2
         assert agent.max_concurrent_source_tool_calls == 3
         assert agent.max_source_tool_batch_size == 4
+        assert agent.max_researcher_execute_attempts == 6
         assert agent.max_writer_execute_attempts == 5
 
     def test_create_agent_instance_allows_non_deep_agent_to_reuse_deep_config(self):
@@ -3085,6 +3089,7 @@ class TestAsyncJobRunnerAgentFactory:
                 max_research_concurrency=None,
                 max_concurrent_source_tool_calls=None,
                 max_source_tool_batch_size=None,
+                max_researcher_execute_attempts=None,
                 max_writer_execute_attempts=None,
             ):
                 raise TypeError("internal constructor failure")

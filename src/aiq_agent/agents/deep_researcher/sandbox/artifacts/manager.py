@@ -59,7 +59,6 @@ _CANONICAL_DIGEST_UNREGISTERED = "canonical_dataset_digest_unregistered"
 _CANONICAL_DIGEST_MISMATCH = "canonical_dataset_digest_mismatch"
 _ARTIFACT_MANIFEST_INVALID = "artifact_manifest_invalid"
 _MAX_HARVEST_REJECTIONS = 32
-_MANIFEST_NOT_FOUND_MARKERS = ("file_not_found", "not found", "no such file", "404")
 
 
 @dataclass(frozen=True)
@@ -71,9 +70,8 @@ class ArtifactHarvestCheckpoint:
 
 
 def _manifest_error_is_not_found(error: object) -> bool:
-    """Return whether a backend error confirms that the manifest is absent."""
-    normalized = str(error).strip().lower()
-    return any(marker in normalized for marker in _MANIFEST_NOT_FOUND_MARKERS)
+    """Return whether a backend returned the structured missing-file reason."""
+    return error == "file_not_found"
 
 
 # Markdown image references the agent writes as ![caption](artifact://<filename or id>).

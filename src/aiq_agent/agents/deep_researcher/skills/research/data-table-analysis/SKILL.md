@@ -47,7 +47,8 @@ the trusted digest after the structured response is accepted.
 Keep each dataset report-sized: at least one data row, no more than 5,000 rows or 128 columns,
 and no more than 64 KiB of UTF-8 CSV. A note may contain at most four datasets. Headers must be
 non-empty, unique, and free of surrounding whitespace. Use valid quoted CSV with consistent row
-widths and no blank records, BOM, NUL, DEL, or other control characters beyond tab/newlines.
+widths and no blank records, BOM, NUL, DEL, or other control characters beyond tab/newlines. The
+combined UTF-8 CSV size across every dataset in one note must not exceed 128 KiB.
 
 ## Data honesty
 

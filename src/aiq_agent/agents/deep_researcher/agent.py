@@ -236,6 +236,9 @@ class DeepResearcherAgent:
         committed = final_report_tracker.committed_text(files)
         notes = self._validated_research_notes(files)
         required_tables = self._required_quantitative_tables(notes)
+        if required_tables is None:
+            logger.warning("Published canonical dataset has no matching validated ResearchNotes dataset")
+            return None
         if committed is not None:
             report = committed.strip()
             if report and (not required_tables or self._contains_all_canonical_tables(report, required_tables)):
@@ -249,15 +252,17 @@ class DeepResearcherAgent:
         """Load schema-valid notes through the shared researcher/writer trust boundary."""
         return list(validated_research_notes_from_state({"files": files}))
 
-    def _required_quantitative_tables(self, notes: list[ResearchNotes]) -> tuple[str, ...]:
+    def _required_quantitative_tables(self, notes: list[ResearchNotes]) -> tuple[str, ...] | None:
         """Return the bounded canonical tables that the accepted report must preserve."""
         selected, _ = self._select_required_quantitative_datasets(notes)
+        if selected is None:
+            return None
         return tuple(dataset.markdown_table.strip() for _, dataset in selected)
 
     def _select_required_quantitative_datasets(
         self,
         notes: list[ResearchNotes],
-    ) -> tuple[tuple[tuple[ResearchNotes, QuantitativeDataset], ...], int]:
+    ) -> tuple[tuple[tuple[ResearchNotes, QuantitativeDataset], ...] | None, int]:
         """Select report tables by durable publication, then relevance, within hard limits.
 
         Once a canonical CSV has been durably published, its runtime-trusted digest is the
@@ -272,6 +277,9 @@ class DeepResearcherAgent:
         ]
         published_digests = self._published_canonical_digests()
         if published_digests:
+            validated_digests = {candidate[3].csv_sha256 for candidate in candidates}
+            if not published_digests.issubset(validated_digests):
+                return None, 0
             candidates = [candidate for candidate in candidates if candidate[3].csv_sha256 in published_digests]
             max_datasets = _MAX_REQUIRED_PUBLISHED_DATASETS
         else:
@@ -374,6 +382,8 @@ class DeepResearcherAgent:
             ),
         ]
         selected_datasets, omitted_table_count = self._select_required_quantitative_datasets(notes)
+        if selected_datasets is None:
+            return None
         selected_dataset_objects = {id(dataset) for _, dataset in selected_datasets}
         if selected_datasets:
             sections.append("## Canonical quantitative evidence")
