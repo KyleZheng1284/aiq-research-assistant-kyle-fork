@@ -41,39 +41,17 @@ creates these on session start (`_prepare_workspace`, an idempotent `mkdir -p`) 
 runtime injects them into prompts/skills as `sandbox_workdir`/`sandbox_artifact_dir`. This
 prevents accidental filename collisions and keeps harvesting scoped to the current job.
 
-In normal per-job mode, OpenShell lazily creates a creator-owned physical sandbox on
-the first sandbox operation. Modal attempts a fresh job-named sandbox and reattaches to
-that same job-derived name only when creation reports `AlreadyExists`. Both scope the
-active backend to the job. OpenShell first validates the configured policy against
-AI-Q's requirements and the installed SDK schema, submits it in the creation
-`SandboxSpec`, waits for `READY`, and verifies the Gateway's effective policy and loaded
-revision before constructing the execution adapter. A recoverable failure during an
-idempotent file operation can replace the physical session once; the ownership boundary
-remains the job rather than a specific physical instance.
-
-Successful OpenShell verification requires the current, active, loaded-revision, and
-effective-config versions to be positive and equal. The effective policy source,
-protobuf content, and Gateway-provided hashes must also agree with the policy AI-Q
-submitted. An optional `expected_policy_version` pins the revision checked during this
-initial verification. Zero versions may be observed while polling, but they are never
-accepted as a successful result. A revision that remains Pending beyond
-`policy_load_timeout_seconds` fails closed.
-
-Creation or verification failure closes the creator-owned SDK context, which requests
-deletion when `delete_on_exit` applies. AI-Q records whether that handled cleanup call
-returned successfully; it does not claim that an OpenShell resource can never be
-orphaned after worker process loss.
-
-OpenShell shared attachment remains available only as an explicit debug escape hatch:
-`existing_sandbox_name` plus `allow_shared_sandbox: true`. It is not a job isolation boundary
-and must not be used for mutually untrusted jobs. Production policy validation also requires
-`landlock.compatibility: hard_requirement`; a local demo may explicitly set both the policy
-and `require_hard_landlock: false` to accept `best_effort`.
+In normal per-job mode, all agents and subagents in a job share one job-scoped provider
+object and workspace; a different job constructs a different provider object. Physical
+session creation remains lazy until the first provider-backed operation. The common
+session lifecycle and each provider's distinct creation, security, and deletion
+semantics are described under [Providers](#providers).
 
 The remote execution surface exposed to the agent is
 `read_file`/`write_file`/`edit_file`/`execute`. `/shared/` and `/skills/` route to
-host-side backends rather than OpenShell. Binary artifacts are harvested host-side via
-`download_files` and referenced in reports as `artifact://<id>` (never base64).
+host-side backends rather than the provider sandbox. Binary artifacts are harvested
+host-side through the provider's `download_files` implementation and referenced in
+reports as `artifact://<id>` (never base64).
 
 ## Module map
 
@@ -239,7 +217,37 @@ shared helper, `MarkdownRenderer/artifact-url.ts`, builds the content path):
 
 ## Providers
 
+### Shared AI-Q provider lifecycle
+
+OpenShell and Modal plug into the same provider-neutral `SandboxProvider` and
+`DeepAgentsRuntime` lifecycle. AI-Q, rather than either provider SDK, owns these
+behaviors:
+
+- **Job scope and lazy creation:** the runtime constructs one logical provider per job.
+  Same-job subagents share it, and the first provider-backed operation creates its
+  physical session through a single-flight path.
+- **Call serialization and retry:** one operation lock serializes provider-backed calls.
+  `execute` is never replayed. An idempotent upload or download may replace the physical
+  session and retry once only when that provider classifies the error as recoverable.
+- **Artifact capture:** successful `execute` calls can checkpoint manifest-declared
+  artifacts. Success and ordinary failure paths run the final manifest plus
+  candidate-limited scan; cancellation runs it only when the provider operation lease is
+  immediately available.
+- **Terminal handling:** handled normal paths call idempotent `close()`; interrupted
+  paths call idempotent `terminate()` without waiting behind an active provider call.
+  Best-effort `sandbox.cleanup` events record the call outcome, not independent proof
+  that the remote resource no longer exists.
+
+The shared contract stops at the provider boundary. Physical naming, creation or
+attachment, security controls, transport, and resource deletion remain provider-specific.
+The sections below describe those differences; they do not redefine the common lifecycle.
+
 ### OpenShell (experimental)
+
+OpenShell uses the shared lifecycle above and adds fail-closed policy validation,
+control-plane verification, and Gateway-Supervisor enforcement. The sequence diagrams
+retain the common AI-Q runtime, artifact, and terminal steps to show the handoff points;
+the Gateway-Supervisor transport and policy verification are OpenShell-specific.
 
 #### Boundary model
 
@@ -321,7 +329,7 @@ write fails, AI-Q rolls back its job records on a best-effort basis even though 
 worker may already be running. API ownership checks protect job reads only when
 `REQUIRE_AUTH=true`; the sandbox is not the end-user authorization layer.
 
-#### Execution, artifacts, and teardown
+#### OpenShell transport during execution and teardown
 
 ```mermaid
 sequenceDiagram
@@ -426,20 +434,12 @@ sandbox.
 #### Lifecycle guarantees and reconciliation limits
 
 Per-job configuration requires `attest: true` and `delete_on_exit: true`. When the Dask
-worker reaches its terminal handling:
-
-- successful and ordinary failure paths perform best-effort final artifact harvesting
-  before closing the provider;
-- cancellation paths prioritize `terminate()` and skip the final scan when a sandbox
-  operation still holds the provider lease; handled timeouts follow their resulting
-  exception or cancellation path;
-- `close()` or `terminate()` exits the creator-owned SDK context and therefore requests
-  deletion; and
-- `sandbox.cleanup` started and outcome events are written best-effort to the job event
-  store and later served by the API.
-
-These events report handled cleanup calls, not independent proof that the Gateway no
-longer contains the resource. Normal SDK context exit has no AI-Q deadline.
+worker reaches the shared terminal handling described above, OpenShell implements both
+`close()` and `terminate()` by exiting the creator-owned SDK context, which requests
+deletion through the Gateway. The provider-neutral `sandbox.cleanup` events therefore
+report whether that handled context-exit call returned successfully, not independent
+proof that the Gateway no longer contains the resource. Normal SDK context exit has no
+AI-Q deadline.
 `cleanup_timeout_seconds` bounds only the wait when teardown races with context
 creation. A crash, OOM kill, or hard worker loss can bypass both the context exit and
 the cleanup event. AI-Q's ghost-job reaper marks the stale database job failed but does
@@ -486,8 +486,23 @@ in force. Once the upstream adapter provides equivalent guards, drop the shim an
 
 ### Modal (cloud)
 
-Requires `modal` + `langchain-modal` (in `pyproject`) and `modal setup`. See
-`docs/source/examples/skills-sandbox/index.md`.
+Modal uses the same job scope, lazy single-flight creation, serialized operations,
+artifact pipeline, and terminal handling described in
+[Shared AI-Q provider lifecycle](#shared-ai-q-provider-lifecycle). Its provider-specific
+behavior is:
+
+- the first provider-backed operation attempts a fresh, job-named `modal.Sandbox`;
+  `AlreadyExists` reattaches only to that same job-derived name;
+- Modal receives the configured network-blocking, CPU, memory, lifetime, and idle-timeout
+  controls when it creates the sandbox;
+- a typed Modal `NotFoundError` allows the shared base to recreate the session and retry
+  an idempotent upload or download once; and
+- the `langchain-modal` adapter and Modal SDK own physical resource teardown when the
+  shared lifecycle calls `close()` or `terminate()`.
+
+Modal does not use OpenShell policy attestation, Landlock requirements, or the
+Gateway-Supervisor transport. It requires `modal` + `langchain-modal` (in `pyproject`) and
+`modal setup`. See `docs/source/examples/skills-sandbox/index.md`.
 
 ## Artifact byte storage
 
