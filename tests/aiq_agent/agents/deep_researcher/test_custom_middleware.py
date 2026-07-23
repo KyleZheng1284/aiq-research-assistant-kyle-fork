@@ -1221,6 +1221,7 @@ class TestArtifactDirectoryOwnershipGuardMiddleware:
             ("write_file", {"file_path": "/shared/research_note.json", "content": "{}"}),
             ("edit_file", {"file_path": "/sandbox/job/analysis.py", "old_string": "x", "new_string": "y"}),
             ("execute", {"command": "python /sandbox/job/analysis.py /sandbox/job/input.csv"}),
+            ("execute", {"command": "python /sandbox/job/explore.py --output /sandbox/job/exploratory.png"}),
             ("read_file", {"file_path": "/sandbox/job/aiq-artifacts/revenue.csv"}),
         ],
     )

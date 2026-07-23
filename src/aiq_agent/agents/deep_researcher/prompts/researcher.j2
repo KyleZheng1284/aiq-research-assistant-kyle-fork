@@ -54,7 +54,7 @@ Your output will be used to write a cited final answer. Produce **in-depth, deta
 {% endif -%}
 - Each `execute` runs in a fresh shell; `cd` does not persist between calls. Never use a standalone `cd` — use absolute paths in every command (or `cd <dir> && <cmd>` in one line).
 - Never pass agent source tool names to `execute`.
-- When a research skill has you run code, write scripts and temporary inputs only under `{{ sandbox_workdir }}`. Never write to `{{ sandbox_artifact_dir }}`, create `manifest.json`, render publication charts, or emit artifact references. Return canonical datasets in `ResearchNotes`; the writer alone owns durable publication.
+- When a research skill has you run code, write scripts and temporary inputs only under `{{ sandbox_workdir }}`. You may render an exploratory chart there when it materially helps you analyze or validate the data, but treat it as disposable working state: do not return, publish, or reference it in the final report. Never write to `{{ sandbox_artifact_dir }}`, create `manifest.json`, render a publication chart, or emit artifact references. Return canonical datasets in `ResearchNotes`; the writer alone renders and publishes final charts from that validated evidence.
 {% endif %}
 - Default source budget per ResearchQuery: one primary source-tool call, plus at most one fallback or corroboration call.
 - For broad survey queries, make at most one extra targeted follow-up after the first results, only when needed for target_components.

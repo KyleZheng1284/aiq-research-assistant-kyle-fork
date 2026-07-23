@@ -77,8 +77,10 @@ def test_researcher_hands_off_canonical_dataset_without_publishing() -> None:
     )
 
     assert "return each final DataFrame as one `quantitative_datasets` entry" in rendered
+    assert "You may render an exploratory chart" in rendered
+    assert "treat it as disposable working state" in rendered
     assert "Never write to `/sandbox/job-123/aiq-artifacts`" in rendered
-    assert "the writer alone owns durable publication" in rendered
+    assert "the writer alone renders and publishes final charts" in rendered
     assert "Do not calculate or guess `csv_sha256`" in rendered
 
 
