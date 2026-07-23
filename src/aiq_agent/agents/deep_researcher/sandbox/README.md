@@ -9,9 +9,11 @@ Provider-neutral sandbox execution for agent-generated code, plus a durable arti
 runtime that harvests generated files (charts, CSVs, notebooks) so they survive the
 sandbox and can be served to the UI, embedded in reports, or downloaded via the skill CLI.
 
-Design pattern: **sandbox-as-tool**. AI-Q keeps the orchestrator, auth, tools, event
-store, and report state in-process; only generated code runs remotely. Secrets and
-data-source credentials never enter the sandbox.
+Design pattern: **sandbox-as-tool**. AI-Q keeps authentication, orchestration,
+inference, data-source tools, checkpoints, events, and report state in its API and
+worker processes; only generated code runs in the provider sandbox. AI-Q does not
+copy its host environment, inference keys, or data-source credentials into the
+sandbox creation request.
 
 ## Architecture
 
@@ -25,8 +27,10 @@ DeepAgentsRuntime (deepagents_runtime.py) holds the provider and composes:      
         - workdir (default route): real sandbox FS, reached via execute. The EFFECTIVE
           workdir is per-job: <configured workdir>/<job_id> (e.g. /sandbox/<job_id>), with
           artifacts nested at <job_id>/aiq-artifacts. See "Workspace isolation" below.
-        - /shared/, /skills/: in-process virtual FS (durable text, never the sandbox)
-   ArtifactManager (artifacts/manager.py): download_files -> validate -> ArtifactStore -> SSE
+        - /shared/: host-side StateBackend for durable job text
+        - /skills/: host-side virtual-mode FilesystemBackend for built-in skills
+   ArtifactManager (artifacts/manager.py):
+        download_files -> validate -> ArtifactStore -> job event store -> SSE/API
 ```
 
 ## Workspace organization and isolation limits
@@ -37,19 +41,28 @@ creates these on session start (`_prepare_workspace`, an idempotent `mkdir -p`) 
 runtime injects them into prompts/skills as `sandbox_workdir`/`sandbox_artifact_dir`. This
 prevents accidental filename collisions and keeps harvesting scoped to the current job.
 
-Modal and OpenShell both create a fresh physical sandbox for each job. OpenShell parses the
-configured policy with the installed SDK schema, applies it in the creation `SandboxSpec`,
-waits for `READY`, and verifies the authoritative effective policy source, protobuf content,
-OpenShell hash, and active revision before exposing the backend. A positive status version
-alone is never treated as attestation. An optional `expected_policy_version` provides an exact
-revision pin. Any creation or attestation failure closes the owning SDK context so the partially
-created sandbox is deleted.
+In normal per-job mode, OpenShell lazily creates a creator-owned physical sandbox on
+the first sandbox operation. Modal attempts a fresh job-named sandbox and reattaches to
+that same job-derived name only when creation reports `AlreadyExists`. Both scope the
+active backend to the job. OpenShell first validates the configured policy against
+AI-Q's requirements and the installed SDK schema, submits it in the creation
+`SandboxSpec`, waits for `READY`, and verifies the Gateway's effective policy and loaded
+revision before constructing the execution adapter. A recoverable failure during an
+idempotent file operation can replace the physical session once; the ownership boundary
+remains the job rather than a specific physical instance.
 
-Zero generic `current_policy_version` or `active_version` values are treated as unreported only
-when the LOADED revision plus effective config agree on the same positive version, source,
-protobuf content, and deterministic hash. Every positive reported version remains subject to
-exact agreement. An effective policy that remains Pending beyond `policy_load_timeout_seconds`
-fails with `policy_status_inconsistent`; AI-Q never treats it as successful attestation.
+Successful OpenShell verification requires the current, active, loaded-revision, and
+effective-config versions to be positive and equal. The effective policy source,
+protobuf content, and Gateway-provided hashes must also agree with the policy AI-Q
+submitted. An optional `expected_policy_version` pins the revision checked during this
+initial verification. Zero versions may be observed while polling, but they are never
+accepted as a successful result. A revision that remains Pending beyond
+`policy_load_timeout_seconds` fails closed.
+
+Creation or verification failure closes the creator-owned SDK context, which requests
+deletion when `delete_on_exit` applies. AI-Q records whether that handled cleanup call
+returned successfully; it does not claim that an OpenShell resource can never be
+orphaned after worker process loss.
 
 OpenShell shared attachment remains available only as an explicit debug escape hatch:
 `existing_sandbox_name` plus `allow_shared_sandbox: true`. It is not a job isolation boundary
@@ -57,8 +70,9 @@ and must not be used for mutually untrusted jobs. Production policy validation a
 `landlock.compatibility: hard_requirement`; a local demo may explicitly set both the policy
 and `require_hard_landlock: false` to accept `best_effort`.
 
-The agent only ever sees a `read_file`/`write_file`/`edit_file`/`execute` tool surface
-plus `/shared/` for durable text. Binary artifacts are harvested host-side via
+The remote execution surface exposed to the agent is
+`read_file`/`write_file`/`edit_file`/`execute`. `/shared/` and `/skills/` route to
+host-side backends rather than OpenShell. Binary artifacts are harvested host-side via
 `download_files` and referenced in reports as `artifact://<id>` (never base64).
 
 ## Module map
@@ -69,14 +83,14 @@ plus `/shared/` for durable text. Binary artifacts are harvested host-side via
 | `registry.py` | `register_sandbox_provider` / `create_sandbox_backend` (config-driven dispatch + capability gate). |
 | `config.py` | `SandboxConfig`: common fields + nested `providers.<name>` + `artifact_capture` + `lifecycle_scope`; legacy flat-config shim; provider validated against the registry. |
 | `capabilities.py` | `SandboxCapabilities` + `verify_capabilities` (fail-closed: refuse to run if a required guarantee like `block_network` is unsupported). |
+| `providers/openshell.py` | OpenShell provider (enterprise/on-prem). Lazy, ad-hoc deps; per-job policy creation, readiness/revision verification, and confined transfer. |
 | `providers/modal.py` | Modal provider (cloud). Create-fresh semantics (no silent attach-by-name). |
-| `providers/openshell.py` | OpenShell provider (enterprise/on-prem). Lazy, ad-hoc deps; per-job policy creation, readiness/revision attestation, and confined transfer. |
 | `artifacts/models.py` | `Artifact` record (id, mime, sha256, size, provenance, status). Metadata only. |
 | `artifacts/manifest.py` | `manifest.json` schema + parser. |
 | `artifacts/store.py` | `SqlArtifactStore` coordinates SQL metadata with the configured byte provider. |
 | `artifacts/blob_store.py` | Byte adapters for SQL BLOBs and S3-compatible object storage. |
 | `artifacts/factory.py` | Builds the application store from `AIQ_ARTIFACT_*` environment variables. |
-| `artifacts/manager.py` | Harvest pipeline: manifest-first + scan, path-traversal confinement, MIME-from-bytes, SVG sanitize, render-gate, quotas, dedup, store-then-emit, `artifact://` resolution. |
+| `artifacts/manager.py` | Harvest pipeline: manifest-first + scan, path-traversal confinement, MIME-from-bytes, active-content rejection, render-gate, quotas, dedup, store-then-emit, `artifact://` resolution. |
 
 ## Adding a provider (the whole surface)
 
@@ -140,17 +154,13 @@ sandbox:
   timeout: 1200
   idle_timeout: 1800
   resources:                   # optional CPU/memory caps; omit for no limit
-    # cpu: 2                   # cores; needs supports_resource_limits (Modal enforces; OpenShell does not)
+    # cpu: 2                   # cores; needs supports_resource_limits (OpenShell does not enforce; Modal does)
     # memory_mb: 4096          # a requested limit on a provider that can't enforce it fails closed
   artifact_capture:
     enabled: true              # requires supports_artifact_download
     max_file_bytes: 50000000
     allow_extensions: [.png, .jpg, .jpeg, .webp, .csv, .json, .md, .ipynb, .pdf]
   providers:
-    modal:
-      app_name: aiq-deep-research
-      image: python:3.12-slim
-      python_packages: [matplotlib, numpy, pandas, pillow, tabulate]
     openshell:
       gateway: null            # null = locally selected gateway
       workspace: default        # OpenShell lifecycle scope (not the in-sandbox workdir)
@@ -159,9 +169,15 @@ sandbox:
       delete_on_exit: true
       attest: true
       policy_load_timeout_seconds: 30
+      # Bounds a teardown wait that races with SDK context creation;
+      # normal SDK context exit has no AI-Q deadline.
       cleanup_timeout_seconds: 30
       # expected_policy_version: 1
       require_hard_landlock: true
+    modal:
+      app_name: aiq-deep-research
+      image: python:3.12-slim
+      python_packages: [matplotlib, numpy, pandas, pillow, tabulate]
 ```
 
 The legacy flat shape (top-level `app_name`/`image`/`python_packages`) still loads and
@@ -172,32 +188,35 @@ is lifted into `providers.modal`.
 - Generated code writes binaries + a `manifest.json` to `artifact_dir`.
 - Successful `execute` calls trigger a manifest-only checkpoint. Terminal finalization runs
   one manifest + directory scan on success or failure. On cancellation, that scan runs only
-  when the provider operation lease is immediately available; a busy sandbox is terminated
-  immediately, while completed execute outputs remain preserved by earlier checkpoints.
+  when the provider operation lease is immediately available; terminal handling prioritizes
+  termination for a busy sandbox, while completed execute outputs remain preserved by earlier
+  checkpoints.
 - The `ArtifactManager` pulls bytes via `download_files`, runs the validation pipeline
   (path-traversal confinement -> extension allowlist -> size cap -> MIME-from-bytes/spoof
-  reject -> quota -> SVG sanitize -> sha256), stores metadata in SQL and bytes through the
-  configured artifact blob provider, then emits an
+  reject -> quota -> active-content rejection -> sha256), stores metadata in SQL and bytes
+  through the configured artifact blob provider, then emits an
   `artifact.update` event (durable metadata + `content_url`, never bytes or URL-as-text).
 - Reports reference artifacts as `![caption](artifact://<filename-or-id>)`; the report
   postprocessor rewrites filename refs to durable ids and drops unknown/foreign refs.
 - Endpoints: `GET /v1/jobs/async/job/{job_id}/artifacts` and `.../artifacts/{id}/content`
   (auth-scoped via `authorize_job_access`). CLI: `python3 skills/aiq-research/scripts/aiq.py artifacts <job_id> [--download-dir DIR]`.
-- Render gate: only PNG/JPEG/WebP may render inline; SVG/notebook/PDF are download-only.
+- Render gate: only PNG/JPEG/WebP may render inline. SVG is rejected until a vetted
+  sanitizer exists; notebooks and PDFs are download-only.
 - Transfer guards (artifacts come from an untrusted sandbox): the OpenShell download
   bootstrap fails closed BEFORE reading bytes - it rejects symlink escapes (`realpath`
   differs from the lexical path: leaf or parent), directories, and files over
   `max_file_bytes` - so a hostile sandbox cannot pull an out-of-tree or oversized file
   into host memory. The harvest also count-gates before each download and bounds the
-  directory scan, and decoded bytes are base64-validated. SQL is fully parameterized
-  and the content endpoint is auth-scoped per job with `nosniff` + RFC 5987 filenames.
+  number of scan candidates it processes after enumeration, and decoded bytes are
+  base64-validated. SQL is fully parameterized and the content endpoint is auth-scoped
+  per job with `nosniff` + RFC 5987 filenames.
 
 ### Report post-processing (host-side, in `agent.run`)
 
 Run once after the report is produced, reusing a single artifact fetch:
 - `resolve_report_references` - rewrite `artifact://<filename>` to `artifact://<id>`; drop unknown/foreign refs.
 - `ensure_inline_artifacts_embedded` - append a `## Figures` section embedding any produced
-  inline image the model forgot to reference (so a generated chart always surfaces).
+  inline image the model forgot to reference (so every harvested inline chart surfaces).
 - `append_artifact_index` - append a `## Generated Artifacts` list crediting every harvested
   file (charts and their backing CSVs), alongside the external `## Sources`.
 
@@ -219,28 +238,233 @@ shared helper, `MarkdownRenderer/artifact-url.ts`, builds the content path):
 
 ## Providers
 
-### Modal (cloud)
-
-Requires `modal` + `langchain-modal` (in `pyproject`) and `modal setup`. See
-`docs/source/examples/skills-sandbox/index.md`.
-
 ### OpenShell (experimental)
 
-Each job creates a new policy-bound OpenShell sandbox and deletes it on terminal cleanup.
-AI-Q refuses startup if the YAML does not match the installed SDK schema, the policy grants a
-host or hostless/CIDR override outside the declared public network contract, production Landlock
-mode is not fail-closed, or the gateway cannot prove the submitted policy is effective. The
-creation spec deliberately has no copied host environment or credential providers.
-Owned sandboxes carry `aiq=deep-research` and a normalized `aiq-job-id` in both OpenShell
-gateway metadata and runtime template metadata so operators can use label selectors reliably.
+#### Boundary model
+
+AI-Q uses OpenShell as a job-scoped sandbox-as-tool boundary. It is important not to
+collapse four different identities into the word "user":
+
+| Boundary | Meaning in AI-Q |
+|---|---|
+| API principal | The caller identity used for job, report, and artifact authorization when `REQUIRE_AUTH=true`. When authentication is disabled, AI-Q synthesizes a principal for audit records but does not enforce job ownership on reads. |
+| Deep-research job | One asynchronous execution dispatched through Dask. The worker constructs one DeepAgents graph and one job-scoped runtime for that execution. A job is not a long-lived user session. |
+| OpenShell sandbox | In normal per-job mode, a physical execution resource owned by one job. Agents and subagents in that job share its serialized backend; a different job receives a different sandbox. |
+| Tenant | An administrative and security boundary above jobs. AI-Q does not implement tenant sandbox pools, tenant-specific Gateways, leases, or tenant quotas in this provider. A sandbox is not itself a tenant. |
+
+The API principal and the OpenShell control-plane identity are separate. AI-Q passes
+the owner user ID to the worker for per-user host-side tool resolution, but does not
+put that identity in the OpenShell `SandboxSpec`, policy, or labels. The OpenShell SDK
+connects with the Gateway identity configured for the AI-Q deployment; Gateway
+authentication therefore proves the AI-Q service/operator connection, not the
+end-user identity.
+
+#### Submission, provisioning, and policy verification
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Caller as API caller
+    participant API as AI-Q API
+    participant Dask as Job store and Dask scheduler
+    participant Access as Job access store
+    participant Worker as Dask job worker
+    participant Runtime as AI-Q job runtime
+    participant Gateway as OpenShell Gateway
+    participant Sandbox as Sandbox workload and Supervisor
+
+    Caller->>API: Submit an asynchronous deep-research job
+    API->>API: Resolve the request principal
+    API->>Dask: Create the job record and enqueue run_agent_job
+    par Scheduler may dispatch immediately
+        Dask->>Worker: Start run_agent_job
+    and Submission completion
+        Dask-->>API: Submission accepted
+        API->>Access: Persist job_access for API authorization
+    end
+    Note over API,Worker: Worker startup and job_access persistence can race
+    Worker->>Runtime: Construct the DeepAgents graph and job runtime
+    Note over Worker,Runtime: Authentication, orchestration, inference, credentials,<br/>events, checkpoints, and report state remain in AI-Q
+    Worker->>Runtime: First sandbox file or execute operation
+    Runtime->>Runtime: Validate policy YAML and SDK schema,<br/>AI-Q network bounds, process and filesystem rules,<br/>and the required Landlock mode
+    Runtime->>Gateway: Open a creator-owned SDK context with<br/>image, policy, and job labels
+    Gateway->>Sandbox: Provision the workload through the compute driver
+    Sandbox->>Gateway: Supervisor connects and authenticates as the workload
+    Gateway-->>Sandbox: Deliver desired policy and settings
+    Sandbox->>Sandbox: Drop privileges, apply Landlock and seccomp,<br/>and route egress through the policy proxy
+    Sandbox-->>Gateway: Report readiness and policy revision status
+
+    loop Until the revision loads or the policy deadline expires
+        Runtime->>Gateway: Query sandbox, policy status, and effective config
+        Gateway-->>Runtime: Return phase, source, policies, hashes, and versions
+        Runtime->>Runtime: Compare the submitted and effective policy identity
+    end
+
+    alt Verification fails or times out
+        Runtime->>Gateway: Exit the creator-owned SDK context
+        Gateway-->>Sandbox: Request deletion when delete_on_exit applies
+        Runtime-->>Worker: Fail closed and keep the backend unavailable
+    else Verification succeeds
+        Runtime->>Runtime: Construct the OpenShell adapter
+        Runtime->>Gateway: Best-effort prepare the job workspace
+        Gateway->>Sandbox: Relay the workspace operation
+        Sandbox-->>Gateway: Return the workspace result
+        Gateway-->>Runtime: Return the workspace result
+        Runtime-->>Worker: Continue through the verified backend
+    end
+```
+
+The ordering above reflects the current submit path: API authentication happens before
+submission, but the `job_access` row is written after Dask accepts the job. If that
+write fails, AI-Q rolls back its job records on a best-effort basis even though the
+worker may already be running. API ownership checks protect job reads only when
+`REQUIRE_AUTH=true`; the sandbox is not the end-user authorization layer.
+
+#### Execution, artifacts, and teardown
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Graph as DeepAgents graph and same-job subagents
+    participant Worker as Dask job worker
+    participant Runtime as AI-Q runtime and artifact manager
+    participant Gateway as OpenShell Gateway
+    participant Sandbox as Sandbox workload and Supervisor
+    participant Artifacts as Artifact store
+    participant Events as Job event store
+
+    Note over Graph,Runtime: The shared and skills routes stay in AI-Q host-side backends
+    loop Any provider-backed workspace or execute call
+        Graph->>Runtime: Sandbox read, write, edit, or execute
+        Runtime->>Gateway: Send the SDK exec or file operation
+        Gateway->>Sandbox: Relay over the authenticated Supervisor session
+        Sandbox->>Sandbox: Run under the active policy in the job workspace
+        Sandbox-->>Gateway: Return the operation response
+        Gateway-->>Runtime: Return the operation response
+
+        opt This was a successful execute and artifact capture is enabled
+            Runtime->>Gateway: Run the bounded download shim for manifest candidates
+            Gateway->>Sandbox: Relay the download operation
+            Sandbox-->>Gateway: Return candidate bytes or an error
+            Gateway-->>Runtime: Return candidate bytes or an error
+            Runtime->>Runtime: Validate confinement, extension, size,<br/>quota, MIME, content, and digest
+            alt A candidate is accepted
+                Runtime->>Artifacts: Store metadata and bytes
+                Runtime->>Events: Persist artifact.update
+            else A candidate is rejected
+                Runtime->>Events: Persist artifact.warning
+            end
+        end
+        Runtime-->>Graph: Return the tool result with any checkpoint summary
+    end
+
+    alt The worker reaches a handled terminal path
+        Worker->>Worker: Classify success, exception, or cancellation
+        opt Artifact capture is enabled
+            alt Success or ordinary failure
+                Worker->>Runtime: Run the final manifest and candidate-limited scan
+            else Cancellation while the provider is idle
+                Worker->>Runtime: Run the final scan
+            else Cancellation during an active sandbox operation
+                Worker->>Runtime: Skip the final scan and prioritize termination
+            end
+        end
+        Note over Runtime,Sandbox: Final discovery and downloads also travel through the Gateway
+        Worker->>Runtime: Finalize with close or interrupted terminate
+        Runtime->>Events: Persist best-effort sandbox.cleanup started
+        Runtime->>Gateway: Exit the owning SDK context
+        Gateway-->>Sandbox: Request deletion for a per-job context
+        Runtime->>Events: Persist best-effort sandbox.cleanup outcome
+    else The worker process is lost
+        Note over Worker,Events: Python finalizers and cleanup events are not guaranteed
+        Note over Gateway,Sandbox: The AI-Q ghost-job reaper marks the job failed only<br/>An external reconciler must delete any orphaned sandbox
+    end
+```
+
+Every sandbox execution and transfer traverses the OpenShell SDK, Gateway, and
+authenticated Gateway-Supervisor relay; AI-Q does not directly address a container or
+pod. The Gateway is OpenShell's control plane, while the Supervisor is the local
+security boundary that launches restricted child processes and applies the active
+policy. See [How OpenShell Works](https://docs.nvidia.com/openshell/about/how-it-works)
+for the OpenShell-owned portion of this sequence.
+
+#### What AI-Q policy verification proves
+
+Before constructing the `OpenShellSandbox` adapter, AI-Q:
+
+1. validates policy version, non-empty filesystem rules, non-root process identity,
+   required endpoint enforcement, production Landlock mode, and AI-Q's network upper
+   bound;
+2. parses the policy with the installed SDK protobuf schema, rejecting unknown fields;
+3. waits for the sandbox to be `READY`; and
+4. queries the Gateway for sandbox state, policy status, and effective configuration,
+   then requires the submitted policy, loaded revision, source, hashes, and all positive
+   versions to agree.
+
+This is fail-closed, point-in-time **control-plane policy verification**. The emitted
+event is named `sandbox.attestation`, but it is not hardware-backed remote attestation
+and AI-Q does not independently inspect kernel enforcement. AI-Q relies on OpenShell's
+Supervisor and policy status for enforcement. With
+`landlock.compatibility: hard_requirement`, OpenShell aborts startup if Landlock is
+unavailable or a configured path cannot be opened; AI-Q then never exposes the backend.
+OpenShell documents Landlock, seccomp, privilege dropping, and the other enforcement
+layers in its
+[Security Best Practices](https://docs.nvidia.com/openshell/latest/security/best-practices).
+
+Filesystem and process controls are static for a sandbox instance, while authorized
+OpenShell operators can update dynamic controls such as network policy over the live
+Gateway-Supervisor session. AI-Q verifies the initial snapshot and does not re-attest
+before every tool call. Consequently, `expected_policy_version` pins initial backend
+exposure; it does not prevent a later authorized OpenShell policy update.
+
+The creation template contains the image and job labels but deliberately omits copied
+host environment variables and OpenShell provider records. AI-Q inference remains
+host-side, so its inference credential is neither required by nor submitted to the
+sandbox.
+
+#### Lifecycle guarantees and reconciliation limits
+
+Per-job configuration requires `attest: true` and `delete_on_exit: true`. When the Dask
+worker reaches its terminal handling:
+
+- successful and ordinary failure paths perform best-effort final artifact harvesting
+  before closing the provider;
+- cancellation paths prioritize `terminate()` and skip the final scan when a sandbox
+  operation still holds the provider lease; handled timeouts follow their resulting
+  exception or cancellation path;
+- `close()` or `terminate()` exits the creator-owned SDK context and therefore requests
+  deletion; and
+- `sandbox.cleanup` started and outcome events are written best-effort to the job event
+  store and later served by the API.
+
+These events report handled cleanup calls, not independent proof that the Gateway no
+longer contains the resource. Normal SDK context exit has no AI-Q deadline.
+`cleanup_timeout_seconds` bounds only the wait when teardown races with context
+creation. A crash, OOM kill, or hard worker loss can bypass both the context exit and
+the cleanup event. AI-Q's ghost-job reaper marks the stale database job failed but does
+not contact OpenShell, so production operators need an external reconciler that compares
+AI-Q terminal jobs with Gateway inventory and removes orphans.
+
+Owned sandboxes carry `aiq=deep-research` and a normalized `aiq-job-id` in Gateway
+metadata and runtime template metadata. These labels aid inventory and reconciliation;
+they are not authorization or uniqueness boundaries. The normalized job ID is limited
+to 63 characters and can collide after normalization or truncation, so destructive
+operator actions must resolve the actual Gateway sandbox ID or physical name as well.
+
+This is a multi-user, job-isolated execution model only when AI-Q authentication is
+enabled; it is not a tenant control plane. A multi-tenant platform can retain the same
+agent-to-sandbox boundary while adding authenticated tenant mapping, exclusive job or
+session leases, tenant-specific Gateway/workspace selection, policy and quotas, and
+orphan reconciliation. Explicit shared-sandbox debug attachment must never be treated
+as a cross-tenant isolation boundary.
 
 Two ad-hoc deps (never in `pyproject`): the `openshell` SDK and the official
 `langchain-nvidia-openshell` adapter (`OpenShellSandbox`), the OpenShell partner package in
 [`langchain-ai/langchain-nvidia`](https://github.com/langchain-ai/langchain-nvidia/pull/303).
 They remain lazy so selecting another provider does not install or import OpenShell.
 The provider config supports per-job policy creation and an explicit shared-debug attachment;
-policy-configured shared attachment is strictly attested, while policy-free attachment emits
-`assurance=reduced`.
+policy-configured shared attachment performs the same control-plane comparison and emits
+`assurance=strict`, while policy-free attachment emits `assurance=reduced`.
 
 Use the canonical [OpenShell deployment guide](../../../../../docs/source/deployment/openshell.md)
 for installation, platform support, authenticated gateway ownership, policy/config pairing,
@@ -258,6 +482,11 @@ to delegate uploads to the official adapter and validate the upstream argv fix
 ([langchain-nvidia#303](https://github.com/langchain-ai/langchain-nvidia/pull/303)). Downloads
 always use AI-Q's bounded shim so realpath confinement and pre-transfer size checks remain
 in force. Once the upstream adapter provides equivalent guards, drop the shim and toggle.
+
+### Modal (cloud)
+
+Requires `modal` + `langchain-modal` (in `pyproject`) and `modal setup`. See
+`docs/source/examples/skills-sandbox/index.md`.
 
 ## Artifact byte storage
 
@@ -310,7 +539,8 @@ Custom endpoints use path-style bucket addressing for MinIO compatibility.
   inside the OpenShell container, rebuild the sandbox image with a higher `RUST_LOG`:
   `./scripts/openshell/setup_openshell.sh --sandbox-log-level debug` (or `--build-arg
   OPENSHELL_SANDBOX_LOG_LEVEL=debug`). Default `warn` keeps OpenShell's stock behavior.
-  Read the generated sandbox name from AI-Q's attestation/cleanup events, then use
+  When AI-Q persisted attestation/cleanup events, read the physical sandbox name there;
+  otherwise resolve it from Gateway inventory and the non-unique discovery labels. Then use
   `openshell logs <sandbox-name>`, the OpenShell TUI, or inside
   the sandbox at `/var/log/openshell.*.log` (e.g. `grep "OCSF PROC:"` for process activity).
 
@@ -320,8 +550,8 @@ Custom endpoints use path-style bucket addressing for MinIO compatibility.
 pytest tests/aiq_agent/agents/deep_researcher/sandbox/ -q
 ```
 
-Core provider/artifact tests use fake SDK objects and run without a live Modal/OpenShell
-gateway. The exact checked-policy/protobuf schema assertion is optional when the SDK is absent.
+Core provider/artifact tests use fake SDK objects and run without a live OpenShell or Modal
+backend. The exact checked-policy/protobuf schema assertion is optional when the SDK is absent.
 The opt-in gateway acceptance suite and its environment contract are documented in the
 [OpenShell deployment guide](../../../../../docs/source/deployment/openshell.md#acceptance-tests).
 
