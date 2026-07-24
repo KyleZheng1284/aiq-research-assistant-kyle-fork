@@ -124,47 +124,58 @@ mybox = "my_pkg.provider:MySandboxProvider"
 The entry-point name becomes the config `provider` key. A broken plugin is logged and
 skipped — it can never break resolution of the built-in providers.
 
-## Config (sandbox block)
+## Internal normalized `SandboxConfig`
+
+The following YAML represents the internal provider-neutral
+`sandbox.config.SandboxConfig` built by `_create_sandbox_backend` after AI-Q validates
+and maps the public `deep_research_sandbox` function config. It is an implementation
+reference, **not valid workflow YAML**; do not paste it under `functions:` or
+`deep_research_agent.sandbox` in a `configs/config_*.yml` file.
+
+For accepted public syntax, use the shipped
+[`configs/config_openshell.yml`](../../../../../configs/config_openshell.yml) profile.
+The public surface uses flat fields such as `network: allowlist`, `network_allow`,
+`openshell_image`, and `packages`. The runtime maps them to internal fields such as
+`network.mode`, `network.allow`, and `providers.<name>`; internal-only fields shown
+below, including `resources`, are not accepted by the public function schema.
 
 ```yaml
-sandbox:
-  enabled: true
-  provider: openshell          # registry key
-  workdir: /sandbox            # injected into prompts + skills
-  network:                     # normalized, provider-neutral egress policy
-    mode: allowlist            # blocked | allowlist | open  (legacy `block_network: true` => blocked)
-    allow: [api.github.com, github.com]  # policy grants must be a subset of this list
-  timeout: 1200
-  idle_timeout: 1800
-  resources:                   # optional CPU/memory caps; omit for no limit
-    # cpu: 2                   # cores; needs supports_resource_limits (OpenShell does not enforce; Modal does)
-    # memory_mb: 4096          # a requested limit on a provider that can't enforce it fails closed
-  artifact_capture:
-    enabled: true              # requires supports_artifact_download
-    max_file_bytes: 50000000
-    allow_extensions: [.png, .jpg, .jpeg, .webp, .csv, .json, .md, .ipynb, .pdf]
-  providers:
-    openshell:
-      gateway: null            # null = locally selected gateway
-      workspace: default        # OpenShell lifecycle scope (not the in-sandbox workdir)
-      image: aiq-openshell-demo:latest
-      policy: configs/openshell/generated/aiq-openshell-policy.yaml
-      delete_on_exit: true
-      attest: true
-      policy_load_timeout_seconds: 30
-      # Bounds a teardown wait that races with SDK context creation;
-      # normal SDK context exit has no AI-Q deadline.
-      cleanup_timeout_seconds: 30
-      # expected_policy_version: 1
-      require_hard_landlock: true
-    modal:
-      app_name: aiq-deep-research
-      image: python:3.12-slim
-      python_packages: [matplotlib, numpy, pandas, pillow, tabulate]
+enabled: true
+provider: openshell          # registry key
+workdir: /sandbox            # injected into prompts + skills
+network:                     # normalized, provider-neutral egress policy
+  mode: allowlist            # blocked | allowlist | open  (legacy `block_network: true` => blocked)
+  allow: [api.github.com, github.com]  # policy grants must be a subset of this list
+timeout: 1200
+idle_timeout: 1800
+resources: {}                # optional CPU/memory caps; empty requests no limits
+artifact_capture:
+  enabled: true              # requires supports_artifact_download
+  max_file_bytes: 50000000
+  allow_extensions: [.png, .jpg, .jpeg, .webp, .csv, .json, .md, .ipynb, .pdf]
+providers:
+  openshell:
+    gateway: null            # null = locally selected gateway
+    workspace: default       # OpenShell lifecycle scope (not the in-sandbox workdir)
+    image: aiq-openshell-demo:latest
+    policy: configs/openshell/generated/aiq-openshell-policy.yaml
+    delete_on_exit: true
+    attest: true
+    policy_load_timeout_seconds: 30
+    # Bounds a teardown wait that races with SDK context creation;
+    # normal SDK context exit has no AI-Q deadline.
+    cleanup_timeout_seconds: 30
+    # expected_policy_version: 1
+    require_hard_landlock: true
+  modal:
+    app_name: aiq-deep-research
+    image: python:3.12-slim
+    python_packages: [matplotlib, numpy, pandas, pillow, tabulate]
 ```
 
-The legacy flat shape (top-level `app_name`/`image`/`python_packages`) still loads and
-is lifted into `providers.modal`.
+Within this internal model, the legacy flat Modal shape (top-level
+`app_name`/`image`/`python_packages`) still loads and is lifted into
+`providers.modal`.
 
 ## Artifact runtime
 
