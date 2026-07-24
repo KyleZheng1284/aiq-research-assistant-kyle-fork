@@ -24,9 +24,10 @@ config YAML (sandbox.provider + providers.<name>)
                                                                                      |
 DeepAgentsRuntime (deepagents_runtime.py) holds the provider and composes:           |
    CompositeBackend(default = provider, routes = {/shared/ -> StateBackend, /skills/ -> FilesystemBackend})
-        - workdir (default route): real sandbox FS, reached via execute. The EFFECTIVE
-          workdir is per-job: <configured workdir>/<job_id> (e.g. /sandbox/<job_id>), with
-          artifacts nested at <job_id>/aiq-artifacts. See "Workspace isolation" below.
+        - workdir (default route): real sandbox FS, reached through the provider's
+          execute/upload primitives. The EFFECTIVE workdir is per-job:
+          <configured workdir>/<job_id> (e.g. /sandbox/<job_id>), with artifacts nested
+          at <job_id>/aiq-artifacts. See "Workspace isolation" below.
         - /shared/: host-side StateBackend for durable job text
         - /skills/: host-side virtual-mode FilesystemBackend for built-in skills
    ArtifactManager (artifacts/manager.py):
@@ -47,17 +48,20 @@ session creation remains lazy until the first provider-backed operation. The com
 session lifecycle and each provider's distinct creation, security, and deletion
 semantics are described under [Providers](#providers).
 
-The remote execution surface exposed to the agent is
-`read_file`/`write_file`/`edit_file`/`execute`. `/shared/` and `/skills/` route to
-host-side backends rather than the provider sandbox. Binary artifacts are harvested
-host-side through the provider's `download_files` implementation and referenced in
-reports as `artifact://<id>` (never base64).
+With sandbox execution enabled, the agent graph's filesystem/code tool set is `ls`,
+`glob`, `grep`, `read_file`, `write_file`, `edit_file`, and `execute`. For job-workspace
+paths on the default route, DeepAgents derives listing, search, read, write, and edit
+operations from the provider's `execute` and `upload_files` primitives; direct `execute`
+also uses the provider.
+`/shared/` and `/skills/` route path-based filesystem calls to host-side backends instead.
+Binary artifacts are harvested host-side through the provider's `download_files`
+implementation and referenced in reports as `artifact://<id>` (never base64).
 
 ## Module map
 
 | File | Purpose |
 |---|---|
-| `base.py` | `SandboxProvider` ABC. Force only `execute` + `capabilities`; the base owns lazy single-flight creation, a serialization lock, idempotency-gated retry, `close()`, `terminate()`. |
+| `base.py` | `SandboxProvider` ABC. Provider subclasses supply session creation and capabilities; the base delegates `execute`/`upload_files`/`download_files` and owns lazy single-flight creation, serialization, idempotency-gated retry, `close()`, and `terminate()`. |
 | `registry.py` | `register_sandbox_provider` / `create_sandbox_backend` (config-driven dispatch + capability gate). |
 | `config.py` | `SandboxConfig`: common fields + nested `providers.<name>` + `artifact_capture` + `lifecycle_scope`; legacy flat-config shim; provider validated against the registry. |
 | `capabilities.py` | `SandboxCapabilities` + `verify_capabilities` (fail-closed: refuse to run if a required guarantee like `block_network` is unsupported). |
@@ -100,9 +104,10 @@ register_sandbox_provider("mybox", MySandboxProvider)
 ```
 
 Add a `MyProviderConfig` sub-model to `SandboxProvidersConfig` in `config.py`. You do
-NOT implement `read_file`/`write_file`/`ls`/`glob` (inherited from `BaseSandbox` on top
-of `execute`) or the retry/lock/lifecycle (the base owns those). Every provider must
-pass the compliance suite (`tests/.../sandbox/test_provider_compliance.py`).
+NOT implement `ls`/`glob`/`grep`/`read_file`/`write_file`/`edit_file` (inherited from
+`BaseSandbox` on top of the session's execute/upload primitives) or the
+retry/lock/lifecycle (the base owns those). Every provider must pass the compliance
+suite (`tests/.../sandbox/test_provider_compliance.py`).
 
 ### Out-of-tree providers (entry points)
 
@@ -343,8 +348,8 @@ sequenceDiagram
     participant Events as Job event store
 
     Note over Graph,Runtime: The shared and skills routes stay in AI-Q host-side backends
-    loop Any provider-backed workspace or execute call
-        Graph->>Runtime: Sandbox read, write, edit, or execute
+    loop Any provider-backed filesystem or execute call
+        Graph->>Runtime: Sandbox list, search, read, write, edit, or execute
         Runtime->>Gateway: Send the SDK exec or file operation
         Gateway->>Sandbox: Relay over the authenticated Supervisor session
         Sandbox->>Sandbox: Run under the active policy in the job workspace
