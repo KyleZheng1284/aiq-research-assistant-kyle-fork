@@ -111,7 +111,7 @@ def _secret_value(value: Any) -> str | None:
 
 
 def _settings(config: dict[str, Any]) -> _Settings:
-    base_url = str(config.get("base_url") or "http://127.0.0.1:17670").strip().rstrip("/")
+    base_url = str(config.get("base_url") or "http://127.0.0.1:7670").strip().rstrip("/")
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("nrl_base_url must be an absolute HTTP(S) URL")

@@ -22,7 +22,7 @@ Usage:
     python tests/knowledge_layer_tests/run_adapter_compliance.py --backend azure_ai_search --quick \
       --config '{"endpoint":"https://example.search.windows.net","start_ttl_cleanup":false}'
     python tests/knowledge_layer_tests/run_adapter_compliance.py --backend nemo_retriever --quick \
-      --config '{"base_url":"http://127.0.0.1:17670","scope":"workspace-123"}'
+      --config '{"base_url":"http://127.0.0.1:7670","scope":"workspace-123"}'
 
     # Full mode - complete ingestion + retrieval test
     python tests/knowledge_layer_tests/run_adapter_compliance.py --backend llamaindex
@@ -36,7 +36,7 @@ Usage:
       --config '{"start_ttl_cleanup":false}'
 
     python tests/knowledge_layer_tests/run_adapter_compliance.py --backend nemo_retriever \
-      --config '{"base_url":"http://127.0.0.1:17670","api_token":"...",\
+      --config '{"base_url":"http://127.0.0.1:7670","api_token":"...",\
                  "scope":"workspace-123"}'
 
     # For managed identity, omit AZURE_SEARCH_API_KEY. Set AZURE_CLIENT_ID for a

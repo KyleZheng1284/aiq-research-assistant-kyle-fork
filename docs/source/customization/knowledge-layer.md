@@ -132,7 +132,7 @@ functions:
     # opensearch_ingestion_mode: local        # local, dask, or auto
     # embed_model: nvidia/llama-nemotron-embed-vl-1b-v2
 
-    # nrl_base_url: http://127.0.0.1:17670    # nemo_retriever only
+    # nrl_base_url: http://127.0.0.1:7670    # nemo_retriever only
     # nrl_api_token: ${NRL_API_TOKEN:-}
     # nrl_scope: ${NRL_SCOPE}                 # required
     # nrl_verify_ssl: true
@@ -258,7 +258,7 @@ functions:
     collection_name: ${COLLECTION_NAME:-aiq-nrl}
     top_k: 5
     generate_summary: false
-    nrl_base_url: ${NRL_BASE_URL:-http://127.0.0.1:17670}
+    nrl_base_url: ${NRL_BASE_URL:-http://127.0.0.1:7670}
     nrl_api_token: ${NRL_API_TOKEN:-}
     nrl_scope: ${NRL_SCOPE}
     nrl_verify_ssl: ${NRL_VERIFY_SSL:-true}
