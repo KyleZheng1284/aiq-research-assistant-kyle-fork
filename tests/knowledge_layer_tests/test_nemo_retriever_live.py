@@ -38,7 +38,7 @@ def _config(*, scope: str | None = None, token: str | None = None) -> dict:
     if not selected_scope:
         pytest.fail("NRL_SCOPE is required for the live NeMo Retriever test")
     return {
-        "base_url": os.environ.get("NRL_BASE_URL", "http://127.0.0.1:17670"),
+        "base_url": os.environ.get("NRL_BASE_URL", "http://127.0.0.1:7670"),
         "api_token": token if token is not None else os.environ.get("NRL_API_TOKEN"),
         "scope": selected_scope,
         "connect_timeout_s": float(os.environ.get("NRL_CONNECT_TIMEOUT_S", "30")),

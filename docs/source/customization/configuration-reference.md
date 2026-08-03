@@ -347,7 +347,7 @@ functions:
     collection_name: ${COLLECTION_NAME:-aiq-nrl}
     top_k: 5
     generate_summary: false
-    nrl_base_url: ${NRL_BASE_URL:-http://127.0.0.1:17670}
+    nrl_base_url: ${NRL_BASE_URL:-http://127.0.0.1:7670}
     nrl_api_token: ${NRL_API_TOKEN:-}
     nrl_scope: ${NRL_SCOPE}
     nrl_verify_ssl: ${NRL_VERIFY_SSL:-true}
@@ -386,7 +386,7 @@ functions:
 | `opensearch_dask_file_transfer` | `str` | `bytes` | Send uploads to Dask workers as `bytes` or shared filesystem `paths`. |
 | `embed_model` | `str` | `nvidia/nemotron-3-embed-1b` | Embedding model for OpenSearch and Azure AI Search ingestion and retrieval. |
 | `embed_base_url` | `str` | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible embeddings endpoint for OpenSearch and Azure AI Search. |
-| `nrl_base_url` | `str` | `http://127.0.0.1:17670` | Public NeMo Retriever gateway URL. |
+| `nrl_base_url` | `str` | `http://127.0.0.1:7670` | Public NeMo Retriever gateway URL. |
 | `nrl_api_token` | `SecretStr` | `NRL_API_TOKEN` or `None` | Optional bearer token. |
 | `nrl_scope` | `str` | **required** | Workspace scope sent as `X-NRL-Scope` on every request. |
 | `nrl_connect_timeout_s` | `float` | `30` | Gateway connection timeout in seconds. |

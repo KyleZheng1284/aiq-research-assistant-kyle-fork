@@ -33,14 +33,14 @@ Start from [`configs/config_web_nemo_retriever.yml`](../../../../configs/config_
 The required deployment setting is an explicit workspace scope:
 
 ```bash
-export NRL_BASE_URL=http://127.0.0.1:17670
+export NRL_BASE_URL=http://127.0.0.1:7670
 export NRL_SCOPE=workspace-123
 export NRL_API_TOKEN='replace-with-a-secret'  # omit only for an auth-disabled dev deployment
 ```
 
 | YAML field | Environment variable | Default | Purpose |
 |---|---|---:|---|
-| `nrl_base_url` | `NRL_BASE_URL` | `http://127.0.0.1:17670` | Public NRL gateway, not a worker or VectorDB pod |
+| `nrl_base_url` | `NRL_BASE_URL` | `http://127.0.0.1:7670` | Public NRL gateway, not a worker or VectorDB pod |
 | `nrl_api_token` | `NRL_API_TOKEN` | unset | Optional bearer token stored as a secret |
 | `nrl_scope` | `NRL_SCOPE` | required | Logical workspace scope sent on every request |
 | `nrl_connect_timeout_s` | `NRL_CONNECT_TIMEOUT_S` | `30` | TCP/TLS connection timeout |
@@ -77,16 +77,16 @@ Container-name prefixes can differ when the Compose project name is
 overridden. For local Docker, publish the NRL gateway and use its host port:
 
 ```bash
-curl -fsS http://127.0.0.1:17670/v1/health
-export NRL_BASE_URL=http://127.0.0.1:17670
+curl -fsS http://127.0.0.1:7670/v1/health
+export NRL_BASE_URL=http://127.0.0.1:7670
 ```
 
 For an NRL deployment on a remote development host, create a tunnel from the
 AIQ workstation:
 
 ```bash
-ssh -N -L 17670:127.0.0.1:17670 user@nrl-host
-export NRL_BASE_URL=http://127.0.0.1:17670
+ssh -N -L 7670:127.0.0.1:7670 user@nrl-host
+export NRL_BASE_URL=http://127.0.0.1:7670
 ```
 
 For Kubernetes, route AIQ to the NRL gateway Service or an enterprise ingress.
@@ -126,7 +126,7 @@ Run the contract tests without a service:
 uv run pytest tests/knowledge_layer_tests/test_nemo_retriever_adapter.py
 uv run python tests/knowledge_layer_tests/run_adapter_compliance.py \
   --backend nemo_retriever --quick \
-  --config '{"base_url":"http://127.0.0.1:17670","scope":"workspace-123"}'
+  --config '{"base_url":"http://127.0.0.1:7670","scope":"workspace-123"}'
 ```
 
 Run TXT, HTML, PDF, lifecycle, scope-isolation, durability, and latency checks

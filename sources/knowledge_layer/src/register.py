@@ -283,7 +283,7 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
     )
     # NeMo Retriever service options
     nrl_base_url: str = Field(
-        default_factory=lambda: _env_value("NRL_BASE_URL", default="http://127.0.0.1:17670"),
+        default_factory=lambda: _env_value("NRL_BASE_URL", default="http://127.0.0.1:7670"),
         description="Public NeMo Retriever gateway URL (nemo_retriever only).",
     )
     nrl_api_token: OptionalSecretStr = Field(
