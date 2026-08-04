@@ -118,6 +118,10 @@ and manifest identifiers, preventing duplicate processing after a lost
 response. `attempt_id` is retained only in diagnostic job/file metadata;
 `document_id` remains the stable AIQ file identity.
 
+Query results preserve the order returned by NeMo Retriever and expose its native
+vector distance as `Chunk.distance`. Lower values are closer; AIQ does not
+normalize or re-rank these backend-specific values.
+
 ## Validation
 
 Run the contract tests without a service:

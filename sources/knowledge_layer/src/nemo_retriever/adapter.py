@@ -418,11 +418,10 @@ class NemoRetrieverRetriever(BaseRetriever):
         image_url = _http_url(image_storage_uri)
         if image_url is None and content_type == ContentType.IMAGE:
             image_url = _http_url(hit.source)
-        score = min(max(float(hit.score), 0.0), 1.0)
         return Chunk(
             chunk_id=hit.chunk_id,
             content=hit.text or "",
-            score=score,
+            distance=hit.distance,
             file_name=hit.filename,
             page_number=page_number,
             display_citation=citation,

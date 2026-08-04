@@ -140,7 +140,7 @@ class QueryHitWire(_WireModel):
     chunk_id: str
     document_id: str
     text: str
-    score: float
+    distance: float = Field(allow_inf_nan=False)
     filename: str
     page_number: int | None = None
     content_type: str | None = None
