@@ -14,18 +14,21 @@ from typing import Any
 import httpx
 import pytest
 from knowledge_layer.nemo_retriever._transport import NemoRetrieverCompatibilityError
+from knowledge_layer.nemo_retriever._transport import NemoRetrieverError
 from knowledge_layer.nemo_retriever._transport import NemoRetrieverHTTPError
 from knowledge_layer.nemo_retriever._transport import NemoRetrieverTransportError
 from knowledge_layer.nemo_retriever._transport import _NRLTransport
 from knowledge_layer.nemo_retriever.adapter import NemoRetrieverIngestor
 from knowledge_layer.nemo_retriever.adapter import NemoRetrieverRetriever
 from knowledge_layer.register import KnowledgeRetrievalConfig
+from knowledge_layer.register import _format_results
 from knowledge_layer.register import _setup_backend
 from pydantic import SecretStr
 from pydantic import ValidationError
 
 from aiq_agent.knowledge import BaseIngestor
 from aiq_agent.knowledge import BaseRetriever
+from aiq_agent.knowledge import Chunk
 from aiq_agent.knowledge import ContentType
 from aiq_agent.knowledge import JobState
 from aiq_agent.knowledge.factory import is_ingestor_registered
@@ -383,7 +386,7 @@ def test_query_mapping_citations_content_types_and_image_safety():
             "chunk_id": "text-1",
             "document_id": "doc-1",
             "text": "Text body",
-            "score": 0.9,
+            "distance": 0.1,
             "filename": "report.pdf",
             "page_number": 2,
             "content_type": "text",
@@ -396,7 +399,7 @@ def test_query_mapping_citations_content_types_and_image_safety():
             "chunk_id": "table-1",
             "document_id": "doc-1",
             "text": "Table caption",
-            "score": 0.8,
+            "distance": 0.2,
             "filename": "report.pdf",
             "page_number": 3,
             "content_type": "structured_table",
@@ -406,7 +409,7 @@ def test_query_mapping_citations_content_types_and_image_safety():
             "chunk_id": "chart-1",
             "document_id": "doc-1",
             "text": "Chart caption",
-            "score": 0.7,
+            "distance": 0.3,
             "filename": "report.pdf",
             "page_number": 4,
             "content_type": "bar_chart",
@@ -416,7 +419,7 @@ def test_query_mapping_citations_content_types_and_image_safety():
             "chunk_id": "image-1",
             "document_id": "doc-1",
             "text": "Image caption",
-            "score": 0.6,
+            "distance": 0.4,
             "filename": "report.pdf",
             "page_number": 5,
             "content_type": "image",
@@ -427,7 +430,7 @@ def test_query_mapping_citations_content_types_and_image_safety():
             "chunk_id": "image-2",
             "document_id": "doc-1",
             "text": "Public image",
-            "score": 0.5,
+            "distance": 0.5,
             "filename": "report.pdf",
             "page_number": None,
             "content_type": "figure",
@@ -438,7 +441,7 @@ def test_query_mapping_citations_content_types_and_image_safety():
             "chunk_id": "unknown-1",
             "document_id": "doc-1",
             "text": "Unknown type",
-            "score": 0.4,
+            "distance": 0.6,
             "filename": "notes.txt",
             "page_number": None,
             "content_type": "novel-modality",
@@ -450,6 +453,16 @@ def test_query_mapping_citations_content_types_and_image_safety():
     result = asyncio.run(retriever.retrieve("findings", "test", top_k=6))
 
     assert result.success
+    assert [chunk.chunk_id for chunk in result.chunks] == [
+        "text-1",
+        "table-1",
+        "chart-1",
+        "image-1",
+        "image-2",
+        "unknown-1",
+    ]
+    assert [chunk.distance for chunk in result.chunks] == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    assert all(chunk.score == 0.0 for chunk in result.chunks)
     assert [chunk.content_type for chunk in result.chunks] == [
         ContentType.TEXT,
         ContentType.TABLE,
@@ -467,8 +480,35 @@ def test_query_mapping_citations_content_types_and_image_safety():
     assert result.chunks[3].image_url is None
     assert "lancedb_uri" not in result.chunks[3].metadata
     assert result.chunks[4].image_url == "https://images.example.test/signed.png"
-    assert all(0 <= chunk.score <= 1 for chunk in result.chunks)
     assert result.chunks[5].metadata["source"] == {"label": "logical source"}
+    formatted = _format_results(result, "findings")
+    assert "Vector Distance: 0.1 (lower is closer)" in formatted
+    assert "Relevance Score:" not in formatted
+
+
+@pytest.mark.parametrize("distance", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_query_distances_are_rejected(distance):
+    with pytest.raises(ValidationError):
+        Chunk(
+            chunk_id="chunk-1",
+            content="body",
+            distance=distance,
+            file_name="report.pdf",
+            display_citation="report.pdf",
+            content_type=ContentType.TEXT,
+        )
+
+    retriever = NemoRetrieverRetriever(_adapter_config(FakeNRL()))
+    with pytest.raises(NemoRetrieverError, match="public API contract"):
+        retriever.normalize(
+            {
+                "chunk_id": "chunk-1",
+                "document_id": "doc-1",
+                "text": "body",
+                "distance": distance,
+                "filename": "report.pdf",
+            }
+        )
 
 
 def test_filters_empty_results_and_malformed_response():

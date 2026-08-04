@@ -579,7 +579,10 @@ def _format_results(retrieval_result, query: str) -> str:
             lines.append(f"Page: {chunk.page_number}")
         lines.append(f"Citation: {citation}")
         lines.append(f"Content Type: {chunk.content_type.value}")
-        lines.append(f"Relevance Score: {chunk.score:.2f}")
+        if chunk.distance is not None:
+            lines.append(f"Vector Distance: {chunk.distance:.4g} (lower is closer)")
+        else:
+            lines.append(f"Relevance Score: {chunk.score:.2f}")
         lines.append("")
 
         # Content (truncate if very long)
