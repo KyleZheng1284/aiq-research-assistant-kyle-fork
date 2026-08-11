@@ -121,6 +121,13 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
     verify_ssl: bool = Field(
         default=True, description="Verify SSL certificates (foundational_rag only). Set false for self-signed certs."
     )
+    start_ttl_cleanup: bool = Field(
+        default=True,
+        description=(
+            "Start automatic collection TTL cleanup (foundational_rag only). Disable when using a shared or "
+            "pre-built index whose lifecycle is managed externally."
+        ),
+    )
     # OpenSearch-specific options
     opensearch_url: str = Field(
         default_factory=lambda: _env_value("OPENSEARCH_URL", default="http://localhost:9200"),
@@ -375,6 +382,7 @@ def _setup_backend(config: KnowledgeRetrievalConfig, summary_llm_obj=None) -> tu
             "ingest_url": config.ingest_url,
             "timeout": config.timeout,
             "verify_ssl": config.verify_ssl,
+            "start_ttl_cleanup": config.start_ttl_cleanup,
             **summary_config,
         }
 

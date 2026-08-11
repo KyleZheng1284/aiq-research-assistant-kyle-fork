@@ -626,6 +626,7 @@ class FoundationalRagIngestor(TTLCleanupMixin, BaseIngestor):
                 - timeout: Request timeout in seconds
                 - chunk_size: Default chunk size for ingestion
                 - chunk_overlap: Default chunk overlap
+                - start_ttl_cleanup: Whether to start automatic collection cleanup (default: True)
         """
         super().__init__(config)
         # Support both rag_url (legacy) and ingest_url (explicit)
@@ -654,8 +655,8 @@ class FoundationalRagIngestor(TTLCleanupMixin, BaseIngestor):
         self._jobs: dict[str, IngestionJobStatus] = {}
         self._lock = threading.RLock()
 
-        # Start background TTL cleanup task
-        self._start_ttl_cleanup_task(COLLECTION_TTL_HOURS, TTL_CLEANUP_INTERVAL_SECONDS)
+        if self.config.get("start_ttl_cleanup", True):
+            self._start_ttl_cleanup_task(COLLECTION_TTL_HOURS, TTL_CLEANUP_INTERVAL_SECONDS)
 
         llm_info = "configured" if self.summary_llm else "not configured"
         logger.info(

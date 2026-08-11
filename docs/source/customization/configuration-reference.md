@@ -302,6 +302,8 @@ functions:
     rag_url: ${RAG_SERVER_URL:-http://localhost:8081/v1}
     ingest_url: ${RAG_INGEST_URL:-http://localhost:8082/v1}
     timeout: 300
+    # Set false when collection lifecycle is managed externally, such as a shared evaluation index
+    start_ttl_cleanup: true
     # verify_ssl: false # Only set to false for self-signed certs
 ```
 
@@ -348,6 +350,7 @@ functions:
 | `ingest_url` | `str` | `http://localhost:8082/v1` | RAG ingestion server URL. Foundational RAG backend only. |
 | `timeout` | `int` | `120` | Request timeout in seconds. Foundational RAG backend only. |
 | `verify_ssl` | `bool` | `true` | Verify SSL certificates. Set `false` for self-signed certs. Foundational RAG backend only. |
+| `start_ttl_cleanup` | `bool` | `true` | Start client-side collection TTL cleanup. Set `false` for shared or pre-built Foundational RAG indexes whose lifecycle is managed externally. Foundational RAG backend only. |
 | `azure_search_endpoint` | `URL` | `AZURE_SEARCH_ENDPOINT` | Azure AI Search service endpoint. Required for Azure AI Search. |
 | `azure_search_api_key` | `SecretStr` | `AZURE_SEARCH_API_KEY` | Optional admin API key. |
 | `azure_search_index_prefix` | `str` | `AIQ_AZURE_SEARCH_INDEX_PREFIX` or `aiq` | Deployment-unique namespace for the shared AI-Q index. |
