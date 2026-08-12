@@ -438,6 +438,9 @@ class NemoRetrieverIngestor(BaseIngestor):
         self._file_sizes: dict[str, int] = {}
         self._job_collections: dict[str, str] = {}
         self._upload_batches: dict[str, _UploadBatchState] = {}
+        # Needed because we want the summary to show the filename, but we work with document_ids
+        # TODO: Need to warm start this in case the instance is restarted
+        self._document_id_to_filename: dict[str, str] = {}
         self._summarized: dict[str, set[str]] = {}
         self._collection_expirations: dict[str, datetime] = {}
         self._submission_condition = threading.Condition(self._tracking_lock)
@@ -895,8 +898,8 @@ class NemoRetrieverIngestor(BaseIngestor):
             params={"if_exists": "true"},
         )
         result = _wire(DocumentDeleteWire, payload, "delete document")
-        unregister_summary(collection_name, file_id)
-        self._summarized[collection_name].discard(file_id)
+        unregister_summary(collection_name, self._document_id_to_filename.get(file_id, file_id))
+        self._summarized.get(collection_name, set()).discard(file_id)
         return result.deleted or not result.existed or result.cleanup_pending
 
     def list_files(self, collection_name: str) -> list[FileInfo]:
@@ -970,11 +973,15 @@ class NemoRetrieverIngestor(BaseIngestor):
 
     def _register_summary(self, collection_name: str, document: JobDocumentWire) -> None:
         """Register a summary for a document if it has been successfully ingested."""
+        if not self._summarized.get(collection_name):
+            self._summarized[collection_name] = set()
         if (
             _status_to_file_status(document.status) == FileStatus.SUCCESS
             and document.document_id not in self._summarized[collection_name]
         ):
             logger.info(f"registering summary for {document.filename or document.document_id}")
             # TODO: Get the summary for the document
-            register_summary(collection_name, document.filename or document.document_id, "No Summary Available")
+            filename = document.filename or document.document_id
+            self._document_id_to_filename[document.document_id] = filename
+            register_summary(collection_name, filename, "No Summary Available")
             self._summarized[collection_name].add(document.document_id)
