@@ -122,6 +122,19 @@ Query results preserve the order returned by NeMo Retriever and expose its nativ
 vector distance as `Chunk.distance`. Lower values are closer; AIQ does not
 normalize or re-rank these backend-specific values.
 
+## Summary reconciliation
+
+Document summaries live in AIQ's summary store, but NeMo Retriever owns document
+lifetime, including server-side collection expiration. Collections therefore
+disappear without AIQ observing a delete. On startup the ingestor reconciles the
+two on a background thread: documents NRL serves gain a summary row, rows NRL no
+longer backs are removed, and a collection's summaries are cleared once NRL
+positively reports the collection as absent.
+
+Reconciliation never blocks or fails startup, and a transport failure leaves the
+store untouched rather than deleting summaries NRL could not confirm. The same
+pass warms the document-ID-to-filename mapping that document deletes rely on.
+
 ## Validation
 
 Run the contract tests without a service:

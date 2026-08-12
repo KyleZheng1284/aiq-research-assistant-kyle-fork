@@ -314,6 +314,18 @@ class SummaryStore:
             # Fallback to sync
             return self.get_all(collection)
 
+    def list_collections(self) -> list[str]:
+        """Get every collection that currently holds summaries (sync)."""
+        from sqlalchemy import text
+
+        try:
+            with self._sync_engine.connect() as conn:
+                result = conn.execute(text("SELECT DISTINCT collection FROM summaries"))
+                return [row[0] for row in result]
+        except Exception as e:
+            logger.warning("Failed to list summary collections (%s)", type(e).__name__)
+            return []
+
     def unregister(self, collection: str, filename: str) -> None:
         """Remove a document's summary (sync)."""
         from sqlalchemy import text
