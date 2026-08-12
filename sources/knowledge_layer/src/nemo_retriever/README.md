@@ -334,7 +334,22 @@ positively reports the collection as absent.
 
 Reconciliation never blocks or fails startup, and a transport failure leaves the
 store untouched rather than deleting summaries NRL could not confirm. The same
-pass warms the document-ID-to-filename mapping that document deletes rely on.
+pass warms the document-ID-to-filename mapping that document deletes rely on,
+and adopts the expirations NRL reports so cleanup also covers collections this
+process did not create.
+
+## Collection expiration
+
+`nrl_collection_ttl_hours` is sent as an absolute expiration when AIQ creates a
+collection, and NRL deletes the collection itself once that expiration passes.
+A background thread retires only what AIQ keeps alongside it — the collection's
+summaries and the adapter's cached document state — so agents stop being offered
+documents that can no longer be retrieved. It runs every
+`AIQ_TTL_CLEANUP_INTERVAL_SECONDS` (3600 by default), the shared knowledge-layer
+setting; unlike the other backends, expiration comes from NRL rather than from
+how long a collection sat idle. The deadline used is the one NRL last reported,
+recorded when AIQ creates or updates a collection and refreshed by startup
+reconciliation.
 
 ### Service validation
 

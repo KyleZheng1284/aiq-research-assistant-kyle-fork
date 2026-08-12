@@ -348,6 +348,13 @@ writes. A 404/410 from version-probing job creation or immediate upload means
 the service contract is incompatible; a later polling 404/410 means the job is
 missing or expired.
 
+`nrl_collection_ttl_hours` is sent as an absolute expiration when AI-Q creates a
+collection, and NRL deletes the expired collection itself. TTL cleanup clears the
+document summaries and cached state AI-Q holds for it, so agents stop being
+offered documents NRL no longer serves. Expiration comes from NRL rather than
+from how long a collection sat idle: the deadline used is the one NRL last
+reported for the collection.
+
 The tested service baseline is the immutable NeMo Retriever integration head
 [`f3a0b418b7250fa8823ec44dea569b07e2b008cb`](https://github.com/NVIDIA/NeMo-Retriever/commit/f3a0b418b7250fa8823ec44dea569b07e2b008cb),
 which contains the collection-management fixes and TXT/HTML service-mode tokenizer support. See the
@@ -605,6 +612,10 @@ COLLECTION_TTL_HOURS = 24
 TTL_CLEANUP_INTERVAL_SECONDS = 3600
 ```
 
+NeMo Retriever runs the same hourly thread, but that service owns collection lifetime: it deletes collections on the
+absolute deadline it was given at creation (`nrl_collection_ttl_hours`), and the thread only expires the summaries and
+cached state AI-Q keeps for them rather than deleting anything itself.
+
 ---
 
 ## Architecture
@@ -699,7 +710,7 @@ Configuration values are resolved in the following order (highest to lowest prio
 | `KNOWLEDGE_INGESTOR_BACKEND` | All | Default ingestor backend (fallback if not in YAML) |
 | `AIQ_CHROMA_DIR` | llamaindex | ChromaDB persistence path |
 | `AIQ_COLLECTION_TTL_HOURS` | all local/managed backends | Hours before stale collections are deleted (default: 24) |
-| `AIQ_TTL_CLEANUP_INTERVAL_SECONDS` | all local/managed backends | Collection cleanup interval (default: 3600) |
+| `AIQ_TTL_CLEANUP_INTERVAL_SECONDS` | All | Collection cleanup interval (default: 3600) |
 | `RAG_SERVER_URL` | foundational_rag | Query server URL (port 8081) |
 | `RAG_INGEST_URL` | foundational_rag | Ingestion server URL (port 8082) |
 | `OPENSEARCH_URL` | opensearch | OpenSearch endpoint URL |
