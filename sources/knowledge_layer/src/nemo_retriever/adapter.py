@@ -30,8 +30,11 @@ from aiq_agent.knowledge import FileProgress
 from aiq_agent.knowledge import IngestionJobStatus
 from aiq_agent.knowledge import JobState
 from aiq_agent.knowledge import RetrievalResult
+from aiq_agent.knowledge import clear_collection_summaries
 from aiq_agent.knowledge import register_ingestor
 from aiq_agent.knowledge import register_retriever
+from aiq_agent.knowledge import register_summary
+from aiq_agent.knowledge import unregister_summary
 from aiq_agent.knowledge.schema import CollectionInfo
 from aiq_agent.knowledge.schema import FileInfo
 from aiq_agent.knowledge.schema import FileStatus
@@ -454,7 +457,8 @@ class NemoRetrieverIngestor(BaseIngestor):
         self._file_jobs: dict[str, str] = {}
         self._file_sizes: dict[str, int] = {}
         self._job_collections: dict[str, str] = {}
-        self._summarized: set[str] = set()
+        self._summarized: dict[str, set[str]] = {}
+        self._collection_expirations: dict[str, datetime] = {}
 
     @property
     def backend_name(self) -> str:
@@ -478,6 +482,7 @@ class NemoRetrieverIngestor(BaseIngestor):
                 "expires_at": expires_at.isoformat(),
             },
         )
+        self._collection_expirations[name] = expires_at
         return _collection_info(_wire(CollectionWire, payload, "create collection"))
 
     def update_collection(
@@ -511,6 +516,9 @@ class NemoRetrieverIngestor(BaseIngestor):
             params={"if_exists": "true"},
         )
         result = _wire(CollectionDeleteWire, payload, "delete collection")
+        clear_collection_summaries(name)
+        self._collection_expirations.pop(name, None)
+        self._summarized.pop(name, None)
         return result.deleted or not result.existed or result.cleanup_pending
 
     def list_collections(self) -> list[CollectionInfo]:
@@ -736,6 +744,8 @@ class NemoRetrieverIngestor(BaseIngestor):
             params={"if_exists": "true"},
         )
         result = _wire(DocumentDeleteWire, payload, "delete document")
+        unregister_summary(collection_name, file_id)
+        self._summarized[collection_name].discard(file_id)
         return result.deleted or not result.existed or result.cleanup_pending
 
     def list_files(self, collection_name: str) -> list[FileInfo]:
@@ -809,13 +819,11 @@ class NemoRetrieverIngestor(BaseIngestor):
 
     def _register_summary(self, collection_name: str, document: JobDocumentWire) -> None:
         """Register a summary for a document if it has been successfully ingested."""
-        from aiq_agent.knowledge import register_summary
-
         if (
             _status_to_file_status(document.status) == FileStatus.SUCCESS
-            and document.document_id not in self._summarized
+            and document.document_id not in self._summarized[collection_name]
         ):
             logger.info(f"registering summary for {document.filename or document.document_id}")
             # TODO: Get the summary for the document
             register_summary(collection_name, document.filename or document.document_id, "No Summary Available")
-            self._summarized.add(document.document_id)
+            self._summarized[collection_name].add(document.document_id)
