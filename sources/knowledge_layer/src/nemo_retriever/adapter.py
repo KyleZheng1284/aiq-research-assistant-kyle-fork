@@ -435,6 +435,7 @@ class NemoRetrieverIngestor(BaseIngestor):
         self._file_sizes: dict[str, int] = {}
         self._job_collections: dict[str, str] = {}
         self._upload_batches: dict[str, _UploadBatchState] = {}
+        self._summarized: set[str] = set()
         self._submission_condition = threading.Condition(self._tracking_lock)
         self._outstanding_uploads = 0
         self._active_submissions = 0
@@ -730,6 +731,8 @@ class NemoRetrieverIngestor(BaseIngestor):
         for item in documents:
             status = status_to_file_status(item.status)
             attempt_ids[item.document_id] = item.attempt_id
+            # Always register at least the filename. We may want to gate this behind the generate_summary flag later.
+            self._register_summary(aggregate.collection_name, item)
             upstream_details[item.document_id] = FileProgress(
                 file_id=item.document_id,
                 file_name=item.filename or item.document_id,
@@ -954,3 +957,16 @@ class NemoRetrieverIngestor(BaseIngestor):
             return isinstance(payload, dict) and payload.get("status") in {"ok", "healthy"}
         except NemoRetrieverError:
             return False
+
+    def _register_summary(self, collection_name: str, document: JobDocumentWire) -> None:
+        """Register a summary for a document if it has been successfully ingested."""
+        from aiq_agent.knowledge import register_summary
+
+        if (
+            _status_to_file_status(document.status) == FileStatus.SUCCESS
+            and document.document_id not in self._summarized
+        ):
+            logger.info(f"registering summary for {document.filename or document.document_id}")
+            # TODO: Get the summary for the document
+            register_summary(collection_name, document.filename or document.document_id, "No Summary Available")
+            self._summarized.add(document.document_id)
