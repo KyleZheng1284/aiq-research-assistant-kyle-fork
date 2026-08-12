@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,7 @@ from aiq_agent.knowledge import register_ingestor
 from aiq_agent.knowledge import register_retriever
 from aiq_agent.knowledge import register_summary
 from aiq_agent.knowledge import unregister_summary
+from aiq_agent.knowledge.base import TTLCleanupMixin
 from aiq_agent.knowledge.schema import CollectionInfo
 from aiq_agent.knowledge.schema import FileInfo
 from aiq_agent.knowledge.schema import FileStatus
@@ -78,6 +80,8 @@ _PHYSICAL_STORAGE_KEYS = frozenset(
 _SUCCESS_STATUSES = frozenset({"completed", "indexed", "ready", "success", "succeeded"})
 _FAILED_STATUSES = frozenset({"failed", "error"})
 _PLACEHOLDER_SUMMARY = "No Summary Available"
+# Shared with the other knowledge backends so one setting paces every TTL cleanup thread.
+TTL_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("AIQ_TTL_CLEANUP_INTERVAL_SECONDS", "3600"))
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,7 @@ class _Settings:
     ca_bundle: str | None
     collection_ttl_hours: float
     warm_start: bool
+    start_ttl_cleanup: bool
 
 
 @dataclass(frozen=True)
@@ -151,6 +156,7 @@ def _settings(config: dict[str, Any]) -> _Settings:
         ca_bundle=str(config["ca_bundle"]) if config.get("ca_bundle") else None,
         collection_ttl_hours=collection_ttl_hours,
         warm_start=bool(config.get("warm_start", True)),
+        start_ttl_cleanup=bool(config.get("start_ttl_cleanup", True)),
     )
 
 
@@ -332,6 +338,18 @@ def _collection_info(item: CollectionWire) -> CollectionInfo:
     )
 
 
+def _collection_expiration(info: CollectionInfo) -> datetime | None:
+    """Read back the expiration that ``_collection_info`` carries as an ISO string in metadata."""
+    raw = info.metadata.get("expires_at")
+    if not raw:
+        return None
+    try:
+        return _parse_timestamp(datetime.fromisoformat(str(raw)))
+    except ValueError:
+        logger.warning("NeMo Retriever reported a collection expiration that could not be parsed")
+        return None
+
+
 def _document_info(item: DocumentWire) -> FileInfo:
     status = _status_to_file_status(item.status)
     return FileInfo(
@@ -451,7 +469,7 @@ class NemoRetrieverRetriever(BaseRetriever):
 
 
 @register_ingestor(_BACKEND_NAME)
-class NemoRetrieverIngestor(BaseIngestor):
+class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
     """Manage NRL collections and accepted ingestion jobs through REST."""
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -469,6 +487,8 @@ class NemoRetrieverIngestor(BaseIngestor):
         self._collection_expirations: dict[str, datetime] = {}
         if self._settings.warm_start:
             self._start_warm_start_task()
+        if self._settings.start_ttl_cleanup:
+            self._start_ttl_cleanup_task(self._settings.collection_ttl_hours, TTL_CLEANUP_INTERVAL_SECONDS)
 
     def _start_warm_start_task(self) -> None:
         """Reconcile on a daemon thread so startup neither blocks on NRL nor fails with it."""
@@ -480,11 +500,48 @@ class NemoRetrieverIngestor(BaseIngestor):
         thread.start()
 
     def _warm_start(self) -> None:
-        """Reconcile the summary store with NRL and leave the adapter caches warm."""
+        """Reconcile with NRL, retire collections that expired while down, and warm the caches."""
         try:
             self._reconcile_summaries()
+            self._cleanup_expired_collections()
         except Exception:
             logger.exception("NeMo Retriever warm start did not complete")
+
+    def _cleanup_expired_collections(self) -> None:
+        """Drop the summaries and cached state of collections whose NRL expiration has passed.
+
+        NRL expires the collection itself, so cleanup never issues a delete: it only retires the
+        state AI-Q keeps alongside it, which would otherwise keep offering agents documents that
+        can no longer be retrieved.
+
+        It also replaces the mixin's idle-time policy: NRL is given an absolute expiration at
+        creation and enforces it, so inferring one from ``updated_at`` would push AI-Q's view of a
+        collection past the deadline the service will actually act on.
+
+        Each deadline is the one NRL last reported, recorded at create, update, or reconcile time.
+        """
+        now = datetime.now(UTC)
+        with self._tracking_lock:
+            due = [name for name, expires_at in self._collection_expirations.items() if expires_at <= now]
+        for name in due:
+            self._forget_collection(name)
+            logger.info("Dropped summaries for an expired NeMo Retriever collection")
+
+    def _track_expiration(self, name: str, expires_at: datetime | None) -> None:
+        """Record when NRL will expire a collection, or stop tracking one that no longer expires."""
+        with self._tracking_lock:
+            if expires_at is None:
+                self._collection_expirations.pop(name, None)
+            else:
+                self._collection_expirations[name] = expires_at
+
+    def _forget_collection(self, name: str) -> None:
+        """Drop a collection's summaries and the adapter state that tracked its documents."""
+        clear_collection_summaries(name)
+        with self._tracking_lock:
+            self._collection_expirations.pop(name, None)
+            for document_id in self._summarized.pop(name, set()):
+                self._document_id_to_filename.pop(document_id, None)
 
     def _reconcile_summaries(self) -> None:
         """Make the summary store match the documents NRL actually holds.
@@ -492,15 +549,20 @@ class NemoRetrieverIngestor(BaseIngestor):
         NRL owns document lifetime, including server-side collection expiration, so it is the
         authority here: documents it serves must have a summary row, and rows it no longer backs
         are dropped. A collection is cleared only once NRL positively reports it absent, so a
-        transport failure leaves the store untouched instead of deleting live summaries.
+        transport failure leaves the store untouched instead of deleting live summaries. The
+        expirations NRL reports are adopted as well, which is what lets TTL cleanup act on
+        collections this process did not create itself.
         """
-        live_collections = {collection.name for collection in self.list_collections()}
+        collections = self.list_collections()
+        for collection in collections:
+            self._track_expiration(collection.name, _collection_expiration(collection))
+        live_collections = {collection.name for collection in collections}
         for name in live_collections | set(list_summary_collections()):
             try:
                 if name in live_collections:
                     self._reconcile_collection(name)
                 elif self.get_collection(name) is None:
-                    clear_collection_summaries(name)
+                    self._forget_collection(name)
                     logger.info("Dropped summaries for a collection NeMo Retriever no longer holds")
             except NemoRetrieverError:
                 logger.warning("Skipped summary reconciliation for one collection (NeMo Retriever unavailable)")
@@ -510,6 +572,9 @@ class NemoRetrieverIngestor(BaseIngestor):
 
         The store is read before NRL so that a document ingested mid-reconcile is treated as new
         rather than as an orphan: an extra idempotent write is harmless, a wrong delete is not.
+
+        Every document NRL lists gets its filename mapped, because a delete can arrive for one that
+        is still ingesting. Only successfully ingested documents count as summarized.
         """
         stored = {document.file_name for document in get_available_documents(collection_name)}
         documents = self.list_files(collection_name)
@@ -517,6 +582,8 @@ class NemoRetrieverIngestor(BaseIngestor):
         for document in documents:
             filename = document.file_name or document.file_id
             known.add(filename)
+            with self._tracking_lock:
+                self._document_id_to_filename[document.file_id] = filename
             if document.status != FileStatus.SUCCESS:
                 continue
             if filename not in stored:
@@ -524,9 +591,7 @@ class NemoRetrieverIngestor(BaseIngestor):
                     collection_name, document.status, document.file_id, filename, _PLACEHOLDER_SUMMARY
                 )
             else:
-                # This document is already in the summary store, so we need to update the filename and summarized set
                 with self._tracking_lock:
-                    self._document_id_to_filename[document.file_id] = filename
                     self._summarized[collection_name].add(document.file_id)
         for orphan in stored - known:
             unregister_summary(collection_name, orphan)
@@ -553,8 +618,9 @@ class NemoRetrieverIngestor(BaseIngestor):
                 "expires_at": expires_at.isoformat(),
             },
         )
-        self._collection_expirations[name] = expires_at
-        return _collection_info(_wire(CollectionWire, payload, "create collection"))
+        info = _collection_info(_wire(CollectionWire, payload, "create collection"))
+        self._track_expiration(name, _collection_expiration(info) or expires_at)
+        return info
 
     def update_collection(
         self,
@@ -577,7 +643,9 @@ class NemoRetrieverIngestor(BaseIngestor):
             operation="update collection",
             json=body,
         )
-        return _collection_info(_wire(CollectionWire, payload, "update collection"))
+        info = _collection_info(_wire(CollectionWire, payload, "update collection"))
+        self._track_expiration(name, _collection_expiration(info) or expires_at)
+        return info
 
     def delete_collection(self, name: str) -> bool:
         payload = self._transport.request_json(
@@ -587,9 +655,7 @@ class NemoRetrieverIngestor(BaseIngestor):
             params={"if_exists": "true"},
         )
         result = _wire(CollectionDeleteWire, payload, "delete collection")
-        clear_collection_summaries(name)
-        self._collection_expirations.pop(name, None)
-        self._summarized.pop(name, None)
+        self._forget_collection(name)
         return result.deleted or not result.existed or result.cleanup_pending
 
     def list_collections(self) -> list[CollectionInfo]:
