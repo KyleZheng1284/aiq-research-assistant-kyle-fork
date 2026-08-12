@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import threading
+from collections import defaultdict
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -33,6 +34,8 @@ from aiq_agent.knowledge import IngestionJobStatus
 from aiq_agent.knowledge import JobState
 from aiq_agent.knowledge import RetrievalResult
 from aiq_agent.knowledge import clear_collection_summaries
+from aiq_agent.knowledge import get_available_documents
+from aiq_agent.knowledge import list_summary_collections
 from aiq_agent.knowledge import register_ingestor
 from aiq_agent.knowledge import register_retriever
 from aiq_agent.knowledge import register_summary
@@ -86,6 +89,9 @@ _SERVICE_CONFIG_KEYS = frozenset(
         "collection_ttl_hours",
     }
 )
+_SUCCESS_STATUSES = frozenset({"completed", "indexed", "ready", "success", "succeeded"})
+_FAILED_STATUSES = frozenset({"failed", "error"})
+_PLACEHOLDER_SUMMARY = "No Summary Available"
 
 
 @dataclass(frozen=True)
@@ -101,6 +107,7 @@ class _Settings:
     verify_ssl: bool
     ca_bundle: str | None
     collection_ttl_hours: float
+    warm_start: bool
 
 
 @dataclass(frozen=True)
@@ -188,6 +195,7 @@ def _settings(config: dict[str, Any]) -> _Settings:
         ),
         ca_bundle=(str(value) if (value := _config_value(config, "ca_bundle", "NRL_CA_BUNDLE")) is not None else None),
         collection_ttl_hours=collection_ttl_hours,
+        warm_start=bool(config.get("warm_start", True)),
     )
 
 
@@ -439,9 +447,8 @@ class NemoRetrieverIngestor(BaseIngestor):
         self._job_collections: dict[str, str] = {}
         self._upload_batches: dict[str, _UploadBatchState] = {}
         # Needed because we want the summary to show the filename, but we work with document_ids
-        # TODO: Need to warm start this in case the instance is restarted
         self._document_id_to_filename: dict[str, str] = {}
-        self._summarized: dict[str, set[str]] = {}
+        self._summarized: defaultdict[str, set[str]] = defaultdict(set)
         self._collection_expirations: dict[str, datetime] = {}
         self._submission_condition = threading.Condition(self._tracking_lock)
         self._outstanding_uploads = 0
@@ -452,6 +459,8 @@ class NemoRetrieverIngestor(BaseIngestor):
         )
         self._close_lock = threading.Lock()
         self._closed = False
+        if self._settings.warm_start:
+            self._start_warm_start_task()
 
     def _begin_submission(self, requested: int) -> None:
         """Atomically reserve a complete batch before creating an upstream job."""
@@ -487,6 +496,67 @@ class NemoRetrieverIngestor(BaseIngestor):
     def _release_upload_reservations(self, count: int) -> None:
         with self._submission_condition:
             self._outstanding_uploads -= count
+
+    def _start_warm_start_task(self) -> None:
+        """Reconcile on a daemon thread so startup neither blocks on NRL nor fails with it."""
+        thread = threading.Thread(
+            target=self._warm_start,
+            daemon=True,
+            name=f"{self.backend_name}-warm-start",
+        )
+        thread.start()
+
+    def _warm_start(self) -> None:
+        """Reconcile the summary store with NRL and leave the adapter caches warm."""
+        try:
+            self._reconcile_summaries()
+        except Exception:
+            logger.exception("NeMo Retriever warm start did not complete")
+
+    def _reconcile_summaries(self) -> None:
+        """Make the summary store match the documents NRL actually holds.
+
+        NRL owns document lifetime, including server-side collection expiration, so it is the
+        authority here: documents it serves must have a summary row, and rows it no longer backs
+        are dropped. A collection is cleared only once NRL positively reports it absent, so a
+        transport failure leaves the store untouched instead of deleting live summaries.
+        """
+        live_collections = {collection.name for collection in self.list_collections()}
+        for name in live_collections | set(list_summary_collections()):
+            try:
+                if name in live_collections:
+                    self._reconcile_collection(name)
+                elif self.get_collection(name) is None:
+                    clear_collection_summaries(name)
+                    logger.info("Dropped summaries for a collection NeMo Retriever no longer holds")
+            except NemoRetrieverError:
+                logger.warning("Skipped summary reconciliation for one collection (NeMo Retriever unavailable)")
+
+    def _reconcile_collection(self, collection_name: str) -> None:
+        """Reconcile one collection that NRL still holds against its stored summaries.
+
+        The store is read before NRL so that a document ingested mid-reconcile is treated as new
+        rather than as an orphan: an extra idempotent write is harmless, a wrong delete is not.
+        """
+        stored = {document.file_name for document in get_available_documents(collection_name)}
+        documents = self.list_files(collection_name)
+        known: set[str] = set()
+        for document in documents:
+            filename = document.file_name or document.file_id
+            known.add(filename)
+            if document.status != FileStatus.SUCCESS:
+                continue
+            if filename not in stored:
+                self._register_summary(
+                    collection_name, document.status, document.file_id, filename, _PLACEHOLDER_SUMMARY
+                )
+            else:
+                # This document is already in the summary store, so we need to update the filename and summarized set
+                with self._tracking_lock:
+                    self._document_id_to_filename[document.file_id] = filename
+                    self._summarized[collection_name].add(document.file_id)
+        for orphan in stored - known:
+            unregister_summary(collection_name, orphan)
 
     @property
     def backend_name(self) -> str:
@@ -739,11 +809,21 @@ class NemoRetrieverIngestor(BaseIngestor):
         }.get(aggregate.status.lower(), JobState.PROCESSING)
         upstream_details: dict[str, FileProgress] = {}
         attempt_ids: dict[str, str] = {}
+        collection_name = aggregate.collection_name
+        if not collection_name:
+            with self._tracking_lock:
+                collection_name = self._job_collections.get(job_id, "")
         for item in documents:
             status = status_to_file_status(item.status)
             attempt_ids[item.document_id] = item.attempt_id
             # Always register at least the filename. We may want to gate this behind the generate_summary flag later.
-            self._register_summary(aggregate.collection_name, item)
+            # TODO: Get the summary for the document
+            self._register_summary(
+                collection_name,
+                status,
+                item.document_id,
+                item.filename,
+            )
             upstream_details[item.document_id] = FileProgress(
                 file_id=item.document_id,
                 file_name=item.filename or item.document_id,
@@ -797,10 +877,6 @@ class NemoRetrieverIngestor(BaseIngestor):
                 if aggregate.status.lower() == "failed" or terminal >= aggregate.expected_documents
                 else JobState.PROCESSING
             )
-        collection_name = aggregate.collection_name
-        if not collection_name:
-            with self._tracking_lock:
-                collection_name = self._job_collections.get(job_id, "")
         error_message = None
         if upload_failures and state == JobState.FAILED:
             error_message = "NeMo Retriever rejected one or more document uploads"
@@ -898,8 +974,12 @@ class NemoRetrieverIngestor(BaseIngestor):
             params={"if_exists": "true"},
         )
         result = _wire(DocumentDeleteWire, payload, "delete document")
-        unregister_summary(collection_name, self._document_id_to_filename.get(file_id, file_id))
-        self._summarized.get(collection_name, set()).discard(file_id)
+        with self._tracking_lock:
+            summary_key = self._document_id_to_filename.get(file_id, file_id)
+        unregister_summary(collection_name, summary_key)
+        with self._tracking_lock:
+            self._document_id_to_filename.pop(file_id, None)
+            self._summarized[collection_name].discard(file_id)
         return result.deleted or not result.existed or result.cleanup_pending
 
     def list_files(self, collection_name: str) -> list[FileInfo]:
@@ -971,17 +1051,20 @@ class NemoRetrieverIngestor(BaseIngestor):
         except NemoRetrieverError:
             return False
 
-    def _register_summary(self, collection_name: str, document: JobDocumentWire) -> None:
+    def _register_summary(
+        self,
+        collection_name: str,
+        status: FileStatus,
+        document_id: str,
+        filename: str | None,
+        summary: str | None = None,
+    ) -> None:
         """Register a summary for a document if it has been successfully ingested."""
-        if not self._summarized.get(collection_name):
-            self._summarized[collection_name] = set()
-        if (
-            _status_to_file_status(document.status) == FileStatus.SUCCESS
-            and document.document_id not in self._summarized[collection_name]
-        ):
-            logger.info(f"registering summary for {document.filename or document.document_id}")
-            # TODO: Get the summary for the document
-            filename = document.filename or document.document_id
-            self._document_id_to_filename[document.document_id] = filename
-            register_summary(collection_name, filename, "No Summary Available")
-            self._summarized[collection_name].add(document.document_id)
+        if status == FileStatus.SUCCESS and document_id not in self._summarized[collection_name]:
+            summary = summary or _PLACEHOLDER_SUMMARY
+            logger.info(f"registering summary for {filename or document_id}")
+            filename = filename or document_id
+            with self._tracking_lock:
+                self._document_id_to_filename[document_id] = filename
+                self._summarized[collection_name].add(document_id)
+            register_summary(collection_name, filename, summary)

@@ -338,6 +338,11 @@ async def get_available_documents_async(collection: str) -> list["AvailableDocum
     return await _get_summary_store().get_all_async(collection)
 
 
+def list_summary_collections() -> list[str]:
+    """Get every collection that currently holds summaries."""
+    return _get_summary_store().list_collections()
+
+
 def unregister_summary(collection: str, filename: str) -> None:
     """Delete a file's summary."""
     _get_summary_store().unregister(collection, filename)
