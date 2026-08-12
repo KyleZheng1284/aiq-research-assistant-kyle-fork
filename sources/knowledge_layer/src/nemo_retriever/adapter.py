@@ -454,6 +454,7 @@ class NemoRetrieverIngestor(BaseIngestor):
         self._file_jobs: dict[str, str] = {}
         self._file_sizes: dict[str, int] = {}
         self._job_collections: dict[str, str] = {}
+        self._summarized: set[str] = set()
 
     @property
     def backend_name(self) -> str:
@@ -636,6 +637,8 @@ class NemoRetrieverIngestor(BaseIngestor):
             if status in {FileStatus.SUCCESS, FileStatus.FAILED}:
                 terminal += 1
             attempt_ids[item.document_id] = item.attempt_id
+            # Always register at least the filename. We may want to gate this behind the generate_summary flag later.
+            self._register_summary(aggregate.collection_name, item)
             file_details.append(
                 FileProgress(
                     file_id=item.document_id,
@@ -803,3 +806,16 @@ class NemoRetrieverIngestor(BaseIngestor):
             return isinstance(payload, dict) and payload.get("status") in {"ok", "healthy"}
         except NemoRetrieverError:
             return False
+
+    def _register_summary(self, collection_name: str, document: JobDocumentWire) -> None:
+        """Register a summary for a document if it has been successfully ingested."""
+        from aiq_agent.knowledge import register_summary
+
+        if (
+            _status_to_file_status(document.status) == FileStatus.SUCCESS
+            and document.document_id not in self._summarized
+        ):
+            logger.info(f"registering summary for {document.filename or document.document_id}")
+            # TODO: Get the summary for the document
+            register_summary(collection_name, document.filename or document.document_id, "No Summary Available")
+            self._summarized.add(document.document_id)
