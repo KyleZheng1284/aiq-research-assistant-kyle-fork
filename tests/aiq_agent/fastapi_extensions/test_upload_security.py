@@ -27,8 +27,10 @@ from aiq_agent.fastapi_extensions.routes.documents import add_document_routes as
 from aiq_agent.fastapi_extensions.upload_security import UPLOAD_ENDPOINT_DESCRIPTION
 from aiq_agent.fastapi_extensions.upload_security import UploadLimits
 from aiq_agent.fastapi_extensions.upload_security import UploadValidationError
+from aiq_agent.fastapi_extensions.upload_security import ValidatedUploadBatch
 from aiq_agent.fastapi_extensions.upload_security import get_upload_limits
 from aiq_agent.fastapi_extensions.upload_security import save_validated_upload
+from aiq_agent.fastapi_extensions.upload_security import submit_validated_upload_batch
 from aiq_agent.fastapi_extensions.upload_security import validate_upload_count
 from aiq_api.routes.documents import add_document_routes as add_unified_document_routes
 
@@ -197,6 +199,16 @@ def _upload_endpoint(register_routes: Callable[[APIRouter], None]) -> Callable:
     return _upload_route(register_routes).endpoint
 
 
+def _job_status_endpoint(register_routes: Callable[[APIRouter], None]) -> Callable:
+    router = APIRouter()
+    register_routes(router)
+    return next(
+        route.endpoint
+        for route in router.routes
+        if isinstance(route, APIRoute) and route.path == "/v1/documents/{job_id}/status"
+    )
+
+
 class _FailingIngestor:
     def get_collection(self, collection_name: str) -> object:
         return object()
@@ -220,6 +232,26 @@ class _SuccessfulIngestor:
         return SimpleNamespace(file_details=[])
 
 
+class _BlockingIngestor(_SuccessfulIngestor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submission_started = threading.Event()
+        self.release_submission = threading.Event()
+
+    def submit_job(self, paths, *args, **kwargs) -> str:
+        self.submitted_paths = list(paths)
+        self.submission_started.set()
+        if not self.release_submission.wait(timeout=5):
+            raise AssertionError("test did not release ingestion submission")
+        return "ingestion-job"
+
+
+class _JobStatusError(RuntimeError):
+    def __init__(self, status_code: int):
+        super().__init__("private backend response")
+        self.status_code = status_code
+
+
 def test_loads_existing_shared_upload_environment_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FILE_UPLOAD_ACCEPTED_TYPES", "pdf, .DOCX, .txt")
     monkeypatch.setenv("FILE_UPLOAD_MAX_SIZE_MB", "1.5")
@@ -231,6 +263,21 @@ def test_loads_existing_shared_upload_environment_contract(monkeypatch: pytest.M
     assert limits.max_file_bytes == int(1.5 * 1024 * 1024)
     assert limits.max_total_bytes == limits.max_file_bytes
     assert limits.max_files == 7
+
+
+@pytest.mark.parametrize(("status_code", "detail"), [(404, "not found"), (410, "expired")])
+def test_unified_job_status_preserves_missing_and_expired_semantics(status_code: int, detail: str) -> None:
+    endpoint = _job_status_endpoint(add_unified_document_routes)
+
+    def get_job_status(_job_id: str) -> None:
+        raise _JobStatusError(status_code)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(endpoint(job_id="job-1", ingestor=SimpleNamespace(get_job_status=get_job_status)))
+
+    assert exc_info.value.status_code == status_code
+    assert detail in exc_info.value.detail
+    assert "private backend response" not in exc_info.value.detail
 
 
 def test_file_count_accepts_boundary_and_rejects_plus_one() -> None:
@@ -684,4 +731,78 @@ async def test_upload_route_success_transfers_temp_file_ownership_to_ingestion(
 
     assert response.job_id == "ingestion-job"
     assert ingestor.submitted_paths == [str(submitted_path)]
+    assert submitted_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_route_submission_does_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    endpoint = _upload_endpoint(add_unified_document_routes)
+    submitted_path = tmp_path / "submitted.txt"
+    submitted_path.write_bytes(b"research")
+
+    async def save_upload(*_args, on_temp_path_created, **_kwargs):
+        on_temp_path_created(str(submitted_path))
+        return SimpleNamespace(path=str(submitted_path), original_filename="submitted.txt", size_bytes=8)
+
+    monkeypatch.setattr(upload_security_module, "save_validated_upload", save_upload)
+    ingestor = _BlockingIngestor()
+    safety_release = threading.Timer(1, ingestor.release_submission.set)
+    safety_release.start()
+    request_task = asyncio.create_task(
+        endpoint(
+            collection_name="private",
+            files=[_upload("submitted.txt", b"research", "text/plain")],
+            ingestor=ingestor,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(ingestor.submission_started.wait, 1)
+        await asyncio.sleep(0)
+        assert not ingestor.release_submission.is_set(), "submit_job blocked the event loop"
+        ingestor.release_submission.set()
+        response = await asyncio.wait_for(request_task, 1)
+    finally:
+        safety_release.cancel()
+        ingestor.release_submission.set()
+        if not request_task.done():
+            await asyncio.gather(request_task, return_exceptions=True)
+        submitted_path.unlink(missing_ok=True)
+
+    assert response.job_id == "ingestion-job"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_submission_quiesces_worker_before_upload_cleanup(tmp_path: Path) -> None:
+    submitted_path = tmp_path / "submitted.txt"
+    submitted_path.write_bytes(b"research")
+    batch = ValidatedUploadBatch(
+        temp_paths=[str(submitted_path)],
+        original_filenames=[submitted_path.name],
+        total_bytes=submitted_path.stat().st_size,
+    )
+    submission_started = threading.Event()
+    release_submission = threading.Event()
+
+    def submit() -> str:
+        submission_started.set()
+        if not release_submission.wait(timeout=5):
+            raise AssertionError("test did not release ingestion submission")
+        return "ingestion-job"
+
+    submit_task = asyncio.create_task(submit_validated_upload_batch(submit, batch))
+    assert await asyncio.to_thread(submission_started.wait, 1)
+    submit_task.cancel()
+    await asyncio.sleep(0)
+
+    assert not submit_task.done()
+    assert submitted_path.exists()
+
+    release_submission.set()
+    with pytest.raises(asyncio.CancelledError):
+        await submit_task
+
+    assert batch._ownership_transferred
     assert submitted_path.exists()
