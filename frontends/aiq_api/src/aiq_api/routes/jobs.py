@@ -40,6 +40,7 @@ from typing import Any
 
 from fastapi import Body
 from fastapi import FastAPI
+from fastapi import Header
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
@@ -218,7 +219,17 @@ def _source_ids_by_lowercase() -> tuple[list[str], dict[str, str]]:
     return known_ids, {source_id.lower(): source_id for source_id in known_ids}
 
 
-async def _get_agent_available_source_ids(builder: WorkflowBuilder, agent_config_name: str) -> list[str]:
+def _get_configured_agent_function_config(builder: WorkflowBuilder, config_name: str) -> Any | None:
+    """Return an active function config, or None for NAT's missing-function error."""
+    try:
+        return builder.get_function_config(config_name)
+    except ValueError as exc:
+        if str(exc) == f"Function `{config_name}` not found":
+            return None
+        raise
+
+
+async def _get_agent_available_source_ids(builder: WorkflowBuilder, fn_config: Any) -> list[str]:
     """Return mapped source IDs with at least one effective tool for an agent config.
 
     This mirrors the async job runner's effective tool resolution: explicit
@@ -234,8 +245,7 @@ async def _get_agent_available_source_ids(builder: WorkflowBuilder, agent_config
     A registered agent without these fields is a registration-time bug, not a
     runtime concern.
     """
-    fn_config = builder.get_function_config(agent_config_name)
-    tool_refs = fn_config.tools if fn_config.tools is not None else get_all_tool_refs()
+    tool_refs = fn_config.tools or get_all_tool_refs()
     tools = await builder.get_tools(tool_names=tool_refs, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
 
     excluded = set(fn_config.exclude_tools or [])
@@ -270,6 +280,7 @@ async def _validate_data_sources_for_agent(
     builder: WorkflowBuilder,
     agent_type: str,
     agent_config_name: str,
+    fn_config: Any,
     data_sources: list[str] | None,
 ) -> None:
     """Raise HTTP 422 if requested sources are unknown or unavailable to the selected agent."""
@@ -285,7 +296,7 @@ async def _validate_data_sources_for_agent(
     known_ids, known_by_lower = _source_ids_by_lowercase()
 
     try:
-        available_ids = await _get_agent_available_source_ids(builder, agent_config_name)
+        available_ids = await _get_agent_available_source_ids(builder, fn_config)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -456,7 +467,7 @@ class AgentInfo(BaseModel):
 class AgentListResponse(BaseModel):
     """List of available agents."""
 
-    agents: list[AgentInfo] = Field(..., description="Registered agent types")
+    agents: list[AgentInfo] = Field(..., description="Public agent types configured in the active workflow")
 
 
 class DataSource(BaseModel):
@@ -491,6 +502,8 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
 
     from ..jobs.access import authorize_job_access
     from ..jobs.access import ensure_job_access_table
+    from ..jobs.admission import JobAdmissionError
+    from ..jobs.admission import ensure_deep_research_admission_table
     from ..jobs.crypto import ContentEncryptionConfigError
     from ..jobs.crypto import ContentEncryptionInvalidData
     from ..jobs.crypto import ContentEncryptionUnavailable
@@ -617,15 +630,17 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
         response_model=AgentListResponse,
         tags=["async jobs"],
         summary="List available agents",
-        description="Returns all registered agent types that can be used with the submit endpoint.",
+        description="Returns public agent types configured in the active workflow.",
     )
     async def list_agents() -> AgentListResponse:
         """List available agent types for async job submission."""
-        agents = [
-            AgentInfo(agent_type=agent_type, description=config.description)
-            for agent_type, config in AGENT_REGISTRY.items()
-            if config.public
-        ]
+        agents = []
+        for agent_type, config in AGENT_REGISTRY.items():
+            if not config.public:
+                continue
+            if _get_configured_agent_function_config(builder, config.config_name) is None:
+                continue
+            agents.append(AgentInfo(agent_type=agent_type, description=config.description))
         return AgentListResponse(agents=agents)
 
     @app.get(
@@ -673,6 +688,7 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
     )
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, ensure_job_access_table, db_url)
+    await loop.run_in_executor(None, ensure_deep_research_admission_table, db_url)
     await loop.run_in_executor(None, _validate_artifact_store, db_url)
 
     @app.post(
@@ -684,24 +700,32 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
             "Submit a research query to a registered agent. Returns a job ID for tracking progress via SSE stream."
         ),
         responses={
-            400: {"description": "Unknown agent type or invalid request"},
+            400: {"description": "Unknown, internal-only, or unconfigured agent type, or invalid request"},
+            413: {"description": "Deep-research input exceeds the configured payload limit"},
             409: {
                 "description": (
                     "A custom job_id was supplied that collides with an existing job, or a selected "
                     "protected data source requires per-user OAuth connection"
                 )
             },
+            429: {"description": "Per-principal active-job or submission-rate limit reached"},
             422: {"description": "One or more unknown or agent-unavailable data source IDs"},
             500: {
                 "description": (
-                    "Content encryption configuration is invalid or async job authorization persistence failed"
+                    "Content encryption configuration is invalid, async job authorization persistence failed, "
+                    "or agent/tool configuration lookup failed unexpectedly"
                 )
             },
-            503: {"description": "Content encryption, Dask scheduler, or sandbox capacity is unavailable"},
+            503: {
+                "description": (
+                    "Content encryption, Dask scheduler, admission database, or deployment job capacity is unavailable"
+                )
+            },
         },
     )
     async def submit_job(
         req: Annotated[JobSubmitRequest, Body(openapi_examples=JOB_SUBMIT_EXAMPLES)],
+        conversation_id: Annotated[str | None, Header(alias="conversation-id")] = None,
     ) -> JobStatusResponse:
         """Submit a new async job for deep research or other registered agents."""
         try:
@@ -710,6 +734,18 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
             raise HTTPException(400, str(e))
         if not agent_config.public:
             raise HTTPException(400, f"Agent type is internal-only and cannot be submitted directly: {req.agent_type}")
+
+        fn_config = _get_configured_agent_function_config(builder, agent_config.config_name)
+        if fn_config is None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "agent_not_configured",
+                    "message": f"Agent '{req.agent_type}' is not configured in the active workflow",
+                    "agent_type": req.agent_type,
+                    "config_name": agent_config.config_name,
+                },
+            )
 
         expiry = req.expiry_seconds if req.expiry_seconds is not None else default_expiry_seconds
         # Authenticate the caller (raises 401/403 if unverified). The returned principal
@@ -735,6 +771,7 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
             builder=builder,
             agent_type=req.agent_type,
             agent_config_name=agent_config.config_name,
+            fn_config=fn_config,
             data_sources=req.data_sources,
         )
         logger.info(
@@ -772,6 +809,7 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
                 expiry_seconds=expiry,
                 data_sources=req.data_sources,
                 auth_token=auth_token,
+                conversation_id=conversation_id,
                 skip_encryption_readiness_check=True,
             )
         except ContentEncryptionUnavailable as e:
@@ -788,6 +826,9 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
             raise HTTPException(500, "Content encryption configuration is invalid")
         except JobIdConflictError:
             raise HTTPException(409, f"Job already exists: {req.job_id}")
+        except JobAdmissionError as e:
+            headers = {"Retry-After": str(e.retry_after_seconds)} if e.retry_after_seconds is not None else None
+            raise HTTPException(status_code=e.status_code, detail=e.public_message, headers=headers)
         except McpAuthRequiredError as e:
             # submit_agent_job runs the same MCP preflight and raises if a selected
             # protected source became disconnected between the route preflight above
@@ -1637,6 +1678,13 @@ def _process_artifact_update(
         url = data.get("url") or content
         if _is_valid_url(url):
             sources_cited.add(_normalize_url(url))
+    elif artifact_type == "output" and data.get("output_category") == "final_report":
+        final_cited_urls = data.get("cited_urls")
+        if isinstance(final_cited_urls, list):
+            # The verified final report is authoritative. Intermediate LLM
+            # output can contain citations that finalization later removes.
+            sources_cited.clear()
+            sources_cited.update(_normalize_url(url) for url in final_cited_urls if _is_valid_url(url))
 
     if content:
         outputs.append(
