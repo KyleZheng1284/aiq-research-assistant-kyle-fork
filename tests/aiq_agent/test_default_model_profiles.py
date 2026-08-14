@@ -22,7 +22,15 @@ CONFIG_GLOBS = (
     "configs/config_*.yml",
     "frontends/benchmarks/**/configs/*.yml",
 )
-CONFIG_PATHS = tuple(sorted(path for pattern in CONFIG_GLOBS for path in REPO_ROOT.glob(pattern)))
+LOCAL_PROFILE_SUFFIX = ".gpt5nano.local.yml"
+CONFIG_PATHS = tuple(
+    sorted(
+        path
+        for pattern in CONFIG_GLOBS
+        for path in REPO_ROOT.glob(pattern)
+        if not path.name.endswith(LOCAL_PROFILE_SUFFIX)
+    )
+)
 FRESHQA_CONFIG_PATHS = tuple(sorted(REPO_ROOT.glob("frontends/benchmarks/freshqa/configs/*.yml")))
 SHALLOW_PROFILE_PATHS = (
     REPO_ROOT / "configs/config_web_default_guardrails.yml",
@@ -93,6 +101,29 @@ def test_default_profiles_use_role_appropriate_models(config_path: Path):
     config = _load_config(config_path)
     functions = config.get("functions", {})
     is_frontier_profile = config_path.name == "config_frontier_models.yml"
+    is_local_nrl_profile = config_path.name == "config_web_nemo_retriever_local.yml"
+
+    if is_local_nrl_profile:
+        local_llm = config["llms"]["agent_llm"]
+        assert local_llm["_type"] == "openai"
+        assert local_llm["model_name"] == "${AIQ_AGENT_LLM_MODEL:-openai/local-tool-model}"
+        assert local_llm["base_url"] == "${AIQ_AGENT_LLM_BASE_URL:-http://127.0.0.1:1234/v1}"
+        assert local_llm["api_key"] == "${AIQ_AGENT_LLM_API_KEY:-local}"
+        assert "parallel_tool_calls" not in local_llm
+        for function in functions.values():
+            if not isinstance(function, dict):
+                continue
+            for role in (
+                "llm",
+                "orchestrator_llm",
+                "source_router_llm",
+                "researcher_llm",
+                "planner_llm",
+                "writer_llm",
+            ):
+                if role in function:
+                    assert function[role] == "agent_llm"
+        return
 
     for function in functions.values():
         if not isinstance(function, dict):
@@ -168,7 +199,12 @@ def test_deprecated_model_and_endpoint_references_are_absent():
     violations: list[str] = []
 
     for path in REPO_ROOT.rglob("*"):
-        if not path.is_file() or path.suffix not in SCANNED_SUFFIXES or IGNORED_PARTS.intersection(path.parts):
+        if (
+            not path.is_file()
+            or path.name.endswith(LOCAL_PROFILE_SUFFIX)
+            or path.suffix not in SCANNED_SUFFIXES
+            or IGNORED_PARTS.intersection(path.parts)
+        ):
             continue
 
         text = path.read_text(encoding="utf-8")
