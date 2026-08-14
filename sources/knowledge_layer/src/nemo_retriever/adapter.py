@@ -25,7 +25,6 @@ from pydantic import ValidationError
 from aiq_agent.knowledge import BaseIngestor
 from aiq_agent.knowledge import BaseRetriever
 from aiq_agent.knowledge import Chunk
-from aiq_agent.knowledge import ContentType
 from aiq_agent.knowledge import FileProgress
 from aiq_agent.knowledge import IngestionJobStatus
 from aiq_agent.knowledge import JobState
@@ -49,6 +48,11 @@ from ._models import JobDocumentWire
 from ._models import QueryHitWire
 from ._models import QueryResponseWire
 from ._models import UploadAcceptedWire
+from ._normalization import UNSUPPORTED_FILTERS_ERROR
+from ._normalization import normalize_query_hit
+from ._normalization import scrub_metadata as _scrub_metadata
+from ._normalization import status_to_file_status
+from ._normalization import strict_bool
 from ._transport import NemoRetrieverError
 from ._transport import NemoRetrieverHTTPError
 from ._transport import _NRLTransport
@@ -58,19 +62,7 @@ logger = logging.getLogger(__name__)
 _BACKEND_NAME = "nemo_retriever"
 _RESOURCE_PAGE_SIZE = 100
 _JOB_PAGE_SIZE = 1000
-_PHYSICAL_STORAGE_KEYS = frozenset(
-    {
-        "database_uri",
-        "lance_uri",
-        "lancedb_uri",
-        "physical_table",
-        "table_name",
-        "table_path",
-        "vdb_uri",
-    }
-)
-_SUCCESS_STATUSES = frozenset({"completed", "indexed", "ready", "success", "succeeded"})
-_FAILED_STATUSES = frozenset({"failed", "error"})
+_PUBLIC_DOCUMENT_ERROR = "NeMo Retriever document ingestion failed"
 
 
 @dataclass(frozen=True)
@@ -139,7 +131,7 @@ def _settings(config: dict[str, Any]) -> _Settings:
         request_timeout_s=request_timeout_s,
         max_retries=max_retries,
         max_concurrency=max_concurrency,
-        verify_ssl=bool(config.get("verify_ssl", True)),
+        verify_ssl=strict_bool(config.get("verify_ssl", True), name="nrl_verify_ssl"),
         ca_bundle=str(config["ca_bundle"]) if config.get("ca_bundle") else None,
         collection_ttl_hours=collection_ttl_hours,
     )
@@ -196,69 +188,9 @@ def _parse_timestamp(value: datetime | None) -> datetime | None:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
-def _scrub_metadata(value: Any) -> Any:
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            normalized = str(key).lower()
-            if normalized in _PHYSICAL_STORAGE_KEYS or "lancedb" in normalized:
-                continue
-            result[str(key)] = _scrub_metadata(item)
-        return result
-    if isinstance(value, list):
-        return [_scrub_metadata(item) for item in value]
-    if isinstance(value, tuple):
-        return [_scrub_metadata(item) for item in value]
-    return value
-
-
-def _normalize_content_type(value: str | None) -> ContentType:
-    normalized = (value or "").strip().lower()
-    if "table" in normalized:
-        return ContentType.TABLE
-    if "chart" in normalized or "plot" in normalized or "graph" in normalized:
-        return ContentType.CHART
-    if any(token in normalized for token in ("image", "figure", "graphic")):
-        return ContentType.IMAGE
-    return ContentType.TEXT
-
-
-def _status_to_file_status(status: str) -> FileStatus:
-    normalized = status.lower()
-    if normalized in _SUCCESS_STATUSES:
-        return FileStatus.SUCCESS
-    if normalized in _FAILED_STATUSES:
-        return FileStatus.FAILED
-    if normalized == "pending":
-        return FileStatus.UPLOADING
-    return FileStatus.INGESTING
-
-
-def _safe_structured_data(metadata: dict[str, Any]) -> str | None:
-    for key in ("structured_data", "table_content", "chart_data"):
-        value = metadata.get(key)
-        if value is None:
-            continue
-        if isinstance(value, str):
-            return value
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return None
-
-
-def _bbox(value: Any) -> Any:
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except ValueError:
-            return value
-    return value
-
-
-def _http_url(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    parsed = urlparse(value)
-    return value if parsed.scheme in {"http", "https"} and parsed.netloc else None
+def _public_document_error(value: str | None) -> str | None:
+    """Contain producer exception text at the AI-Q public API boundary."""
+    return _PUBLIC_DOCUMENT_ERROR if value else None
 
 
 def _sha256_file(path: Path) -> str:
@@ -324,7 +256,7 @@ def _collection_info(item: CollectionWire) -> CollectionInfo:
 
 
 def _document_info(item: DocumentWire) -> FileInfo:
-    status = _status_to_file_status(item.status)
+    status = status_to_file_status(item.status)
     return FileInfo(
         file_id=item.document_id,
         file_name=item.filename,
@@ -333,7 +265,7 @@ def _document_info(item: DocumentWire) -> FileInfo:
         chunk_count=item.chunk_count,
         uploaded_at=_parse_timestamp(item.created_at),
         ingested_at=_parse_timestamp(item.updated_at) if status == FileStatus.SUCCESS else None,
-        error_message=item.error,
+        error_message=_public_document_error(item.error),
         metadata={
             "content_sha256": item.content_sha256,
             "document_version": item.document_version,
@@ -356,6 +288,10 @@ class NemoRetrieverRetriever(BaseRetriever):
     def backend_name(self) -> str:
         return _BACKEND_NAME
 
+    def close(self) -> None:
+        """Release the transport created for this retriever instance."""
+        self._transport.close()
+
     async def retrieve(
         self,
         query: str,
@@ -369,13 +305,14 @@ class NemoRetrieverRetriever(BaseRetriever):
                 backend=_BACKEND_NAME,
                 chunks=[],
                 success=False,
-                error_message="NeMo Retriever metadata filters are not supported by the public query contract",
+                error_message=UNSUPPORTED_FILTERS_ERROR,
             )
         try:
             payload = await self._transport.arequest_json(
                 "POST",
                 "/v1/query",
                 operation="query",
+                retryable=True,
                 json={"query": query, "collection_name": collection_name, "top_k": top_k},
             )
             response = _wire(QueryResponseWire, payload, "query")
@@ -401,37 +338,7 @@ class NemoRetrieverRetriever(BaseRetriever):
 
     def normalize(self, raw_result: Any) -> Chunk:
         hit = raw_result if isinstance(raw_result, QueryHitWire) else _wire(QueryHitWire, raw_result, "query hit")
-        metadata = _scrub_metadata(hit.metadata)
-        bounding_box = _bbox(hit.bbox if hit.bbox is not None else hit.bbox_xyxy_norm)
-        metadata.update(
-            {
-                "document_id": hit.document_id,
-                "source": _scrub_metadata(hit.source),
-                "source_id": hit.source_id,
-                "bounding_box": bounding_box,
-            }
-        )
-        content_type = _normalize_content_type(hit.content_type)
-        page_number = hit.page_number
-        citation = f"{hit.filename}, p.{page_number}" if page_number else hit.filename
-        image_storage_uri = hit.stored_image_uri or None
-        image_url = _http_url(image_storage_uri)
-        if image_url is None and content_type == ContentType.IMAGE:
-            image_url = _http_url(hit.source)
-        return Chunk(
-            chunk_id=hit.chunk_id,
-            content=hit.text or "",
-            distance=hit.distance,
-            file_name=hit.filename,
-            page_number=page_number,
-            display_citation=citation,
-            content_type=content_type,
-            content_subtype=hit.content_type if hit.content_type and hit.content_type != content_type.value else None,
-            structured_data=_safe_structured_data(metadata),
-            image_storage_uri=image_storage_uri,
-            image_url=image_url,
-            metadata=metadata,
-        )
+        return normalize_query_hit(hit)
 
     async def health_check(self) -> bool:
         try:
@@ -479,34 +386,12 @@ class NemoRetrieverIngestor(BaseIngestor):
         )
         return _collection_info(_wire(CollectionWire, payload, "create collection"))
 
-    def update_collection(
-        self,
-        name: str,
-        *,
-        description: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        expires_at: datetime | None = None,
-    ) -> CollectionInfo:
-        body: dict[str, Any] = {}
-        if description is not None:
-            body["description"] = description
-        if metadata is not None:
-            body["metadata"] = _scrub_metadata(metadata)
-        if expires_at is not None:
-            body["expires_at"] = expires_at.isoformat()
-        payload = self._transport.request_json(
-            "PATCH",
-            f"/v1/collections/{_resource_path(name)}",
-            operation="update collection",
-            json=body,
-        )
-        return _collection_info(_wire(CollectionWire, payload, "update collection"))
-
     def delete_collection(self, name: str) -> bool:
         payload = self._transport.request_json(
             "DELETE",
             f"/v1/collections/{_resource_path(name)}",
             operation="delete collection",
+            retryable=True,
             params={"if_exists": "true"},
         )
         result = _wire(CollectionDeleteWire, payload, "delete collection")
@@ -551,7 +436,7 @@ class NemoRetrieverIngestor(BaseIngestor):
     ) -> str:
         job_config = dict(config or {})
         originals = [str(value) for value in job_config.get("original_filenames", [])]
-        cleanup_files = bool(job_config.get("cleanup_files", False))
+        cleanup_files = strict_bool(job_config.get("cleanup_files", False), name="cleanup_files")
         descriptors = _descriptors(file_paths, originals)
         manifest = [
             {
@@ -566,6 +451,8 @@ class NemoRetrieverIngestor(BaseIngestor):
             "POST",
             "/v1/ingest/job",
             operation="job creation",
+            retryable=True,
+            compatibility_route=True,
             json={
                 "expected_documents": len(descriptors),
                 "collection_name": collection_name,
@@ -588,6 +475,7 @@ class NemoRetrieverIngestor(BaseIngestor):
                 filename=item.filename,
                 manifest_entry_id=item.manifest_entry_id,
                 metadata=json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+                retryable=True,
             )
             return _wire(UploadAcceptedWire, payload, "job document upload")
 
@@ -632,7 +520,7 @@ class NemoRetrieverIngestor(BaseIngestor):
         attempt_ids: dict[str, str] = {}
         terminal = 0
         for item in documents:
-            status = _status_to_file_status(item.status)
+            status = status_to_file_status(item.status)
             if status in {FileStatus.SUCCESS, FileStatus.FAILED}:
                 terminal += 1
             attempt_ids[item.document_id] = item.attempt_id
@@ -642,7 +530,7 @@ class NemoRetrieverIngestor(BaseIngestor):
                     file_name=item.filename or item.document_id,
                     status=status,
                     progress_percent=100.0 if status in {FileStatus.SUCCESS, FileStatus.FAILED} else 50.0,
-                    error_message=item.error,
+                    error_message=_public_document_error(item.error),
                     chunks_created=max(0, item.result_rows or 0),
                 )
             )
@@ -714,7 +602,7 @@ class NemoRetrieverIngestor(BaseIngestor):
             file_id=item.document_id,
             file_name=Path(file_path).name,
             collection_name=collection_name,
-            status=_status_to_file_status(item.status),
+            status=status_to_file_status(item.status),
             file_size=Path(file_path).stat().st_size,
             uploaded_at=_parse_timestamp(item.created_at),
             metadata={
@@ -730,6 +618,7 @@ class NemoRetrieverIngestor(BaseIngestor):
             "DELETE",
             f"/v1/collections/{_resource_path(collection_name)}/documents/{_resource_path(file_id)}",
             operation="delete document",
+            retryable=True,
             params={"if_exists": "true"},
         )
         result = _wire(DocumentDeleteWire, payload, "delete document")
@@ -777,7 +666,7 @@ class NemoRetrieverIngestor(BaseIngestor):
         for item in self._list_job_documents(job_id):
             if item.document_id != file_id:
                 continue
-            status = _status_to_file_status(item.status)
+            status = status_to_file_status(item.status)
             return FileInfo(
                 file_id=item.document_id,
                 file_name=item.filename or item.document_id,
@@ -787,7 +676,7 @@ class NemoRetrieverIngestor(BaseIngestor):
                 chunk_count=max(0, item.result_rows or 0),
                 uploaded_at=_parse_timestamp(item.submitted_at),
                 ingested_at=_parse_timestamp(item.completed_at) if status == FileStatus.SUCCESS else None,
-                error_message=item.error,
+                error_message=_public_document_error(item.error),
                 metadata={
                     "job_id": item.job_id,
                     "attempt_id": item.attempt_id,

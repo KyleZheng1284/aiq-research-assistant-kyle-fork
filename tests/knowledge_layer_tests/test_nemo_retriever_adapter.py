@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any
 
 import httpx
+import knowledge_layer.nemo_retriever._transport as transport_module
 import pytest
 from knowledge_layer.nemo_retriever._transport import NemoRetrieverCompatibilityError
 from knowledge_layer.nemo_retriever._transport import NemoRetrieverError
@@ -207,12 +208,12 @@ class FakeNRL:
                     "filename": item["filename"],
                     "content_sha256": item["content_sha256"],
                     "document_version": "v1",
-                    "status": "indexed",
+                    "status": item["status"],
                     "chunk_count": item["result_rows"],
                     "job_id": "job-1",
                     "created_at": NOW,
                     "updated_at": NOW,
-                    "error": None,
+                    "error": item["error"],
                 }
                 for item in self.documents.values()
             ]
@@ -251,12 +252,12 @@ class FakeNRL:
                     "filename": item["filename"],
                     "content_sha256": item["content_sha256"],
                     "document_version": "v1",
-                    "status": "indexed",
+                    "status": item["status"],
                     "chunk_count": item["result_rows"],
                     "job_id": "job-1",
                     "created_at": NOW,
                     "updated_at": NOW,
-                    "error": None,
+                    "error": item["error"],
                 },
             )
         return _response(request, 404, {"detail": f"unhandled {method} {path}"})
@@ -543,6 +544,105 @@ def test_async_operations_are_safe_across_event_loops():
     assert second.success
 
 
+def test_injected_client_and_request_headers_are_not_mutated():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _response(request, 200, {"status": "ok"})
+
+    client = httpx.Client(
+        headers={"X-Caller-Default": "preserve"},
+        transport=httpx.MockTransport(handler),
+    )
+    original_client_headers = dict(client.headers)
+    request_headers = {"X-Request-Header": "preserve"}
+    transport = _NRLTransport(
+        base_url="https://nrl.example.test",
+        scope="workspace-123",
+        api_token="super-secret",
+        connect_timeout_s=1,
+        request_timeout_s=5,
+        max_retries=0,
+        verify_ssl=True,
+        ca_bundle=None,
+        client=client,
+    )
+
+    assert dict(client.headers) == original_client_headers
+    transport.request_json("GET", "/v1/health", operation="health check", headers=request_headers)
+
+    assert dict(client.headers) == original_client_headers
+    assert request_headers == {"X-Request-Header": "preserve"}
+    assert requests[0].headers["X-Caller-Default"] == "preserve"
+    assert requests[0].headers["X-Request-Header"] == "preserve"
+    assert requests[0].headers["X-NRL-Scope"] == "workspace-123"
+    assert requests[0].headers["Authorization"] == "Bearer super-secret"
+
+
+@pytest.mark.parametrize("retry_after", ["3600", "inf", "nan"])
+def test_retry_after_is_bounded(monkeypatch: pytest.MonkeyPatch, retry_after: str):
+    calls = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _response(request, 429, headers={"Retry-After": retry_after})
+        return _response(request, 200, {"status": "ok"})
+
+    monkeypatch.setattr(transport_module.time, "sleep", delays.append)
+    transport = _adapter_config(handler, retries=1)["_transport"]
+
+    transport.request_json("GET", "/v1/health", operation="health check")
+
+    assert calls == 2
+    assert len(delays) == 1
+    assert 0 <= delays[0] <= 30.0
+
+
+def test_writes_retry_only_when_explicitly_safe(monkeypatch: pytest.MonkeyPatch):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls in {1, 2}:
+            return _response(request, 503, {"detail": "retry"}, headers={"Retry-After": "0"})
+        return _response(request, 200, {"status": "ok"})
+
+    monkeypatch.setattr(transport_module.time, "sleep", lambda _: None)
+    transport = _adapter_config(handler, retries=1)["_transport"]
+
+    with pytest.raises(NemoRetrieverHTTPError) as error:
+        transport.request_json("POST", "/unsafe", operation="unsafe write", json={})
+    assert error.value.status_code == 503
+    assert calls == 1
+
+    result = transport.request_json(
+        "POST",
+        "/idempotent",
+        operation="idempotent write",
+        retryable=True,
+        json={},
+    )
+    assert result == {"status": "ok"}
+    assert calls == 3
+
+
+def test_adapter_boolean_settings_are_strict():
+    false_config = _adapter_config(FakeNRL())
+    false_config["verify_ssl"] = "false"
+    ingestor = NemoRetrieverIngestor(false_config)
+    assert ingestor._settings.verify_ssl is False
+
+    invalid_config = _adapter_config(FakeNRL())
+    invalid_config["verify_ssl"] = "definitely"
+    with pytest.raises(ValueError, match="nrl_verify_ssl must be a boolean"):
+        NemoRetrieverIngestor(invalid_config)
+
+
 @pytest.mark.parametrize("status", [401, 403, 404, 409, 422])
 def test_non_retryable_http_errors(status):
     calls = 0
@@ -575,7 +675,7 @@ def test_retryable_http_errors(status):
     assert calls == 2
 
 
-def test_timeout_secret_redaction_and_job_api_mismatch():
+def test_timeout_secret_redaction_and_job_api_mismatch(tmp_path):
     secret = "token-that-must-not-leak"  # pragma: allowlist secret
 
     def timeout_handler(request: httpx.Request) -> httpx.Response:
@@ -592,8 +692,15 @@ def test_timeout_secret_redaction_and_job_api_mismatch():
             return _response(request, status_code, {"detail": "missing"})
 
         ingestor = NemoRetrieverIngestor(_adapter_config(mismatch))
-        with pytest.raises(NemoRetrieverCompatibilityError, match="compatible collection-management API versions"):
+        with pytest.raises(NemoRetrieverHTTPError) as error:
             ingestor.get_job_status("missing-job")
+        assert type(error.value) is NemoRetrieverHTTPError
+        assert error.value.status_code == status
+
+        upload = tmp_path / f"upload-{status}.txt"
+        upload.write_text("content", encoding="utf-8")
+        with pytest.raises(NemoRetrieverCompatibilityError, match="compatible collection-management API versions"):
+            ingestor.submit_job([str(upload)], "test")
 
 
 def test_partial_success_and_failed_file_status_mapping():
@@ -645,5 +752,41 @@ def test_partial_success_and_failed_file_status_mapping():
     assert status.status == JobState.COMPLETED
     assert status.error_message
     assert [item.status for item in status.file_details] == [FileStatus.SUCCESS, FileStatus.FAILED]
-    assert status.file_details[1].error_message == "extract failed"
+    assert status.file_details[1].error_message == "NeMo Retriever document ingestion failed"
+    assert "extract failed" not in status.file_details[1].error_message
     assert status.submitted_at == datetime.fromisoformat(NOW).astimezone(UTC)
+
+
+def test_worker_errors_are_contained_in_every_public_document_model(tmp_path):
+    fake = FakeNRL()
+    force_direct_404 = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if force_direct_404 and request.method == "GET" and request.url.path.endswith("/stable-doc-0"):
+            return _response(request, 404, {"detail": "not found"})
+        return fake(request)
+
+    ingestor = NemoRetrieverIngestor(_adapter_config(handler))
+    upload = tmp_path / "report.txt"
+    upload.write_text("content", encoding="utf-8")
+    ingestor.submit_job([str(upload)], "test")
+
+    raw_error = (
+        "Bearer super-secret failed at https://nrl.example.test/v1 "
+        f"using {tmp_path}/private-ca.pem and nrl_{'a' * 40}"
+    )  # pragma: allowlist secret
+    fake.documents["stable-doc-0"]["status"] = "failed"
+    fake.documents["stable-doc-0"]["error"] = raw_error
+
+    job_error = ingestor.get_job_status("job-1").file_details[0].error_message
+    list_error = ingestor.list_files("test")[0].error_message
+    direct_error = ingestor.get_file_status("stable-doc-0", "test").error_message
+    force_direct_404 = True
+    fallback_error = ingestor.get_file_status("stable-doc-0", "test").error_message
+
+    assert {job_error, list_error, direct_error, fallback_error} == {"NeMo Retriever document ingestion failed"}
+    for public_error in (job_error, list_error, direct_error, fallback_error):
+        assert "super-secret" not in public_error
+        assert "nrl.example.test" not in public_error
+        assert str(tmp_path) not in public_error
+        assert f"nrl_{'a' * 40}" not in public_error
