@@ -292,6 +292,7 @@ def _adapter_config(handler: Any, *, token: str = "super-secret", retries: int =
         "max_concurrency": 2,
         "max_queued_uploads": 128,
         "_transport": transport,
+        "warm_start": False,
     }
 
 
