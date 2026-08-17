@@ -274,6 +274,19 @@ def clear_active_ingestor() -> None:
     _ACTIVE_INGESTOR = None
 
 
+def release_ingestor(backend: str, ingestor: BaseIngestor) -> bool:
+    """Remove one expected cached ingestor during a backend lifecycle finalizer.
+
+    The identity check prevents an older finalizer from evicting a replacement
+    instance created for the same backend.
+    """
+    if _INGESTOR_INSTANCES.get(backend) is not ingestor:
+        return False
+    del _INGESTOR_INSTANCES[backend]
+    logger.info("Released singleton ingestor instance for backend: %s", backend)
+    return True
+
+
 # =============================================================================
 # Summary Registry (SQLAlchemy-backed, Backend-Agnostic)
 # =============================================================================

@@ -51,11 +51,19 @@ def _secret_from_env(name: str) -> SecretStr | None:
 
 
 # Type-safe backend selection - Pydantic validates at config load time
-BackendType = Literal["llamaindex", "foundational_rag", "opensearch", "azure_ai_search", "nemo_retriever"]
+BackendType = Literal[
+    "llamaindex",
+    "foundational_rag",
+    "opensearch",
+    "azure_ai_search",
+    "nemo_retriever",
+    "nemo_retriever_local",
+]
 OpenSearchAuthType = Literal["none", "basic", "sigv4"]
 OpenSearchAwsService = Literal["aoss", "es"]
 OpenSearchIngestionMode = Literal["local", "dask", "auto"]
 OpenSearchDaskFileTransfer = Literal["bytes", "paths"]
+NemoRetrieverLocalProfile = Literal["auto", "fast-text"]
 
 
 def _env_value(*names: str, default: str | None = None) -> str | None:
@@ -78,6 +86,19 @@ def _env_optional_bool(name: str) -> bool | None:
     if value is None or value == "":
         return None
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_strict_bool(name: str, default: bool) -> bool:
+    """Parse a security-sensitive boolean without accepting ambiguous strings."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -255,7 +276,7 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
         description="How Dask ingestion workers receive files: bytes or paths.",
     )
     embed_model: str = Field(
-        default_factory=lambda: _env_value("AIQ_EMBED_MODEL", default="nvidia/llama-nemotron-embed-vl-1b-v2"),
+        default_factory=lambda: _env_value("AIQ_EMBED_MODEL", default="nvidia/nemotron-3-embed-1b"),
         description="Embedding model for OpenSearch and Azure AI Search ingestion and retrieval.",
     )
     embed_base_url: str = Field(
@@ -315,7 +336,7 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
         description="Maximum concurrent NeMo Retriever document uploads.",
     )
     nrl_verify_ssl: bool = Field(
-        default_factory=lambda: _env_bool("NRL_VERIFY_SSL", True),
+        default_factory=lambda: _env_strict_bool("NRL_VERIFY_SSL", True),
         description="Verify the NeMo Retriever gateway TLS certificate.",
     )
     nrl_ca_bundle: str | None = Field(
@@ -326,6 +347,47 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
         default_factory=lambda: _env_float("NRL_COLLECTION_TTL_HOURS", 24.0),
         gt=0,
         description="Expiration applied when AIQ creates a NeMo Retriever collection.",
+    )
+    # NeMo Retriever in-process options
+    nrl_local_data_dir: str = Field(
+        default_factory=lambda: _env_value("NRL_LOCAL_DATA_DIR", default=".aiq-data/nemo_retriever"),
+        min_length=1,
+        description="Persistent LanceDB directory used by nemo_retriever_local.",
+    )
+    nrl_local_profile: NemoRetrieverLocalProfile = Field(
+        default_factory=lambda: _env_value("NRL_LOCAL_PROFILE", default="auto"),
+        description="NeMo Retriever extraction profile for local ingestion: auto or fast-text.",
+    )
+    nrl_page_elements_invoke_url: str | None = Field(
+        default_factory=lambda: _env_value("NRL_PAGE_ELEMENTS_INVOKE_URL"),
+        description="Optional Page Elements endpoint override for nemo_retriever_local.",
+    )
+    nrl_ocr_invoke_url: str | None = Field(
+        default_factory=lambda: _env_value("NRL_OCR_INVOKE_URL"),
+        description="Optional OCR endpoint override for nemo_retriever_local.",
+    )
+    nrl_table_structure_invoke_url: str | None = Field(
+        default_factory=lambda: _env_value("NRL_TABLE_STRUCTURE_INVOKE_URL"),
+        description="Optional Table Structure endpoint override for nemo_retriever_local.",
+    )
+    nrl_embed_invoke_url: str | None = Field(
+        default_factory=lambda: _env_value("NRL_EMBED_INVOKE_URL"),
+        description="Optional OpenAI-compatible embedding endpoint override for nemo_retriever_local.",
+    )
+    nrl_embed_model_name: str | None = Field(
+        default_factory=lambda: _env_value("NRL_EMBED_MODEL_NAME"),
+        description="Optional NeMo Retriever embedding model override for local ingestion and queries.",
+    )
+    nrl_embed_model_provider_prefix: str | None = Field(
+        default_factory=lambda: _env_value("NRL_EMBED_MODEL_PROVIDER_PREFIX"),
+        description="Optional embedding provider prefix used by NeMo Retriever local inference.",
+    )
+    nrl_inference_api_key: OptionalSecretStr = Field(
+        default_factory=lambda: _secret_from_env("NRL_INFERENCE_API_KEY"),
+        description=(
+            "Inference key for NeMo Retriever local extraction and embedding; pinned NRL falls back to "
+            "NVIDIA_API_KEY and then NGC_API_KEY when unset."
+        ),
     )
 
     @model_validator(mode="after")
@@ -385,6 +447,14 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
                 logger.warning("TLS verification disabled for nemo_retriever. Use only in trusted environments.")
             if self.nrl_ca_bundle and not self.nrl_verify_ssl:
                 raise ValueError("nrl_ca_bundle cannot be used when nrl_verify_ssl is false")
+        elif backend == "nemo_retriever_local":
+            if not self.nrl_scope or not self.nrl_scope.strip():
+                raise ValueError(
+                    "nemo_retriever_local requires an explicit nrl_scope; "
+                    "the shipped local profile defaults it to 'local'"
+                )
+            if not self.nrl_local_data_dir.strip():
+                raise ValueError("nrl_local_data_dir must not be empty")
 
         return self
 
@@ -503,10 +573,28 @@ def _setup_backend(config: KnowledgeRetrievalConfig, summary_llm_obj=None) -> tu
             **summary_config,
         }
 
+    elif backend == "nemo_retriever_local":
+        import knowledge_layer.nemo_retriever.local_adapter  # noqa: F401
+
+        backend_config = {
+            "data_dir": config.nrl_local_data_dir,
+            "scope": config.nrl_scope,
+            "profile": config.nrl_local_profile,
+            "page_elements_invoke_url": config.nrl_page_elements_invoke_url,
+            "ocr_invoke_url": config.nrl_ocr_invoke_url,
+            "table_structure_invoke_url": config.nrl_table_structure_invoke_url,
+            "embed_invoke_url": config.nrl_embed_invoke_url,
+            "embed_model_name": config.nrl_embed_model_name,
+            "embed_model_provider_prefix": config.nrl_embed_model_provider_prefix,
+            "inference_api_key": config.nrl_inference_api_key,
+            "collection_ttl_hours": config.nrl_collection_ttl_hours,
+            **summary_config,
+        }
+
     else:
         raise ValueError(
             f"Unknown backend: {backend}. Use 'llamaindex', 'foundational_rag', 'opensearch', "
-            "'azure_ai_search', or 'nemo_retriever'."
+            "'azure_ai_search', 'nemo_retriever', or 'nemo_retriever_local'."
         )
 
     os.environ["KNOWLEDGE_RETRIEVER_BACKEND"] = backend
@@ -623,8 +711,17 @@ async def knowledge_retrieval(config: KnowledgeRetrievalConfig, _builder: Builde
     configure_summary_db(config.summary_db)
 
     retriever = _get_retriever(config)
-
-    _initialize_ingestor(config, summary_llm_obj)
+    try:
+        ingestor = _initialize_ingestor(config, summary_llm_obj)
+    except Exception:
+        # The local retriever acquires a reference to the locked embedded
+        # runtime. If ingestor construction fails, NAT never reaches the yield
+        # finalizer, so release that reference here before propagating startup.
+        if config.backend == "nemo_retriever_local":
+            close = getattr(retriever, "close", None)
+            if callable(close):
+                close()
+        raise
 
     collection = config.collection_name
     top_k = config.top_k
@@ -671,12 +768,33 @@ async def knowledge_retrieval(config: KnowledgeRetrievalConfig, _builder: Builde
             logger.error(f"Knowledge search failed: {e}")
             return f"Error searching knowledge base: {str(e)}"
 
-    # Yield the function info for NAT registration
-    yield FunctionInfo.from_fn(
-        search,
-        description=(
-            "Search the knowledge base for relevant documents. "
-            "Use this to find information from ingested PDFs, documents, and other files. "
-            f"Returns up to {top_k} relevant excerpts with citations."
-        ),
-    )
+    try:
+        # Yield the function info for NAT registration.
+        yield FunctionInfo.from_fn(
+            search,
+            description=(
+                "Search the knowledge base for relevant documents. "
+                "Use this to find information from ingested PDFs, documents, and other files. "
+                f"Returns up to {top_k} relevant excerpts with citations."
+            ),
+        )
+    finally:
+        if config.backend == "nemo_retriever_local":
+            from aiq_agent.knowledge.factory import clear_active_ingestor
+            from aiq_agent.knowledge.factory import get_active_ingestor
+            from aiq_agent.knowledge.factory import release_ingestor
+
+            if get_active_ingestor() is ingestor:
+                clear_active_ingestor()
+            release_ingestor(config.backend, ingestor)
+            for component in (retriever, ingestor):
+                close = getattr(component, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.warning(
+                            "Failed to close %s during nemo_retriever_local shutdown",
+                            type(component).__name__,
+                            exc_info=True,
+                        )

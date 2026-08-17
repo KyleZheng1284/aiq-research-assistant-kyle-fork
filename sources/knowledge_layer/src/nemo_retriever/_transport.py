@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import mimetypes
 import re
 import ssl
@@ -19,6 +20,8 @@ from typing import Any
 import httpx
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_MAX_RETRY_DELAY_S = 30.0
 _BEARER_PATTERN = re.compile(r"(?i)bearer\s+[^\s,;]+")
 
 
@@ -59,7 +62,8 @@ def _retry_after_seconds(value: str | None) -> float | None:
     if not value:
         return None
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     except ValueError:
         try:
             retry_at = parsedate_to_datetime(value)
@@ -100,9 +104,8 @@ class _NRLTransport:
         timeout = httpx.Timeout(request_timeout_s, connect=connect_timeout_s)
         limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
         verify = _tls_verify(verify_ssl, ca_bundle)
-        self._client = client or httpx.Client(headers=headers, timeout=timeout, limits=limits, verify=verify)
-        if client is not None:
-            self._client.headers.update(headers)
+        self._headers = httpx.Headers(headers)
+        self._client = client or httpx.Client(timeout=timeout, limits=limits, verify=verify)
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}/{path.lstrip('/')}"
@@ -117,9 +120,15 @@ class _NRLTransport:
     def _backoff(attempt: int) -> float:
         return min(0.5 * (2**attempt), 30.0)
 
-    def _response_error(self, response: httpx.Response, operation: str) -> NemoRetrieverHTTPError:
+    def _response_error(
+        self,
+        response: httpx.Response,
+        operation: str,
+        *,
+        compatibility_route: bool,
+    ) -> NemoRetrieverHTTPError:
         status = response.status_code
-        if operation.startswith("job ") and status in {404, 410}:
+        if compatibility_route and status in {404, 410}:
             return NemoRetrieverCompatibilityError(
                 "NeMo Retriever rejected a job-scoped API route with "
                 f"HTTP {status}. Confirm AIQ and the NRL service use compatible collection-management API versions.",
@@ -140,20 +149,38 @@ class _NRLTransport:
             status_code=status,
         )
 
-    def _should_retry(self, response: httpx.Response, attempt: int) -> bool:
-        return response.status_code in _RETRYABLE_STATUS_CODES and attempt < self._max_retries
+    def _should_retry(self, response: httpx.Response, attempt: int, *, retryable: bool) -> bool:
+        return retryable and response.status_code in _RETRYABLE_STATUS_CODES and attempt < self._max_retries
 
     def _delay(self, response: httpx.Response, attempt: int) -> float:
         retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
-        return retry_after if retry_after is not None else self._backoff(attempt)
+        return min(retry_after, _MAX_RETRY_DELAY_S) if retry_after is not None else self._backoff(attempt)
 
-    def request_json(self, method: str, path: str, *, operation: str, **kwargs: Any) -> Any:
+    def _request_headers(self, supplied: Any = None) -> httpx.Headers:
+        headers = httpx.Headers(self._headers)
+        if supplied is not None:
+            headers.update(supplied)
+        return headers
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        operation: str,
+        retryable: bool = False,
+        compatibility_route: bool = False,
+        **kwargs: Any,
+    ) -> Any:
         url = self._url(path)
+        request_kwargs = dict(kwargs)
+        request_kwargs["headers"] = self._request_headers(request_kwargs.get("headers"))
+        can_retry = method.upper() in _SAFE_METHODS or retryable
         for attempt in range(self._max_retries + 1):
             try:
-                response = self._client.request(method, url, **kwargs)
+                response = self._client.request(method, url, **request_kwargs)
             except httpx.TransportError as error:
-                if attempt >= self._max_retries:
+                if not can_retry or attempt >= self._max_retries:
                     raise NemoRetrieverTransportError(
                         self._redact(
                             f"NeMo Retriever {operation} transport failure after retries: {type(error).__name__}"
@@ -161,11 +188,11 @@ class _NRLTransport:
                     ) from error
                 time.sleep(self._backoff(attempt))
                 continue
-            if self._should_retry(response, attempt):
+            if self._should_retry(response, attempt, retryable=can_retry):
                 time.sleep(self._delay(response, attempt))
                 continue
             if response.status_code >= 400:
-                raise self._response_error(response, operation)
+                raise self._response_error(response, operation, compatibility_route=compatibility_route)
             if not response.content:
                 return None
             try:
@@ -185,6 +212,7 @@ class _NRLTransport:
         filename: str,
         manifest_entry_id: str,
         metadata: str,
+        retryable: bool = False,
     ) -> Any:
         url = self._url(f"/v1/ingest/job/{job_id}/document")
         content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
@@ -193,11 +221,12 @@ class _NRLTransport:
                 with file_path.open("rb") as stream:
                     response = self._client.post(
                         url,
+                        headers=self._request_headers(),
                         files={"file": (filename, stream, content_type)},
                         data={"metadata": metadata, "manifest_entry_id": manifest_entry_id},
                     )
             except (httpx.TransportError, OSError) as error:
-                if attempt >= self._max_retries:
+                if not retryable or attempt >= self._max_retries:
                     raise NemoRetrieverTransportError(
                         self._redact(
                             f"NeMo Retriever upload for {filename!r} failed after retries: {type(error).__name__}"
@@ -205,11 +234,11 @@ class _NRLTransport:
                     ) from error
                 time.sleep(self._backoff(attempt))
                 continue
-            if self._should_retry(response, attempt):
+            if self._should_retry(response, attempt, retryable=retryable):
                 time.sleep(self._delay(response, attempt))
                 continue
             if response.status_code >= 400:
-                raise self._response_error(response, "job document upload")
+                raise self._response_error(response, "job document upload", compatibility_route=True)
             try:
                 return response.json()
             except ValueError as error:
