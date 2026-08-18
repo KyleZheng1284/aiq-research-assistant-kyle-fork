@@ -33,6 +33,8 @@ from aiq_agent.fastapi_extensions.upload_security import submit_validated_upload
 from aiq_agent.fastapi_extensions.upload_security import validate_upload_count
 from aiq_agent.fastapi_extensions.upload_security import validated_upload_batch
 from aiq_agent.knowledge.base import BaseIngestor
+from aiq_agent.knowledge.base import IngestionBatchTooLargeError
+from aiq_agent.knowledge.base import IngestionCapacityError
 from aiq_agent.knowledge.schema import FileInfo
 from aiq_agent.knowledge.schema import IngestionJobStatus
 
@@ -56,8 +58,9 @@ def add_document_routes(router: APIRouter):
         responses={
             400: {"description": "No files provided"},
             404: {"description": "Collection not found"},
-            413: {"description": "Upload size or file-count limit exceeded"},
+            413: {"description": "Upload size, file-count, or ingestion-capacity limit exceeded"},
             415: {"description": "Unsupported, malformed, or mismatched file content"},
+            503: {"description": "Document ingestion is temporarily at capacity"},
             500: {"description": "Ingestion failed"},
         },
     )
@@ -110,6 +113,10 @@ def add_document_routes(router: APIRouter):
 
         except UploadValidationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        except IngestionBatchTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except IngestionCapacityError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except HTTPException:
             raise
         except Exception as exc:

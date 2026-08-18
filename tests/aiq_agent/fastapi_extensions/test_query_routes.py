@@ -42,7 +42,7 @@ def _result(*, success: bool = True) -> RetrievalResult:
         query="What was revenue?",
         backend="nemo_retriever_local",
         success=success,
-        error_message=None if success else "private backend detail",
+        error_message=None if success else "private backend detail at /private/data",
         chunks=[
             Chunk(
                 chunk_id="chunk-1",
@@ -140,6 +140,22 @@ def test_direct_query_redacts_backend_failure(monkeypatch) -> None:
 
     assert exc_info.value.status_code == 502
     assert "private backend detail" not in str(exc_info.value.detail)
+    assert "/private/data" not in str(exc_info.value.detail)
+    retriever.close.assert_called_once_with()
+
+
+def test_direct_query_cleanup_logs_only_safe_error_metadata(monkeypatch, caplog) -> None:
+    endpoint = _query_endpoint()
+    ingestor, retriever = _adapters()
+    retriever.close.side_effect = RuntimeError("secret-token at /private/data")
+    monkeypatch.setattr(routes_module, "get_retriever", Mock(return_value=retriever))
+
+    result = asyncio.run(endpoint(request=_request(), ingestor=ingestor))
+
+    assert result.success is True
+    assert "error_type=RuntimeError" in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "/private/data" not in caplog.text
 
 
 def test_direct_query_http_contract_and_validation(monkeypatch) -> None:

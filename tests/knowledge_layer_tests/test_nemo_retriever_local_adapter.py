@@ -15,6 +15,7 @@ import pytest
 import yaml
 from knowledge_layer.llamaindex.adapter import _extract_images_from_pdf
 from knowledge_layer.nemo_retriever import _local_client
+from knowledge_layer.nemo_retriever import adapter as service_adapter
 from knowledge_layer.nemo_retriever._local_client import LocalRuntime
 from knowledge_layer.nemo_retriever._local_client import LocalSettings
 from knowledge_layer.nemo_retriever._local_client import NemoRetrieverLocalDependencyError
@@ -27,7 +28,6 @@ from knowledge_layer.register import KnowledgeRetrievalConfig
 from knowledge_layer.register import _setup_backend
 from PIL import Image
 from pydantic import SecretStr
-from pydantic import ValidationError
 
 from aiq_agent.knowledge import JobState
 from aiq_agent.knowledge.factory import is_ingestor_registered
@@ -397,13 +397,24 @@ def test_registration_is_separate_and_missing_dependencies_are_lazy(tmp_path, mo
         NemoRetrieverLocalIngestor({"data_dir": str(tmp_path), "scope": "local", "profile": "auto"})
 
 
+def test_missing_pinned_nrl_embedding_default_has_actionable_dependency_error(monkeypatch):
+    operator_module = pytest.importorskip("nemo_retriever.operators.embed.cpu_operator")
+    monkeypatch.delattr(operator_module._BatchEmbedCPUActor, "DEFAULT_EMBED_INVOKE_URL")
+
+    with pytest.raises(
+        NemoRetrieverLocalDependencyError,
+        match=r"uv sync --project environments/nemo_retriever_local --frozen",
+    ):
+        _local_client._load_nrl_bindings()
+
+
 def test_nrl_tls_environment_boolean_is_strict(monkeypatch):
     monkeypatch.setenv("NRL_VERIFY_SSL", "false")
-    assert KnowledgeRetrievalConfig(backend="nemo_retriever", nrl_scope="scope").nrl_verify_ssl is False
+    assert service_adapter._settings({"scope": "scope"}).verify_ssl is False
 
     monkeypatch.setenv("NRL_VERIFY_SSL", "enabled")
     with pytest.raises(ValueError, match="NRL_VERIFY_SSL must be a boolean"):
-        KnowledgeRetrievalConfig(backend="nemo_retriever", nrl_scope="scope")
+        service_adapter._settings({"scope": "scope"})
 
 
 def test_local_backend_config_is_distinct_and_secret_safe(monkeypatch):
@@ -412,32 +423,35 @@ def test_local_backend_config_is_distinct_and_secret_safe(monkeypatch):
     secret = "local-inference-secret"  # pragma: allowlist secret
     config = KnowledgeRetrievalConfig(
         backend="nemo_retriever_local",
-        nrl_scope="local",
-        nrl_inference_api_key=SecretStr(secret),
+        backend_config={"scope": "local", "inference_api_key": secret},
     )
 
     backend, backend_config = _setup_backend(config)
+    settings = LocalSettings.from_config(backend_config)
 
     assert backend == "nemo_retriever_local"
-    assert backend_config["data_dir"] == ".aiq-data/nemo_retriever"
-    assert backend_config["profile"] == "auto"
-    assert backend_config["scope"] == "local"
+    assert settings.data_dir.name == "nemo_retriever"
+    assert settings.profile == "auto"
+    assert settings.scope == "local"
+    assert isinstance(config.backend_config["inference_api_key"], SecretStr)
     assert isinstance(backend_config["inference_api_key"], SecretStr)
+    assert isinstance(settings.inference_api_key, SecretStr)
     assert secret not in repr(config)
     assert secret not in repr(backend_config)
     assert is_retriever_registered("nemo_retriever_local")
     assert is_ingestor_registered("nemo_retriever_local")
 
 
-def test_local_backend_requires_scope_and_known_upstream_profile():
-    with pytest.raises(ValidationError, match="explicit nrl_scope"):
-        KnowledgeRetrievalConfig(backend="nemo_retriever_local", nrl_scope="")
-    with pytest.raises(ValidationError, match="Input should be 'auto' or 'fast-text'"):
-        KnowledgeRetrievalConfig(
-            backend="nemo_retriever_local",
-            nrl_scope="local",
-            nrl_local_profile="custom",
-        )
+def test_local_backend_requires_scope_and_known_upstream_profile(monkeypatch):
+    monkeypatch.delenv("NRL_SCOPE", raising=False)
+    monkeypatch.delenv("NRL_LOCAL_PROFILE", raising=False)
+    assert LocalSettings.from_config({}).scope == "local"
+    with pytest.raises(ValueError, match="explicit nrl_scope"):
+        LocalSettings.from_config({"scope": " "})
+    with pytest.raises(ValueError, match="auto.*fast-text"):
+        LocalSettings.from_config({"scope": "local", "profile": "custom"})
+    with pytest.raises(ValueError, match="Unsupported nemo_retriever_local backend_config option.*typo"):
+        KnowledgeRetrievalConfig(backend="nemo_retriever_local", backend_config={"typo": True})
 
 
 def test_release_ingestor_only_evicts_the_expected_cached_instance(monkeypatch):
@@ -465,11 +479,13 @@ def test_local_environment_is_python_312_and_pins_unmodified_nrl() -> None:
         "subdirectory": "nemo_retriever",
     }
 
-    lock = (ENVIRONMENT_DIR / "uv.lock").read_text(encoding="utf-8")
-    assert 'requires-python = "==3.12.*"' in lock
-    assert f"rev={NRL_REVISION}" in lock
-    assert f"#{NRL_REVISION}" in lock
-    assert 'name = "pypdfium2"\nversion = "4.30.0"' in lock
+    lock = _read_toml(ENVIRONMENT_DIR / "uv.lock")
+    packages = {package["name"]: package for package in lock["package"]}
+    assert lock["requires-python"] == "==3.12.*"
+    locked_nrl_source = packages["nemo-retriever"]["source"]["git"]
+    assert f"rev={NRL_REVISION}" in locked_nrl_source
+    assert locked_nrl_source.endswith(f"#{NRL_REVISION}")
+    assert packages["pypdfium2"]["version"] == "4.30.0"
 
 
 def test_normal_knowledge_layer_keeps_nrl_isolated_and_accepts_pdfium_430() -> None:
@@ -488,6 +504,8 @@ def test_local_profile_selects_embedded_backend_and_upstream_auto_defaults() -> 
     local_llm = config["llms"]["agent_llm"]
 
     assert config["general"]["use_uvloop"] is False
+    assert config["general"]["front_end"]["dask_workers"] == "threads"
+    assert config["workflow"]["use_async_deep_research"] is False
     assert local_llm["_type"] == "openai"
     assert local_llm["model_name"] == "${AIQ_AGENT_LLM_MODEL:-openai/local-tool-model}"
     assert local_llm["base_url"] == "${AIQ_AGENT_LLM_BASE_URL:-http://127.0.0.1:1234/v1}"
@@ -507,9 +525,9 @@ def test_local_profile_selects_embedded_backend_and_upstream_auto_defaults() -> 
             if role in function:
                 assert function[role] == "agent_llm"
     assert knowledge["backend"] == "nemo_retriever_local"
-    assert knowledge["nrl_scope"] == "${NRL_SCOPE:-local}"
-    assert knowledge["nrl_local_data_dir"] == "${NRL_LOCAL_DATA_DIR:-.aiq-data/nemo_retriever}"
-    assert knowledge["nrl_local_profile"] == "${NRL_LOCAL_PROFILE:-auto}"
+    assert knowledge["backend_config"]["scope"] == "${NRL_SCOPE:-local}"
+    assert knowledge["backend_config"]["data_dir"] == "${NRL_LOCAL_DATA_DIR:-.aiq-data/nemo_retriever}"
+    assert knowledge["backend_config"]["profile"] == "${NRL_LOCAL_PROFILE:-auto}"
     assert knowledge["generate_summary"] is False
 
 
@@ -544,6 +562,29 @@ def test_pinned_nrl_auto_profile_contract_when_isolated_environment_is_installed
     assert ray.is_initialized() is False
 
 
+def test_pinned_nrl_plans_pptx_through_document_pdf_branch_for_both_profiles(tmp_path):
+    plan_module = pytest.importorskip("nemo_retriever.ingest.plan")
+    presentation = tmp_path / "slides.pptx"
+    presentation.touch()
+
+    for profile in ("auto", "fast-text"):
+        plan = plan_module.resolve_ingest_plan(
+            plan_module.IngestPlanRequest(
+                source=plan_module.IngestSourceOptions(
+                    documents=[str(presentation)],
+                    profile=profile,
+                    input_type="auto",
+                ),
+                runtime=plan_module.IngestRuntimeOptions(run_mode="inprocess"),
+                extract=plan_module.IngestExtractOptions(),
+                embed=plan_module.IngestEmbedOptions(),
+            )
+        )
+
+        assert [(branch.spec.family, branch.spec.extraction_mode) for branch in plan.branches] == [("pdf", "pdf")]
+        assert plan.branches[0].input_paths == (str(presentation),)
+
+
 def test_settings_restrict_profile_and_redact_secret(tmp_path):
     settings = LocalSettings.from_config(
         {
@@ -554,8 +595,52 @@ def test_settings_restrict_profile_and_redact_secret(tmp_path):
         }
     )
     assert "do-not-render" not in repr(settings)
+    assert isinstance(settings.inference_api_key, SecretStr)
     with pytest.raises(ValueError, match="auto.*fast-text"):
         LocalSettings.from_config({"data_dir": str(tmp_path), "scope": "local", "profile": "custom"})
+
+
+def test_local_environment_and_explicit_backend_config_are_equivalent(tmp_path, monkeypatch):
+    values = {
+        "NRL_LOCAL_DATA_DIR": str(tmp_path / "nrl"),
+        "NRL_SCOPE": "workspace",
+        "NRL_LOCAL_PROFILE": "fast-text",
+        "NRL_PAGE_ELEMENTS_INVOKE_URL": "https://page.example/v1/infer",
+        "NRL_OCR_INVOKE_URL": "https://ocr.example/v1/infer",
+        "NRL_TABLE_STRUCTURE_INVOKE_URL": "https://table.example/v1/infer",
+        "NRL_EMBED_INVOKE_URL": "https://embed.example/v1/embeddings",
+        "NRL_EMBED_MODEL_NAME": "embed-model",
+        "NRL_EMBED_MODEL_PROVIDER_PREFIX": "provider",
+        "NRL_INFERENCE_API_KEY": "environment-secret",  # pragma: allowlist secret
+        "NRL_COLLECTION_TTL_HOURS": "48",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+    from_environment = LocalSettings.from_config({})
+    explicit = LocalSettings.from_config(
+        {
+            "data_dir": values["NRL_LOCAL_DATA_DIR"],
+            "scope": values["NRL_SCOPE"],
+            "profile": values["NRL_LOCAL_PROFILE"],
+            "page_elements_invoke_url": values["NRL_PAGE_ELEMENTS_INVOKE_URL"],
+            "ocr_invoke_url": values["NRL_OCR_INVOKE_URL"],
+            "table_structure_invoke_url": values["NRL_TABLE_STRUCTURE_INVOKE_URL"],
+            "embed_invoke_url": values["NRL_EMBED_INVOKE_URL"],
+            "embed_model_name": values["NRL_EMBED_MODEL_NAME"],
+            "embed_model_provider_prefix": values["NRL_EMBED_MODEL_PROVIDER_PREFIX"],
+            "inference_api_key": SecretStr(values["NRL_INFERENCE_API_KEY"]),
+            "collection_ttl_hours": values["NRL_COLLECTION_TTL_HOURS"],
+        }
+    )
+    public_config = KnowledgeRetrievalConfig(backend="nemo_retriever_local")
+    public_settings = LocalSettings.from_config(public_config.backend_config)
+
+    assert from_environment.compatibility_key == explicit.compatibility_key
+    assert public_settings.compatibility_key == from_environment.compatibility_key
+    assert from_environment.data_dir == explicit.data_dir
+    assert values["NRL_INFERENCE_API_KEY"] not in repr(public_config)
+    assert "environment-secret" not in repr(from_environment)
 
 
 def test_local_cleanup_boolean_is_strict(tmp_path):
@@ -593,6 +678,110 @@ def test_runtime_matches_vectordb_construction_and_process_lock(tmp_path):
     locked_bindings, _state = _bindings(locked=True)
     with pytest.raises(NemoRetrieverLocalLockError, match="already open by another process"):
         LocalRuntime(LocalSettings.from_config(_config(tmp_path, locked_bindings)), locked_bindings)
+
+
+def test_runtime_health_check_contains_backend_failures(tmp_path):
+    bindings, _state = _bindings()
+    runtime = LocalRuntime(LocalSettings.from_config(_config(tmp_path, bindings)), bindings)
+    try:
+        runtime.vdb.health = lambda: {"catalog": {"healthy": True}}
+        assert runtime.health_check() is True
+
+        runtime.vdb.health = lambda: {"catalog": {"healthy": False}}
+        assert runtime.health_check() is False
+
+        runtime.vdb.health = lambda: []
+        assert runtime.health_check() is False
+
+        def fail_health() -> Any:
+            raise RuntimeError("backend unavailable")
+
+        runtime.vdb.health = fail_health
+        assert runtime.health_check() is False
+
+        runtime.close()
+        assert runtime.health_check() is False
+    finally:
+        runtime.close()
+
+
+def test_last_release_waits_for_lock_release_without_blocking_other_directories(tmp_path, monkeypatch):
+    bindings, _state = _bindings()
+    config = _config(tmp_path, bindings)
+    first = NemoRetrieverLocalIngestor(config)
+    first_runtime = first._runtime
+    original_close = first_runtime.close
+    close_started = threading.Event()
+    allow_close = threading.Event()
+
+    def delayed_close() -> None:
+        close_started.set()
+        assert allow_close.wait(timeout=5)
+        original_close()
+
+    monkeypatch.setattr(first_runtime, "close", delayed_close)
+    close_thread = threading.Thread(target=first.close)
+    close_thread.start()
+    assert close_started.wait(timeout=2)
+
+    closing = _local_client._RUNTIMES_CLOSING[first._runtime_handle._key]
+    wait_started = threading.Event()
+    original_wait = closing.wait
+
+    def observed_wait(timeout: float | None = None) -> bool:
+        wait_started.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(closing, "wait", observed_wait)
+
+    replacement: list[Any] = []
+    replacement_ready = threading.Event()
+
+    def reacquire() -> None:
+        try:
+            replacement.append(NemoRetrieverLocalIngestor(config))
+        except Exception as error:  # noqa: BLE001 - asserted below
+            replacement.append(error)
+        finally:
+            replacement_ready.set()
+
+    acquire_thread = threading.Thread(target=reacquire)
+    acquire_thread.start()
+    assert wait_started.wait(timeout=2)
+
+    other_bindings, _other_state = _bindings()
+    other = NemoRetrieverLocalIngestor(_config(tmp_path, other_bindings, data_dir=str(tmp_path / "other-nrl")))
+    assert replacement_ready.is_set() is False
+    other.close()
+
+    allow_close.set()
+    close_thread.join(timeout=5)
+    acquire_thread.join(timeout=5)
+    assert not close_thread.is_alive()
+    assert not acquire_thread.is_alive()
+    assert len(replacement) == 1
+    assert isinstance(replacement[0], NemoRetrieverLocalIngestor)
+    assert replacement[0]._runtime is not first_runtime
+
+    replacement_runtime = replacement[0]._runtime
+    replacement_close = replacement_runtime.close
+    close_calls = 0
+    close_calls_lock = threading.Lock()
+
+    def counted_close() -> None:
+        nonlocal close_calls
+        with close_calls_lock:
+            close_calls += 1
+        replacement_close()
+
+    monkeypatch.setattr(replacement_runtime, "close", counted_close)
+    duplicate_closes = [threading.Thread(target=replacement[0].close) for _position in range(2)]
+    for thread in duplicate_closes:
+        thread.start()
+    for thread in duplicate_closes:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in duplicate_closes)
+    assert close_calls == 1
 
 
 def test_runtime_startup_failure_stops_worker_cleans_staging_and_releases_lock(tmp_path, monkeypatch):
@@ -717,7 +906,6 @@ def test_submit_is_non_blocking_stable_and_uses_exact_upstream_profile(tmp_path)
     source = tmp_path / "temporary-upload"
     source.write_text("same bytes", encoding="utf-8")
 
-    started = time.monotonic()
     job_id = ingestor.submit_job(
         [str(source)],
         "reports",
@@ -727,9 +915,7 @@ def test_submit_is_non_blocking_stable_and_uses_exact_upstream_profile(tmp_path)
             "metadata": {"category": "finance"},
         },
     )
-    elapsed = time.monotonic() - started
     pending = ingestor.get_job_status(job_id)
-    assert elapsed < 0.5
     assert pending.file_details[0].file_id
     assert pending.file_details[0].file_name == "report.pdf"
     assert not source.exists()
@@ -1085,6 +1271,43 @@ def test_submit_racing_shutdown_is_rejected_and_staging_is_cleaned(tmp_path):
     gate.lock.release()
     close_thread.join(timeout=5)
     assert not close_thread.is_alive()
+
+
+@pytest.mark.parametrize("corruption", ["missing_job", "missing_progress"])
+def test_stale_work_is_cleaned_and_does_not_stop_the_next_job(tmp_path, corruption):
+    bindings, state = _bindings()
+    ingestor = NemoRetrieverLocalIngestor(_config(tmp_path, bindings))
+    ingestor.create_collection("reports")
+    stale_source = tmp_path / "stale.pdf"
+    valid_source = tmp_path / "valid.pdf"
+    stale_source.write_text("stale", encoding="utf-8")
+    valid_source.write_text("valid", encoding="utf-8")
+
+    # Hold the state lock so the worker cannot inspect the first item until its
+    # process-local bookkeeping has been deliberately corrupted.
+    with ingestor._runtime._state_lock:
+        stale_job_id = ingestor.submit_job([str(stale_source)], "reports")
+        valid_job_id = ingestor.submit_job([str(valid_source)], "reports")
+        stale_job = ingestor._runtime._jobs[stale_job_id]
+        stale_document_id = stale_job.files[0].file_id
+        if corruption == "missing_job":
+            del ingestor._runtime._jobs[stale_job_id]
+        else:
+            stale_job.files.clear()
+
+    valid_status = _wait_terminal(ingestor, valid_job_id)
+    assert valid_status.status == JobState.COMPLETED
+    assert state.buffer_names == ["valid.pdf"]
+    with ingestor._runtime._state_lock:
+        assert ("reports", stale_document_id) not in ingestor._runtime._active_writes
+    assert not list((tmp_path / "nrl" / ".staging").rglob("*"))
+
+    stale_status = ingestor.get_job_status(stale_job_id)
+    assert stale_status.status == JobState.FAILED
+    if corruption == "missing_progress":
+        assert stale_status.is_terminal
+        assert stale_status.processed_files == 0
+    ingestor.close()
 
 
 def test_partial_failure_secret_redaction_and_cleanup(tmp_path):

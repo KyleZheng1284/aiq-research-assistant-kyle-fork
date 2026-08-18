@@ -206,8 +206,12 @@ def add_collection_routes(router: APIRouter):
             if callable(close):
                 try:
                     await asyncio.to_thread(close)
-                except Exception:
-                    logger.warning("Failed to close knowledge retriever", exc_info=True)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to close knowledge component (component=%s, error_type=%s)",
+                        type(retriever).__name__,
+                        type(exc).__name__,
+                    )
 
         if not result.success:
             logger.warning("Knowledge retrieval returned a failure (backend=%s)", ingestor.backend_name)
