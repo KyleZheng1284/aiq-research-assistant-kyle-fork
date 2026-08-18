@@ -24,13 +24,14 @@ CONFIG_GLOBS = (
     "configs/config_*.yml",
     "frontends/benchmarks/**/configs/*.yml",
 )
-LOCAL_PROFILE_SUFFIX = ".gpt5nano.local.yml"
+# Generated, git-ignored GPT-5 Nano profiles are intentionally excluded from shipped-profile endpoint policy.
+GPT5_NANO_LOCAL_SUFFIX = ".gpt5nano.local.yml"
 CONFIG_PATHS = tuple(
     sorted(
         path
         for pattern in CONFIG_GLOBS
         for path in REPO_ROOT.glob(pattern)
-        if not path.name.endswith(LOCAL_PROFILE_SUFFIX)
+        if not path.name.endswith(GPT5_NANO_LOCAL_SUFFIX)
     )
 )
 FRESHQA_CONFIG_PATHS = tuple(sorted(REPO_ROOT.glob("frontends/benchmarks/freshqa/configs/*.yml")))
@@ -233,7 +234,7 @@ def test_deprecated_model_and_endpoint_references_are_absent():
     for path in REPO_ROOT.rglob("*"):
         if (
             not path.is_file()
-            or path.name.endswith(LOCAL_PROFILE_SUFFIX)
+            or path.name.endswith(GPT5_NANO_LOCAL_SUFFIX)
             or path.suffix not in SCANNED_SUFFIXES
             or IGNORED_PARTS.intersection(path.parts)
         ):

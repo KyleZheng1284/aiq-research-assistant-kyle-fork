@@ -13,6 +13,8 @@ general:
   front_end:
     _type: aiq_api
     runner_class: aiq_api.plugin.AIQAPIWorker
+    # Embedded Retriever owns a process-lifetime data-directory lock.
+    dask_workers: threads
     db_url: ${NAT_JOB_STORE_DB_URL:-sqlite+aiosqlite:///./jobs.db}
     expiry_seconds: 86400
     cors:
@@ -56,17 +58,18 @@ functions:
     collection_name: ${COLLECTION_NAME:-aiq-nrl-local}
     top_k: 5
     generate_summary: false
-    nrl_scope: ${NRL_SCOPE:-local}
-    nrl_local_data_dir: ${NRL_LOCAL_DATA_DIR:-.aiq-data/nemo_retriever}
-    nrl_local_profile: ${NRL_LOCAL_PROFILE:-auto}
-    nrl_page_elements_invoke_url: ${NRL_PAGE_ELEMENTS_INVOKE_URL:-}
-    nrl_ocr_invoke_url: ${NRL_OCR_INVOKE_URL:-}
-    nrl_table_structure_invoke_url: ${NRL_TABLE_STRUCTURE_INVOKE_URL:-}
-    nrl_embed_invoke_url: ${NRL_EMBED_INVOKE_URL:-}
-    nrl_embed_model_name: ${NRL_EMBED_MODEL_NAME:-}
-    nrl_embed_model_provider_prefix: ${NRL_EMBED_MODEL_PROVIDER_PREFIX:-}
-    nrl_inference_api_key: ${NRL_INFERENCE_API_KEY:-}
-    nrl_collection_ttl_hours: ${NRL_COLLECTION_TTL_HOURS:-24}
+    backend_config:
+      scope: ${NRL_SCOPE:-local}
+      data_dir: ${NRL_LOCAL_DATA_DIR:-.aiq-data/nemo_retriever}
+      profile: ${NRL_LOCAL_PROFILE:-auto}
+      page_elements_invoke_url: ${NRL_PAGE_ELEMENTS_INVOKE_URL:-}
+      ocr_invoke_url: ${NRL_OCR_INVOKE_URL:-}
+      table_structure_invoke_url: ${NRL_TABLE_STRUCTURE_INVOKE_URL:-}
+      embed_invoke_url: ${NRL_EMBED_INVOKE_URL:-}
+      embed_model_name: ${NRL_EMBED_MODEL_NAME:-}
+      embed_model_provider_prefix: ${NRL_EMBED_MODEL_PROVIDER_PREFIX:-}
+      inference_api_key: ${NRL_INFERENCE_API_KEY:-}
+      collection_ttl_hours: ${NRL_COLLECTION_TTL_HOURS:-24}
 
   intent_classifier:
     _type: intent_classifier
@@ -102,5 +105,6 @@ workflow:
   verbose: true
   enable_escalation: true
   enable_clarifier: true
-  use_async_deep_research: true
+  # Keep full research in this process; detached process jobs require service mode.
+  use_async_deep_research: false
   checkpoint_db: ${AIQ_CHECKPOINT_DB:-./checkpoints.db}

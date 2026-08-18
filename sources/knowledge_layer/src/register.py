@@ -63,7 +63,6 @@ OpenSearchAuthType = Literal["none", "basic", "sigv4"]
 OpenSearchAwsService = Literal["aoss", "es"]
 OpenSearchIngestionMode = Literal["local", "dask", "auto"]
 OpenSearchDaskFileTransfer = Literal["bytes", "paths"]
-NemoRetrieverLocalProfile = Literal["auto", "fast-text"]
 
 
 def _env_value(*names: str, default: str | None = None) -> str | None:
@@ -88,19 +87,6 @@ def _env_optional_bool(name: str) -> bool | None:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
-def _env_strict_bool(name: str, default: bool) -> bool:
-    """Parse a security-sensitive boolean without accepting ambiguous strings."""
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be a boolean")
-
-
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     return int(value) if value is not None and value != "" else default
@@ -117,6 +103,10 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
     backend: BackendType = Field(default="llamaindex", description="Knowledge backend to use")
     collection_name: str = Field(default="default", description="Name of the collection/index to search")
     top_k: int = Field(default=5, description="Number of results to return")
+    backend_config: dict[str, object] = Field(
+        default_factory=dict,
+        description="Backend-owned configuration passed unchanged to the selected knowledge adapter.",
+    )
     # Summarization options (applies to all backends)
     generate_summary: bool = Field(
         default=False, description="Generate one-sentence summary for each ingested document"
@@ -302,93 +292,6 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
         gt=0,
         description="Embedding dimensions; defaults to AIQ_EMBED_DIM and must match existing indexes",
     )
-    # NeMo Retriever service options
-    nrl_base_url: str = Field(
-        default_factory=lambda: _env_value("NRL_BASE_URL", default="http://127.0.0.1:7670"),
-        description="Public NeMo Retriever gateway URL (nemo_retriever only).",
-    )
-    nrl_api_token: OptionalSecretStr = Field(
-        default_factory=lambda: _secret_from_env("NRL_API_TOKEN"),
-        description="Optional NeMo Retriever bearer token; defaults to NRL_API_TOKEN.",
-    )
-    nrl_scope: str | None = Field(
-        default_factory=lambda: _env_value("NRL_SCOPE"),
-        description="Required NeMo Retriever workspace scope; defaults to NRL_SCOPE.",
-    )
-    nrl_connect_timeout_s: float = Field(
-        default_factory=lambda: _env_float("NRL_CONNECT_TIMEOUT_S", 30.0),
-        gt=0,
-        description="NeMo Retriever connection timeout in seconds.",
-    )
-    nrl_request_timeout_s: float = Field(
-        default_factory=lambda: _env_float("NRL_REQUEST_TIMEOUT_S", 300.0),
-        gt=0,
-        description="NeMo Retriever request timeout in seconds.",
-    )
-    nrl_max_retries: int = Field(
-        default_factory=lambda: _env_int("NRL_MAX_RETRIES", 5),
-        ge=0,
-        description="Maximum retries for transient NeMo Retriever failures.",
-    )
-    nrl_max_concurrency: int = Field(
-        default_factory=lambda: _env_int("NRL_MAX_CONCURRENCY", 8),
-        ge=1,
-        description="Maximum concurrent NeMo Retriever document uploads.",
-    )
-    nrl_verify_ssl: bool = Field(
-        default_factory=lambda: _env_strict_bool("NRL_VERIFY_SSL", True),
-        description="Verify the NeMo Retriever gateway TLS certificate.",
-    )
-    nrl_ca_bundle: str | None = Field(
-        default_factory=lambda: _env_value("NRL_CA_BUNDLE"),
-        description="Optional CA bundle path for the NeMo Retriever gateway.",
-    )
-    nrl_collection_ttl_hours: float = Field(
-        default_factory=lambda: _env_float("NRL_COLLECTION_TTL_HOURS", 24.0),
-        gt=0,
-        description="Expiration applied when AIQ creates a NeMo Retriever collection.",
-    )
-    # NeMo Retriever in-process options
-    nrl_local_data_dir: str = Field(
-        default_factory=lambda: _env_value("NRL_LOCAL_DATA_DIR", default=".aiq-data/nemo_retriever"),
-        min_length=1,
-        description="Persistent LanceDB directory used by nemo_retriever_local.",
-    )
-    nrl_local_profile: NemoRetrieverLocalProfile = Field(
-        default_factory=lambda: _env_value("NRL_LOCAL_PROFILE", default="auto"),
-        description="NeMo Retriever extraction profile for local ingestion: auto or fast-text.",
-    )
-    nrl_page_elements_invoke_url: str | None = Field(
-        default_factory=lambda: _env_value("NRL_PAGE_ELEMENTS_INVOKE_URL"),
-        description="Optional Page Elements endpoint override for nemo_retriever_local.",
-    )
-    nrl_ocr_invoke_url: str | None = Field(
-        default_factory=lambda: _env_value("NRL_OCR_INVOKE_URL"),
-        description="Optional OCR endpoint override for nemo_retriever_local.",
-    )
-    nrl_table_structure_invoke_url: str | None = Field(
-        default_factory=lambda: _env_value("NRL_TABLE_STRUCTURE_INVOKE_URL"),
-        description="Optional Table Structure endpoint override for nemo_retriever_local.",
-    )
-    nrl_embed_invoke_url: str | None = Field(
-        default_factory=lambda: _env_value("NRL_EMBED_INVOKE_URL"),
-        description="Optional OpenAI-compatible embedding endpoint override for nemo_retriever_local.",
-    )
-    nrl_embed_model_name: str | None = Field(
-        default_factory=lambda: _env_value("NRL_EMBED_MODEL_NAME"),
-        description="Optional NeMo Retriever embedding model override for local ingestion and queries.",
-    )
-    nrl_embed_model_provider_prefix: str | None = Field(
-        default_factory=lambda: _env_value("NRL_EMBED_MODEL_PROVIDER_PREFIX"),
-        description="Optional embedding provider prefix used by NeMo Retriever local inference.",
-    )
-    nrl_inference_api_key: OptionalSecretStr = Field(
-        default_factory=lambda: _secret_from_env("NRL_INFERENCE_API_KEY"),
-        description=(
-            "Inference key for NeMo Retriever local extraction and embedding; pinned NRL falls back to "
-            "NVIDIA_API_KEY and then NGC_API_KEY when unset."
-        ),
-    )
 
     @model_validator(mode="after")
     def validate_backend_config(self):
@@ -441,21 +344,13 @@ class KnowledgeRetrievalConfig(FunctionBaseConfig, name="knowledge_retrieval"):
             if self.azure_search_endpoint is None:
                 raise ValueError("azure_ai_search requires azure_search_endpoint")
         elif backend == "nemo_retriever":
-            if not self.nrl_scope or not self.nrl_scope.strip():
-                raise ValueError("nemo_retriever requires an explicit nrl_scope")
-            if not self.nrl_verify_ssl:
-                logger.warning("TLS verification disabled for nemo_retriever. Use only in trusted environments.")
-            if self.nrl_ca_bundle and not self.nrl_verify_ssl:
-                raise ValueError("nrl_ca_bundle cannot be used when nrl_verify_ssl is false")
-        elif backend == "nemo_retriever_local":
-            if not self.nrl_scope or not self.nrl_scope.strip():
-                raise ValueError(
-                    "nemo_retriever_local requires an explicit nrl_scope; "
-                    "the shipped local profile defaults it to 'local'"
-                )
-            if not self.nrl_local_data_dir.strip():
-                raise ValueError("nrl_local_data_dir must not be empty")
+            from knowledge_layer.nemo_retriever.adapter import normalize_backend_config
 
+            self.backend_config = normalize_backend_config(self.backend_config)
+        elif backend == "nemo_retriever_local":
+            from knowledge_layer.nemo_retriever._local_client import normalize_backend_config
+
+            self.backend_config = normalize_backend_config(self.backend_config)
         return self
 
 
@@ -560,16 +455,7 @@ def _setup_backend(config: KnowledgeRetrievalConfig, summary_llm_obj=None) -> tu
         import knowledge_layer.nemo_retriever.adapter  # noqa: F401
 
         backend_config = {
-            "base_url": config.nrl_base_url,
-            "api_token": config.nrl_api_token,
-            "scope": config.nrl_scope,
-            "connect_timeout_s": config.nrl_connect_timeout_s,
-            "request_timeout_s": config.nrl_request_timeout_s,
-            "max_retries": config.nrl_max_retries,
-            "max_concurrency": config.nrl_max_concurrency,
-            "verify_ssl": config.nrl_verify_ssl,
-            "ca_bundle": config.nrl_ca_bundle,
-            "collection_ttl_hours": config.nrl_collection_ttl_hours,
+            **config.backend_config,
             **summary_config,
         }
 
@@ -577,17 +463,7 @@ def _setup_backend(config: KnowledgeRetrievalConfig, summary_llm_obj=None) -> tu
         import knowledge_layer.nemo_retriever.local_adapter  # noqa: F401
 
         backend_config = {
-            "data_dir": config.nrl_local_data_dir,
-            "scope": config.nrl_scope,
-            "profile": config.nrl_local_profile,
-            "page_elements_invoke_url": config.nrl_page_elements_invoke_url,
-            "ocr_invoke_url": config.nrl_ocr_invoke_url,
-            "table_structure_invoke_url": config.nrl_table_structure_invoke_url,
-            "embed_invoke_url": config.nrl_embed_invoke_url,
-            "embed_model_name": config.nrl_embed_model_name,
-            "embed_model_provider_prefix": config.nrl_embed_model_provider_prefix,
-            "inference_api_key": config.nrl_inference_api_key,
-            "collection_ttl_hours": config.nrl_collection_ttl_hours,
+            **config.backend_config,
             **summary_config,
         }
 
@@ -779,7 +655,7 @@ async def knowledge_retrieval(config: KnowledgeRetrievalConfig, _builder: Builde
             ),
         )
     finally:
-        if config.backend == "nemo_retriever_local":
+        if config.backend in {"nemo_retriever", "nemo_retriever_local"}:
             from aiq_agent.knowledge.factory import clear_active_ingestor
             from aiq_agent.knowledge.factory import get_active_ingestor
             from aiq_agent.knowledge.factory import release_ingestor
@@ -792,9 +668,10 @@ async def knowledge_retrieval(config: KnowledgeRetrievalConfig, _builder: Builde
                 if callable(close):
                     try:
                         close()
-                    except Exception:
+                    except Exception as exc:
                         logger.warning(
-                            "Failed to close %s during nemo_retriever_local shutdown",
+                            "Failed to close NeMo Retriever component (backend=%s, component=%s, error_type=%s)",
+                            config.backend,
                             type(component).__name__,
-                            exc_info=True,
+                            type(exc).__name__,
                         )

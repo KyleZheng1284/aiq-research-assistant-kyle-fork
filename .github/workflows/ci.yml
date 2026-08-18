@@ -178,11 +178,11 @@ jobs:
           # Match NeMo Retriever's own Apple Silicon library-mode CI lane.
           - runner: macos-26
             os-label: macos-arm64
-    env:
-      UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/aiq-nemo-retriever-local-venv
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -198,6 +198,8 @@ jobs:
 
       - name: Validate and install isolated lock
         shell: bash
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/aiq-nemo-retriever-local-venv
         run: |
           set -euo pipefail
           uv lock --project environments/nemo_retriever_local --check
@@ -205,8 +207,27 @@ jobs:
 
       - name: Test embedded LanceDB and native server lifecycle
         shell: bash
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/aiq-nemo-retriever-local-venv
         run: |
           set -euo pipefail
+          uv run --project environments/nemo_retriever_local --frozen --no-sync python - <<'PY'
+          import tempfile
+
+          import ray
+
+          from knowledge_layer.nemo_retriever._local_client import _load_nrl_bindings
+          from knowledge_layer.nemo_retriever.local_adapter import NemoRetrieverLocalIngestor
+
+          assert ray.is_initialized() is False
+          bindings = _load_nrl_bindings()
+          with tempfile.TemporaryDirectory() as data_dir:
+              ingestor = NemoRetrieverLocalIngestor(
+                  {"data_dir": data_dir, "scope": "ci", "profile": "fast-text", "_bindings": bindings}
+              )
+              ingestor.close()
+          assert ray.is_initialized() is False
+          PY
           uv run --project environments/nemo_retriever_local --frozen --no-sync \
             python -m pytest -q \
               tests/knowledge_layer_tests/test_nemo_retriever_local_adapter.py \
