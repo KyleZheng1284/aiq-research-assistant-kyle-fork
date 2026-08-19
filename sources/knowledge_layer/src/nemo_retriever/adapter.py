@@ -534,22 +534,32 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
             logger.exception("NeMo Retriever warm start did not complete")
 
     def _cleanup_expired_collections(self) -> None:
-        """Drop the summaries and cached state of collections whose NRL expiration has passed.
+        """Drop state only after NRL confirms a locally due collection is gone.
 
-        NRL expires the collection itself, so cleanup never issues a delete: it only retires the
-        state AI-Q keeps alongside it, which would otherwise keep offering agents documents that
-        can no longer be retrieved.
+        NRL expires the collection itself, so cleanup never issues a delete. A locally cached
+        deadline is only a signal to check NRL: the collection could have had its expiration
+        extended after the last create, update, or reconciliation. AI-Q drops its summaries and
+        cached state only once NRL no longer returns the collection.
 
         It also replaces the mixin's idle-time policy: NRL is given an absolute expiration at
         creation and enforces it, so inferring one from ``updated_at`` would push AI-Q's view of a
         collection past the deadline the service will actually act on.
-
-        Each deadline is the one NRL last reported, recorded at create, update, or reconcile time.
         """
         now = datetime.now(UTC)
         with self._tracking_lock:
             due = [name for name, expires_at in self._collection_expirations.items() if expires_at <= now]
         for name in due:
+            try:
+                collection = self.get_collection(name)
+                if collection is not None:
+                    nrl_expires_at = _collection_expiration(collection)
+                    if nrl_expires_at is None or nrl_expires_at > now:
+                        self._track_expiration(name, nrl_expires_at)
+                        continue
+            except NemoRetrieverError:
+                logger.warning("Skipped cleanup for a due collection because NeMo Retriever is unavailable")
+                continue
+
             self._forget_collection(name)
             logger.info("Dropped summaries for an expired NeMo Retriever collection")
 
@@ -570,7 +580,7 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
                 self._document_id_to_filename.pop(document_id, None)
 
     def _reconcile_summaries(self) -> None:
-        """Make the summary store match the documents NRL actually holds.
+        """Update the summary store to match the in-scope collections and documents NRL holds.
 
         NRL owns document lifetime, including server-side collection expiration, so it is the
         authority here: documents it serves must have a summary row, and rows it no longer backs
@@ -587,9 +597,8 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
             try:
                 if name in live_collections:
                     self._reconcile_collection(name)
-                elif self.get_collection(name) is None:
-                    self._forget_collection(name)
-                    logger.info("Dropped summaries for a collection NeMo Retriever no longer holds")
+                # collections in the summary store that we don't find in NRL are left as-is
+                # because they may be owned by another scope
             except NemoRetrieverError:
                 logger.warning("Skipped summary reconciliation for one collection (NeMo Retriever unavailable)")
 
@@ -606,16 +615,14 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
         documents = self.list_files(collection_name)
         known: set[str] = set()
         for document in documents:
-            filename = document.file_name or document.file_id
+            filename = document.file_name
             known.add(filename)
             with self._tracking_lock:
                 self._document_id_to_filename[document.file_id] = filename
             if document.status != FileStatus.SUCCESS:
                 continue
             if filename not in stored:
-                self._register_summary(
-                    collection_name, document.status, document.file_id, filename, _PLACEHOLDER_SUMMARY
-                )
+                self._register_summary(collection_name, document.status, document.file_id, filename, None)
             else:
                 with self._tracking_lock:
                     self._summarized[collection_name].add(document.file_id)
@@ -900,7 +907,7 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
         collection_name = aggregate.collection_name
         if not collection_name:
             with self._tracking_lock:
-                collection_name = self._job_collections.get(job_id, "")
+                collection_name = self._job_collections.get(job_id, None)
         for item in documents:
             status = status_to_file_status(item.status)
             attempt_ids[item.document_id] = item.attempt_id
@@ -1141,18 +1148,20 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
 
     def _register_summary(
         self,
-        collection_name: str,
+        collection_name: str | None,
         status: FileStatus,
         document_id: str,
         filename: str | None,
         summary: str | None = None,
     ) -> None:
         """Register a summary for a document if it has been successfully ingested."""
+        if not filename or not collection_name:
+            return
         if status == FileStatus.SUCCESS and document_id not in self._summarized[collection_name]:
+            has_summary = summary is not None
             summary = summary or _PLACEHOLDER_SUMMARY
-            logger.info(f"registering summary for {filename or document_id}")
-            filename = filename or document_id
+            logger.info(f"registering summary for {filename}")
             with self._tracking_lock:
                 self._document_id_to_filename[document_id] = filename
                 self._summarized[collection_name].add(document_id)
-            register_summary(collection_name, filename, summary)
+            register_summary(collection_name, filename, summary, upsert=has_summary)

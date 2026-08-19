@@ -233,29 +233,30 @@ class SummaryStore:
         cls._tables_initialized.add(db_url)
         logger.info("Created summaries table (async) in %s", _redact_db_url(db_url))
 
-    def register(self, collection: str, filename: str, summary: str) -> None:
-        """Store a document summary (sync)."""
+    def register(self, collection: str, filename: str, summary: str, upsert: bool = True) -> None:
+        """Store a document summary, optionally preserving an existing row (sync)."""
         from sqlalchemy import text
 
-        # Use upsert pattern that works for both SQLite and PostgreSQL
+        # Use dialect-specific conflict handling for SQLite and PostgreSQL.
         is_postgres = self.db_url.startswith("postgres")
 
         try:
             with self._sync_engine.connect() as conn:
                 if is_postgres:
+                    conflict_action = "DO UPDATE SET summary = EXCLUDED.summary" if upsert else "DO NOTHING"
                     conn.execute(
                         text(
                             "INSERT INTO summaries (collection, filename, summary) "
                             "VALUES (:collection, :filename, :summary) "
-                            "ON CONFLICT (collection, filename) DO UPDATE SET summary = EXCLUDED.summary"
+                            f"ON CONFLICT (collection, filename) {conflict_action}"
                         ),
                         {"collection": collection, "filename": filename, "summary": summary},
                     )
                 else:
-                    # SQLite uses INSERT OR REPLACE
+                    sqlite_insert = "INSERT OR REPLACE" if upsert else "INSERT OR IGNORE"
                     conn.execute(
                         text(
-                            "INSERT OR REPLACE INTO summaries (collection, filename, summary) "
+                            f"{sqlite_insert} INTO summaries (collection, filename, summary) "
                             "VALUES (:collection, :filename, :summary)"
                         ),
                         {"collection": collection, "filename": filename, "summary": summary},
