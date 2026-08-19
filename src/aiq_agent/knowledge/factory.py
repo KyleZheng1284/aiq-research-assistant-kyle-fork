@@ -321,11 +321,11 @@ def _get_summary_store() -> "SummaryStore":
     return _summary_store
 
 
-def register_summary(collection: str, filename: str, summary: str | None) -> None:
-    """Store summary in database."""
+def register_summary(collection: str, filename: str, summary: str | None, upsert: bool = True) -> None:
+    """Store a summary, optionally preserving an existing filename's summary."""
     if not summary:
         return
-    _get_summary_store().register(collection, filename, summary)
+    _get_summary_store().register(collection, filename, summary, upsert=upsert)
 
 
 def get_available_documents(collection: str) -> list["AvailableDocument"]:
