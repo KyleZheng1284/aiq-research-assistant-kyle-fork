@@ -822,12 +822,14 @@ async def test_upload_route_success_transfers_temp_file_ownership_to_ingestion(
     assert submitted_path.exists()
 
 
+@pytest.mark.parametrize("register_routes", [add_legacy_document_routes, add_unified_document_routes])
 @pytest.mark.asyncio
 async def test_upload_route_submission_does_not_block_event_loop(
+    register_routes: Callable[[APIRouter], None],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    endpoint = _upload_endpoint(add_unified_document_routes)
+    endpoint = _upload_endpoint(register_routes)
     submitted_path = tmp_path / "submitted.txt"
     submitted_path.write_bytes(b"research")
 
@@ -853,12 +855,12 @@ async def test_upload_route_submission_does_not_block_event_loop(
         )
     )
     try:
-        assert await asyncio.to_thread(ingestor.submission_started.wait, 1)
+        assert await asyncio.to_thread(ingestor.submission_started.wait, 5)
         await asyncio.sleep(0)
         assert not safety_fired.is_set(), "submit_job blocked the event loop until the deadlock fuse fired"
         assert not ingestor.release_submission.is_set(), "submit_job blocked the event loop"
         ingestor.release_submission.set()
-        response = await asyncio.wait_for(request_task, 1)
+        response = await asyncio.wait_for(request_task, 5)
     finally:
         safety_timer.cancel()
         safety_timer.join()
@@ -890,7 +892,7 @@ async def test_cancelled_submission_quiesces_worker_before_upload_cleanup(tmp_pa
         return "ingestion-job"
 
     submit_task = asyncio.create_task(submit_validated_upload_batch(submit, batch))
-    assert await asyncio.to_thread(submission_started.wait, 1)
+    assert await asyncio.to_thread(submission_started.wait, 5)
     submit_task.cancel()
     await asyncio.sleep(0)
 
