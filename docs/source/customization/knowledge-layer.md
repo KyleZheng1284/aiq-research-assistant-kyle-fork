@@ -137,11 +137,12 @@ functions:
     # opensearch_ingestion_mode: local        # local, dask, or auto
     # embed_model: nvidia/nemotron-3-embed-1b
 
-    # nrl_base_url: http://127.0.0.1:7670    # nemo_retriever only
-    # nrl_api_token: ${NRL_API_TOKEN:-}
-    # nrl_scope: ${NRL_SCOPE}                 # required
-    # nrl_verify_ssl: true
-    # nrl_collection_ttl_hours: 24
+    # backend_config:                         # selected adapter owns these fields
+    #   base_url: http://127.0.0.1:7670       # nemo_retriever only
+    #   api_token: ${NRL_API_TOKEN:-}
+    #   scope: ${NRL_SCOPE}                   # required
+    #   verify_ssl: true
+    #   collection_ttl_hours: 24
 ```
 
 You can also use environment variable substitution in YAML for deployment-specific values:
@@ -317,11 +318,14 @@ functions:
     collection_name: ${COLLECTION_NAME:-aiq-nrl}
     top_k: 5
     generate_summary: false
-    nrl_base_url: ${NRL_BASE_URL:-http://127.0.0.1:7670}
-    nrl_api_token: ${NRL_API_TOKEN:-}
-    nrl_scope: ${NRL_SCOPE}
-    nrl_verify_ssl: ${NRL_VERIFY_SSL:-true}
-    nrl_collection_ttl_hours: ${NRL_COLLECTION_TTL_HOURS:-24}
+    backend_config:
+      base_url: ${NRL_BASE_URL:-http://127.0.0.1:7670}
+      api_token: ${NRL_API_TOKEN:-}
+      scope: ${NRL_SCOPE}
+      max_concurrency: ${NRL_MAX_CONCURRENCY:-8}
+      max_queued_uploads: ${NRL_MAX_QUEUED_UPLOADS:-128}
+      verify_ssl: ${NRL_VERIFY_SSL:-true}
+      collection_ttl_hours: ${NRL_COLLECTION_TTL_HOURS:-24}
 ```
 
 Use [`configs/config_web_nemo_retriever.yml`](../../../configs/config_web_nemo_retriever.yml)
@@ -331,9 +335,14 @@ workspace scope are sent on every scoped request. For a remote development
 deployment, forward the gateway port with SSH; for Kubernetes, use the gateway
 Service or an enterprise ingress and configure `NRL_CA_BUNDLE` when required.
 
-The adapter returns NRL's job ID after every multipart upload is accepted,
-then polls the NRL aggregate. Stable `document_id` values are AI-Q file IDs;
-per-attempt IDs remain diagnostic metadata. Query filters are rejected until
+The adapter returns NRL's job ID immediately after job creation and performs
+bounded multipart uploads in the background. Upload and ingestion failures are
+reported through job polling. Pending status entries use deterministic manifest
+IDs; stable NRL `document_id` values replace them after each file is accepted.
+The adapter admits complete batches before NRL job creation and bounds total
+active plus queued files. Oversized batches return HTTP 413; temporary
+saturation returns HTTP 503 without a `Retry-After` header.
+Per-attempt IDs remain diagnostic metadata. Query filters are rejected until
 the public NRL query contract supports them. AI-Q does not expose NRL pipeline
 tuning and does not consume physical VectorDB names or LanceDB locations.
 Automatic transport retries are limited to reads and explicitly idempotent
@@ -348,8 +357,9 @@ offered documents NRL no longer serves. Expiration comes from NRL rather than
 from how long a collection sat idle: the deadline used is the one NRL last
 reported for the collection.
 
-The tested baseline is NeMo Retriever commit `edfed55da` plus the TXT/HTML
-tokenizer landing patch, or a merged successor containing both changes. See the
+The tested service baseline is the immutable NeMo Retriever integration head
+[`f3a0b418b7250fa8823ec44dea569b07e2b008cb`](https://github.com/NVIDIA/NeMo-Retriever/commit/f3a0b418b7250fa8823ec44dea569b07e2b008cb),
+which contains the collection-management fixes and TXT/HTML service-mode tokenizer support. See the
 backend operator guide at `sources/knowledge_layer/src/nemo_retriever/README.md`
 for local Docker, SSH tunnel, Kubernetes, live validation, and troubleshooting.
 
@@ -411,6 +421,10 @@ Collections, documents, chunks, and recovery markers survive restart. Job histor
 pre-write jobs do not. A process lock permits one AI-Q process per data directory. The initial targets are Apple
 Silicon macOS, Windows x64, and Linux x64 with remote inference; Intel macOS, Python 3.13, local GPU inference, and
 shared multi-process storage are excluded.
+
+The shipped local profile uses threaded Dask workers and runs full deep research inline so AI-Q, Retriever, and the
+LanceDB lock remain in one process. Document ingestion is still asynchronous. Detached, durable async research jobs
+require the deployed service backend.
 
 AI-Q removes credentials, endpoint URLs, local paths, and physical table selectors from adapter errors and public API
 responses. Pinned NRL and LanceDB can still write local data paths or physical table identifiers to process logs; treat
@@ -479,6 +493,8 @@ File type support depends on the configured backend:
 | **Foundational RAG** | PDF, DOCX, PPTX, TXT, MD, HTML, images (PNG, JPG) |
 | **OpenSearch** | PDF, DOCX, PPTX, TXT, MD, CSV, JSON, YAML, YML, LOG |
 | **Azure AI Search** | PDF, DOCX, TXT, MD |
+| **NeMo Retriever service** | Determined by the deployed service image and extraction configuration |
+| **NeMo Retriever local** | NRL-supported inputs; DOCX/PPTX conversion requires LibreOffice on `PATH` |
 
 For custom backends, supported types are determined by the backend implementation.
 
@@ -502,7 +518,13 @@ Set identical values for both application components:
 | **Docker Compose** | `deploy/.env` (passed to the frontend and backend containers) |
 | **Helm** | `deploy/helm/deployment-k8s/values.yaml` under both the backend and frontend apps' `env` sections |
 
-For Foundational RAG, add `.pptx` to include PowerPoint support: `FILE_UPLOAD_ACCEPTED_TYPES=.pdf,.docx,.pptx,.txt,.md`
+For Foundational RAG or either NeMo Retriever backend, add `.pptx` to include PowerPoint support:
+`FILE_UPLOAD_ACCEPTED_TYPES=.pdf,.docx,.pptx,.txt,.md`. Set it in the shared process environment, normally
+`deploy/.env`, so the UI and backend receive the same value. Pinned NRL routes `.pptx` through its document/PDF branch
+under both `auto` and `fast-text`.
+
+Upload request validation is atomic: one disallowed or malformed file rejects the complete request with HTTP 415 and
+no ingestion job is created. Failures after job acceptance remain visible per file and can produce partial success.
 
 ### Programmatic Usage
 
@@ -567,6 +589,12 @@ Open `http://localhost:3000` in your browser.
 | `GET` | `/v1/documents/{job_id}/status` | Poll ingestion status |
 | `POST` | `/v1/knowledge/query` | Retrieve chunks directly without a generative LLM |
 | `GET` | `/v1/knowledge/health` | Check knowledge backend health |
+
+`/v1/knowledge/query` is a deployment-scoped endpoint for headless retrieval
+and operational validation; the chat workflow invokes the registered retriever
+directly. It does not implement per-user collection ownership. Enable AI-Q
+authentication and network controls before exposing it outside a trusted local
+environment.
 
 ### Session Collections
 
@@ -698,7 +726,7 @@ Configuration values are resolved in the following order (highest to lowest prio
 | `NRL_BASE_URL` | nemo_retriever | Public NeMo Retriever gateway URL |
 | `NRL_API_TOKEN`, `NRL_SCOPE` | nemo_retriever | Deployment bearer token and required workspace scope |
 | `NRL_CONNECT_TIMEOUT_S`, `NRL_REQUEST_TIMEOUT_S` | nemo_retriever | Connection and request timeout seconds |
-| `NRL_MAX_RETRIES`, `NRL_MAX_CONCURRENCY` | nemo_retriever | Transient retry and multipart upload bounds |
+| `NRL_MAX_RETRIES`, `NRL_MAX_CONCURRENCY`, `NRL_MAX_QUEUED_UPLOADS` | nemo_retriever | Transient retry, active multipart, and queued-upload bounds |
 | `NRL_VERIFY_SSL`, `NRL_CA_BUNDLE` | nemo_retriever | TLS verification and optional enterprise CA bundle |
 | `NRL_LOCAL_DATA_DIR`, `NRL_LOCAL_PROFILE` | nemo_retriever_local | Embedded data directory and NRL `auto` or `fast-text` profile |
 | `NRL_PAGE_ELEMENTS_INVOKE_URL`, `NRL_OCR_INVOKE_URL`, `NRL_TABLE_STRUCTURE_INVOKE_URL` | nemo_retriever_local | Optional extraction endpoint overrides |
@@ -723,7 +751,7 @@ Configuration values are resolved in the following order (highest to lowest prio
 | NRL connection or health failure | AI-Q cannot reach the public gateway | Verify `NRL_BASE_URL`, network policy, ingress, or the SSH tunnel |
 | NRL `401` or `403` | Missing/invalid token or unauthorized scope | Verify `NRL_API_TOKEN` and its authorization for `NRL_SCOPE` |
 | NRL job creation/upload `404` or `410` | AI-Q and NRL use incompatible collection-management APIs | Upgrade the NRL chart/image to the validated API version; polling `404`/`410` instead means the job is missing or expired |
-| NRL TXT/HTML failure | Service image lacks the tokenizer landing fix | Rebuild or deploy NRL with the tokenizer patch or a merged successor |
+| NRL TXT/HTML failure | Service image predates the validated integration baseline | Deploy the documented compatible NRL revision or a released successor |
 | Embedded NRL inference `401` | Hosted extraction or embedding rejected its credential | Set `NRL_INFERENCE_API_KEY` in `deploy/.env`; use `NVIDIA_API_KEY` separately for the AI-Q agent LLM when the endpoints require different credentials |
 | Embedded NRL collection ownership mismatch | The data directory was created with a different scope, profile, embedding model, or provider prefix | Restore the original settings or select a new `NRL_LOCAL_DATA_DIR` and re-ingest |
 | Embedded NRL data-directory lock | Another AI-Q process already owns the directory | Stop the other process or select a different `NRL_LOCAL_DATA_DIR`; sharing one directory across processes is unsupported |

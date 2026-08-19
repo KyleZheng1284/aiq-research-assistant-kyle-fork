@@ -11,9 +11,10 @@ import logging
 import os
 import threading
 from collections import defaultdict
+from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -22,6 +23,7 @@ from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlparse
 
+from pydantic import SecretStr
 from pydantic import ValidationError
 
 from aiq_agent.knowledge import BaseIngestor
@@ -38,6 +40,8 @@ from aiq_agent.knowledge import register_ingestor
 from aiq_agent.knowledge import register_retriever
 from aiq_agent.knowledge import register_summary
 from aiq_agent.knowledge import unregister_summary
+from aiq_agent.knowledge.base import IngestionBatchTooLargeError
+from aiq_agent.knowledge.base import IngestionCapacityError
 from aiq_agent.knowledge.base import TTLCleanupMixin
 from aiq_agent.knowledge.schema import CollectionInfo
 from aiq_agent.knowledge.schema import FileInfo
@@ -87,17 +91,33 @@ _PLACEHOLDER_SUMMARY = "No Summary Available"
 # Shared with the other knowledge backends so one setting paces every TTL cleanup thread.
 TTL_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("AIQ_TTL_CLEANUP_INTERVAL_SECONDS", "3600"))
 _PUBLIC_DOCUMENT_ERROR = "NeMo Retriever document ingestion failed"
+_SERVICE_CONFIG_KEYS = frozenset(
+    {
+        "base_url",
+        "api_token",
+        "scope",
+        "connect_timeout_s",
+        "request_timeout_s",
+        "max_retries",
+        "max_concurrency",
+        "max_queued_uploads",
+        "verify_ssl",
+        "ca_bundle",
+        "collection_ttl_hours",
+    }
+)
 
 
 @dataclass(frozen=True)
 class _Settings:
     base_url: str
-    api_token: str | None
+    api_token: SecretStr | None
     scope: str
     connect_timeout_s: float
     request_timeout_s: float
     max_retries: int
     max_concurrency: int
+    max_queued_uploads: int
     verify_ssl: bool
     ca_bundle: str | None
     collection_ttl_hours: float
@@ -115,6 +135,17 @@ class _FileDescriptor:
     manifest_entry_id: str
 
 
+@dataclass
+class _UploadBatchState:
+    """Process-local state for multipart uploads not yet visible to NRL."""
+
+    descriptors: tuple[_FileDescriptor, ...]
+    accepted_by_position: dict[int, UploadAcceptedWire] = field(default_factory=dict)
+    failed_by_position: dict[int, str] = field(default_factory=dict)
+    remaining: int = 0
+    done: threading.Event = field(default_factory=threading.Event)
+
+
 _SHARED_TRANSPORTS: dict[tuple[Any, ...], _NRLTransport] = {}
 _SHARED_TRANSPORTS_LOCK = threading.Lock()
 
@@ -128,48 +159,88 @@ def _secret_value(value: Any) -> str | None:
     return normalized or None
 
 
+def _config_value(config: dict[str, Any], key: str, env_name: str, default: Any = None) -> Any:
+    """Resolve an adapter-owned option without centralizing backend fields."""
+    if key in config and config[key] not in (None, ""):
+        return config[key]
+    value = os.environ.get(env_name)
+    return value if value not in (None, "") else default
+
+
 def _settings(config: dict[str, Any]) -> _Settings:
-    base_url = str(config.get("base_url") or "http://127.0.0.1:7670").strip().rstrip("/")
+    base_url = str(_config_value(config, "base_url", "NRL_BASE_URL", "http://127.0.0.1:7670")).strip().rstrip("/")
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("nrl_base_url must be an absolute HTTP(S) URL")
-    scope = str(config.get("scope") or "").strip()
+    scope = str(_config_value(config, "scope", "NRL_SCOPE", "")).strip()
     if not scope:
         raise ValueError("nemo_retriever requires an explicit nrl_scope")
-    connect_timeout_s = float(config.get("connect_timeout_s", 30))
-    request_timeout_s = float(config.get("request_timeout_s", 300))
-    max_retries = int(config.get("max_retries", 5))
-    max_concurrency = int(config.get("max_concurrency", 8))
-    collection_ttl_hours = float(config.get("collection_ttl_hours", 24))
+    connect_timeout_s = float(_config_value(config, "connect_timeout_s", "NRL_CONNECT_TIMEOUT_S", 30))
+    request_timeout_s = float(_config_value(config, "request_timeout_s", "NRL_REQUEST_TIMEOUT_S", 300))
+    max_retries = int(_config_value(config, "max_retries", "NRL_MAX_RETRIES", 5))
+    max_concurrency = int(_config_value(config, "max_concurrency", "NRL_MAX_CONCURRENCY", 8))
+    max_queued_uploads = int(_config_value(config, "max_queued_uploads", "NRL_MAX_QUEUED_UPLOADS", 128))
+    collection_ttl_hours = float(_config_value(config, "collection_ttl_hours", "NRL_COLLECTION_TTL_HOURS", 24))
     if connect_timeout_s <= 0 or request_timeout_s <= 0:
         raise ValueError("NeMo Retriever timeouts must be greater than zero")
     if max_retries < 0:
         raise ValueError("nrl_max_retries must be zero or greater")
     if max_concurrency < 1:
         raise ValueError("nrl_max_concurrency must be at least one")
+    if max_queued_uploads < 0:
+        raise ValueError("nrl_max_queued_uploads must be zero or greater")
     if collection_ttl_hours <= 0:
         raise ValueError("nrl_collection_ttl_hours must be greater than zero")
     return _Settings(
         base_url=base_url,
-        api_token=_secret_value(config.get("api_token")),
+        api_token=(
+            SecretStr(api_token)
+            if (api_token := _secret_value(_config_value(config, "api_token", "NRL_API_TOKEN")))
+            else None
+        ),
         scope=scope,
         connect_timeout_s=connect_timeout_s,
         request_timeout_s=request_timeout_s,
         max_retries=max_retries,
         max_concurrency=max_concurrency,
-        verify_ssl=strict_bool(config.get("verify_ssl", True), name="nrl_verify_ssl"),
-        ca_bundle=str(config["ca_bundle"]) if config.get("ca_bundle") else None,
+        max_queued_uploads=max_queued_uploads,
+        verify_ssl=strict_bool(
+            _config_value(config, "verify_ssl", "NRL_VERIFY_SSL", True),
+            name="nrl_verify_ssl" if "verify_ssl" in config else "NRL_VERIFY_SSL",
+        ),
+        ca_bundle=(str(value) if (value := _config_value(config, "ca_bundle", "NRL_CA_BUNDLE")) is not None else None),
         collection_ttl_hours=collection_ttl_hours,
         warm_start=bool(config.get("warm_start", True)),
         start_ttl_cleanup=bool(config.get("start_ttl_cleanup", True)),
     )
 
 
+def normalize_backend_config(config: dict[str, object]) -> dict[str, object]:
+    """Validate public service options and retain secrets as ``SecretStr``."""
+    if unsupported := sorted(set(config).difference(_SERVICE_CONFIG_KEYS)):
+        raise ValueError(f"Unsupported nemo_retriever backend_config option(s): {', '.join(unsupported)}")
+    settings = _settings(config)
+    return {
+        "base_url": settings.base_url,
+        "api_token": settings.api_token,
+        "scope": settings.scope,
+        "connect_timeout_s": settings.connect_timeout_s,
+        "request_timeout_s": settings.request_timeout_s,
+        "max_retries": settings.max_retries,
+        "max_concurrency": settings.max_concurrency,
+        "max_queued_uploads": settings.max_queued_uploads,
+        "verify_ssl": settings.verify_ssl,
+        "ca_bundle": settings.ca_bundle,
+        "collection_ttl_hours": settings.collection_ttl_hours,
+    }
+
+
 def _transport_for(config: dict[str, Any], settings: _Settings) -> _NRLTransport:
     injected = config.get("_transport")
     if injected is not None:
         return injected
-    token_fingerprint = hashlib.sha256((settings.api_token or "").encode()).hexdigest()
+    api_token = _secret_value(settings.api_token)
+    token_fingerprint = hashlib.sha256((api_token or "").encode()).hexdigest()
     key = (
         settings.base_url,
         settings.scope,
@@ -186,7 +257,7 @@ def _transport_for(config: dict[str, Any], settings: _Settings) -> _NRLTransport
             transport = _NRLTransport(
                 base_url=settings.base_url,
                 scope=settings.scope,
-                api_token=settings.api_token,
+                api_token=api_token,
                 connect_timeout_s=settings.connect_timeout_s,
                 request_timeout_s=settings.request_timeout_s,
                 max_retries=settings.max_retries,
@@ -254,7 +325,11 @@ def _descriptors(file_paths: list[str], original_filenames: list[str]) -> list[_
     return descriptors
 
 
-def _idempotency_key(collection_name: str, descriptors: list[_FileDescriptor]) -> str:
+def _idempotency_key(
+    collection_name: str,
+    descriptors: list[_FileDescriptor],
+    metadata: dict[str, Any],
+) -> str:
     canonical = {
         "collection_name": collection_name,
         "documents": [
@@ -265,6 +340,7 @@ def _idempotency_key(collection_name: str, descriptors: list[_FileDescriptor]) -
             }
             for item in descriptors
         ],
+        "metadata": metadata,
     }
     encoded = json.dumps(canonical, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return f"aiq-{hashlib.sha256(encoded).hexdigest()}"
@@ -327,10 +403,6 @@ class NemoRetrieverRetriever(BaseRetriever):
     @property
     def backend_name(self) -> str:
         return _BACKEND_NAME
-
-    def close(self) -> None:
-        """Release the transport created for this retriever instance."""
-        self._transport.close()
 
     async def retrieve(
         self,
@@ -405,6 +477,16 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
         self._document_id_to_filename: dict[str, str] = {}
         self._summarized: defaultdict[str, set[str]] = defaultdict(set)
         self._collection_expirations: dict[str, datetime] = {}
+        self._upload_batches: dict[str, _UploadBatchState] = {}
+        self._submission_condition = threading.Condition(self._tracking_lock)
+        self._outstanding_uploads = 0
+        self._active_submissions = 0
+        self._upload_executor = ThreadPoolExecutor(
+            max_workers=self._settings.max_concurrency,
+            thread_name_prefix="nrl-upload",
+        )
+        self._close_lock = threading.Lock()
+        self._closed = False
         if self._settings.warm_start:
             self._start_warm_start_task()
         if self._settings.start_ttl_cleanup:
@@ -516,6 +598,41 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
         for orphan in stored - known:
             unregister_summary(collection_name, orphan)
 
+    def _begin_submission(self, requested: int) -> None:
+        """Atomically reserve a complete batch before creating an upstream job."""
+        with self._submission_condition:
+            if self._closed:
+                raise NemoRetrieverError("The NeMo Retriever service adapter is closed")
+            outstanding = self._outstanding_uploads
+            limit = self._settings.max_concurrency + self._settings.max_queued_uploads
+            if requested > limit:
+                logger.warning(
+                    "NeMo Retriever upload admission rejected (requested=%d, outstanding=%d, limit=%d)",
+                    requested,
+                    outstanding,
+                    limit,
+                )
+                raise IngestionBatchTooLargeError()
+            if outstanding + requested > limit:
+                logger.warning(
+                    "NeMo Retriever upload admission rejected (requested=%d, outstanding=%d, limit=%d)",
+                    requested,
+                    outstanding,
+                    limit,
+                )
+                raise IngestionCapacityError()
+            self._outstanding_uploads += requested
+            self._active_submissions += 1
+
+    def _end_submission(self) -> None:
+        with self._submission_condition:
+            self._active_submissions -= 1
+            self._submission_condition.notify_all()
+
+    def _release_upload_reservations(self, count: int) -> None:
+        with self._submission_condition:
+            self._outstanding_uploads -= count
+
     @property
     def backend_name(self) -> str:
         return _BACKEND_NAME
@@ -620,6 +737,7 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
         originals = [str(value) for value in job_config.get("original_filenames", [])]
         cleanup_files = strict_bool(job_config.get("cleanup_files", False), name="cleanup_files")
         descriptors = _descriptors(file_paths, originals)
+        file_metadata = _scrub_metadata(job_config.get("metadata") or {})
         manifest = [
             {
                 "manifest_entry_id": item.manifest_entry_id,
@@ -628,62 +746,147 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
             }
             for item in descriptors
         ]
-        idempotency_key = str(job_config.get("idempotency_key") or _idempotency_key(collection_name, descriptors))
-        created_payload = self._transport.request_json(
-            "POST",
-            "/v1/ingest/job",
-            operation="job creation",
-            retryable=True,
-            compatibility_route=True,
-            json={
-                "expected_documents": len(descriptors),
-                "collection_name": collection_name,
-                "operation": "append",
-                "retain_results": False,
-                "idempotency_key": idempotency_key,
-                "document_manifest": manifest,
-            },
+        idempotency_key = str(
+            job_config.get("idempotency_key") or _idempotency_key(collection_name, descriptors, file_metadata)
         )
-        created = _wire(JobCreatedWire, created_payload, "job creation")
-        file_metadata = _scrub_metadata(job_config.get("metadata") or {})
-
-        def upload(item: _FileDescriptor) -> UploadAcceptedWire:
-            metadata: dict[str, Any] = {"filename": item.filename}
-            if file_metadata:
-                metadata["metadata"] = file_metadata
-            payload = self._transport.upload_document(
-                job_id=created.job_id,
-                file_path=item.path,
-                filename=item.filename,
-                manifest_entry_id=item.manifest_entry_id,
-                metadata=json.dumps(metadata, separators=(",", ":"), sort_keys=True),
-                retryable=True,
-            )
-            return _wire(UploadAcceptedWire, payload, "job document upload")
-
-        accepted_by_position: dict[int, UploadAcceptedWire] = {}
+        self._begin_submission(len(descriptors))
+        reservations_owned_by_submission = True
         try:
-            with ThreadPoolExecutor(max_workers=min(self._settings.max_concurrency, len(descriptors))) as executor:
-                futures = {executor.submit(upload, item): item.position for item in descriptors}
-                for future in as_completed(futures):
-                    accepted_by_position[futures[future]] = future.result()
-        finally:
-            if cleanup_files:
-                for item in descriptors:
-                    try:
-                        item.path.unlink(missing_ok=True)
-                    except OSError:
-                        logger.warning("Failed to remove temporary upload file %s", item.path)
+            created_payload = self._transport.request_json(
+                "POST",
+                "/v1/ingest/job",
+                operation="job creation",
+                retryable=True,
+                compatibility_route=True,
+                json={
+                    "expected_documents": len(descriptors),
+                    "collection_name": collection_name,
+                    "operation": "append",
+                    "retain_results": False,
+                    "idempotency_key": idempotency_key,
+                    "document_manifest": manifest,
+                },
+            )
+            created = _wire(JobCreatedWire, created_payload, "job creation")
 
-        accepted = [accepted_by_position[index] for index in range(len(descriptors))]
-        sizes = {item.position: item.file_size for item in descriptors}
+            batch = _UploadBatchState(descriptors=tuple(descriptors), remaining=len(descriptors))
+            with self._tracking_lock:
+                self._upload_batches[created.job_id] = batch
+                self._job_collections[created.job_id] = collection_name
+
+            reservations_owned_by_submission = False
+            scheduled = 0
+            try:
+                for descriptor in batch.descriptors:
+                    future = self._upload_executor.submit(
+                        self._upload_document,
+                        created.job_id,
+                        descriptor,
+                        file_metadata,
+                    )
+                    scheduled += 1
+                    future.add_done_callback(
+                        lambda completed, item=descriptor: self._finish_upload(
+                            created.job_id,
+                            batch,
+                            item,
+                            cleanup_files,
+                            completed,
+                        )
+                    )
+            except Exception as error:
+                logger.warning(
+                    "NeMo Retriever upload scheduling failed (job_id=%s, error_type=%s)",
+                    created.job_id,
+                    type(error).__name__,
+                )
+                for descriptor in batch.descriptors[scheduled:]:
+                    self._finish_upload(created.job_id, batch, descriptor, cleanup_files, None)
+            return created.job_id
+        except Exception:
+            if reservations_owned_by_submission:
+                self._release_upload_reservations(len(descriptors))
+            raise
+        finally:
+            self._end_submission()
+
+    def _upload_document(
+        self,
+        job_id: str,
+        descriptor: _FileDescriptor,
+        file_metadata: dict[str, Any],
+    ) -> UploadAcceptedWire:
+        metadata: dict[str, Any] = {"filename": descriptor.filename}
+        if file_metadata:
+            metadata["metadata"] = file_metadata
+        payload = self._transport.upload_document(
+            job_id=job_id,
+            file_path=descriptor.path,
+            filename=descriptor.filename,
+            manifest_entry_id=descriptor.manifest_entry_id,
+            metadata=json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+            retryable=True,
+        )
+        return _wire(UploadAcceptedWire, payload, "job document upload")
+
+    def _finish_upload(
+        self,
+        job_id: str,
+        batch: _UploadBatchState,
+        descriptor: _FileDescriptor,
+        cleanup_file: bool,
+        future: Future[UploadAcceptedWire] | None,
+    ) -> None:
+        accepted: UploadAcceptedWire | None = None
+        try:
+            if future is not None:
+                accepted = future.result()
+        except Exception as error:
+            logger.warning(
+                "NeMo Retriever document upload failed (filename=%s, error_type=%s)",
+                descriptor.filename,
+                type(error).__name__,
+            )
+        finally:
+            if cleanup_file:
+                try:
+                    descriptor.path.unlink(missing_ok=True)
+                except OSError as error:
+                    logger.warning(
+                        "Failed to remove temporary upload (filename=%s, error_type=%s)",
+                        descriptor.filename,
+                        type(error).__name__,
+                    )
+
+        uploads_done = False
         with self._tracking_lock:
-            self._accepted_by_job[created.job_id] = accepted
-            self._job_collections[created.job_id] = collection_name
-            for position, item in enumerate(accepted):
-                self._file_jobs[item.document_id] = created.job_id
-                self._file_sizes[item.document_id] = sizes[position]
-        return created.job_id
+            if accepted is None:
+                batch.failed_by_position[descriptor.position] = _PUBLIC_DOCUMENT_ERROR
+            else:
+                batch.accepted_by_position[descriptor.position] = accepted
+                self._file_jobs[accepted.document_id] = job_id
+                self._file_sizes[accepted.document_id] = descriptor.file_size
+            batch.remaining -= 1
+            self._outstanding_uploads -= 1
+            if batch.remaining == 0:
+                accepted_items = [batch.accepted_by_position[index] for index in sorted(batch.accepted_by_position)]
+                self._accepted_by_job[job_id] = accepted_items
+                uploads_done = True
+
+        if uploads_done:
+            batch.done.set()
+
+    def close(self) -> None:
+        """Finish accepted uploads and release the adapter-owned worker pool."""
+        with self._close_lock:
+            with self._submission_condition:
+                if self._closed:
+                    return
+                self._closed = True
+                self._submission_condition.notify_all()
+                while self._active_submissions:
+                    self._submission_condition.wait()
+            self._upload_executor.shutdown(wait=True, cancel_futures=False)
 
     def get_job_status(self, job_id: str) -> IngestionJobStatus:
         payload = self._transport.request_json(
@@ -691,6 +894,11 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
         )
         aggregate = _wire(JobAggregateWire, payload, "job status")
         documents = self._list_job_documents(job_id)
+        with self._tracking_lock:
+            batch = self._upload_batches.get(job_id)
+            uploads_done = batch.done.is_set() if batch else True
+            upload_failures = dict(batch.failed_by_position) if batch else {}
+            accepted_uploads = dict(batch.accepted_by_position) if batch else {}
         state = {
             "pending": JobState.PENDING,
             "processing": JobState.PROCESSING,
@@ -698,13 +906,10 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
             "failed": JobState.FAILED,
             "partial_success": JobState.COMPLETED,
         }.get(aggregate.status.lower(), JobState.PROCESSING)
-        file_details: list[FileProgress] = []
+        upstream_details: dict[str, FileProgress] = {}
         attempt_ids: dict[str, str] = {}
-        terminal = 0
         for item in documents:
             status = status_to_file_status(item.status)
-            if status in {FileStatus.SUCCESS, FileStatus.FAILED}:
-                terminal += 1
             attempt_ids[item.document_id] = item.attempt_id
             # Always register at least the filename. We may want to gate this behind the generate_summary flag later.
             # TODO: Get the summary for the document
@@ -714,22 +919,67 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
                 item.document_id,
                 item.filename,
             )
-            file_details.append(
-                FileProgress(
-                    file_id=item.document_id,
-                    file_name=item.filename or item.document_id,
-                    status=status,
-                    progress_percent=100.0 if status in {FileStatus.SUCCESS, FileStatus.FAILED} else 50.0,
-                    error_message=_public_document_error(item.error),
-                    chunks_created=max(0, item.result_rows or 0),
-                )
+            upstream_details[item.document_id] = FileProgress(
+                file_id=item.document_id,
+                file_name=item.filename or item.document_id,
+                status=status,
+                progress_percent=100.0 if status in {FileStatus.SUCCESS, FileStatus.FAILED} else 50.0,
+                error_message=_public_document_error(item.error),
+                chunks_created=max(0, item.result_rows or 0),
+            )
+
+        file_details: list[FileProgress] = []
+        if batch:
+            for descriptor in batch.descriptors:
+                if message := upload_failures.get(descriptor.position):
+                    detail = FileProgress(
+                        file_id=descriptor.manifest_entry_id,
+                        file_name=descriptor.filename,
+                        status=FileStatus.FAILED,
+                        progress_percent=100.0,
+                        error_message=message,
+                    )
+                elif accepted := accepted_uploads.get(descriptor.position):
+                    detail = upstream_details.pop(
+                        accepted.document_id,
+                        FileProgress(
+                            file_id=accepted.document_id,
+                            file_name=descriptor.filename,
+                            status=status_to_file_status(accepted.status),
+                            progress_percent=25.0,
+                        ),
+                    )
+                else:
+                    detail = FileProgress(
+                        file_id=descriptor.manifest_entry_id,
+                        file_name=descriptor.filename,
+                        status=FileStatus.UPLOADING,
+                        progress_percent=0.0,
+                    )
+                file_details.append(detail)
+
+            file_details.extend(upstream_details.values())
+
+            if not uploads_done:
+                state = JobState.PROCESSING if documents else JobState.PENDING
+        else:
+            file_details.extend(upstream_details.values())
+
+        terminal = sum(item.status in {FileStatus.SUCCESS, FileStatus.FAILED} for item in file_details)
+        if batch and uploads_done and upload_failures:
+            state = (
+                JobState.FAILED
+                if aggregate.status.lower() == "failed" or terminal >= aggregate.expected_documents
+                else JobState.PROCESSING
             )
         collection_name = aggregate.collection_name
         if not collection_name:
             with self._tracking_lock:
                 collection_name = self._job_collections.get(job_id, "")
         error_message = None
-        if aggregate.status.lower() == "failed":
+        if upload_failures and state == JobState.FAILED:
+            error_message = "NeMo Retriever rejected one or more document uploads"
+        elif aggregate.status.lower() == "failed":
             error_message = "NeMo Retriever ingestion job failed"
         elif aggregate.status.lower() == "partial_success":
             error_message = "NeMo Retriever ingestion job completed with one or more failed documents"
@@ -738,7 +988,9 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
             status=state,
             submitted_at=_parse_timestamp(aggregate.created_at) or datetime.now(UTC),
             started_at=_parse_timestamp(aggregate.started_at),
-            completed_at=_parse_timestamp(aggregate.finalized_at),
+            completed_at=(
+                _parse_timestamp(aggregate.finalized_at) if state in {JobState.COMPLETED, JobState.FAILED} else None
+            ),
             total_files=aggregate.expected_documents,
             processed_files=terminal,
             file_details=file_details,
@@ -751,6 +1003,8 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
                 "operation": aggregate.operation,
                 "trace_id": aggregate.trace_id,
                 "attempt_ids": attempt_ids,
+                "uploads_complete": uploads_done,
+                "upload_failures": len(upload_failures),
             },
         )
 
@@ -784,7 +1038,14 @@ class NemoRetrieverIngestor(TTLCleanupMixin, BaseIngestor):
             config={"original_filenames": [Path(file_path).name], "metadata": metadata or {}},
         )
         with self._tracking_lock:
+            batch = self._upload_batches.get(job_id)
+        if batch is None or not batch.done.wait(timeout=self._settings.request_timeout_s):
+            raise NemoRetrieverError("Timed out waiting for NeMo Retriever to accept the document upload")
+        with self._tracking_lock:
             accepted = list(self._accepted_by_job.get(job_id, []))
+            failed = bool(batch.failed_by_position)
+        if failed:
+            raise NemoRetrieverError("NeMo Retriever rejected the document upload")
         if not accepted:
             raise NemoRetrieverError("NeMo Retriever accepted the job without a document identifier")
         item = accepted[0]

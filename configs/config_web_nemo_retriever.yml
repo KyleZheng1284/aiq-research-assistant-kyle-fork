@@ -151,11 +151,14 @@ functions:
     collection_name: ${COLLECTION_NAME:-aiq-nrl}
     top_k: 5
     generate_summary: false
-    nrl_base_url: ${NRL_BASE_URL:-http://127.0.0.1:7670}
-    nrl_api_token: ${NRL_API_TOKEN:-}
-    nrl_scope: ${NRL_SCOPE}
-    nrl_verify_ssl: ${NRL_VERIFY_SSL:-true}
-    nrl_collection_ttl_hours: ${NRL_COLLECTION_TTL_HOURS:-24}
+    backend_config:
+      base_url: ${NRL_BASE_URL:-http://127.0.0.1:7670}
+      api_token: ${NRL_API_TOKEN:-}
+      scope: ${NRL_SCOPE}
+      max_concurrency: ${NRL_MAX_CONCURRENCY:-8}
+      max_queued_uploads: ${NRL_MAX_QUEUED_UPLOADS:-128}
+      verify_ssl: ${NRL_VERIFY_SSL:-true}
+      collection_ttl_hours: ${NRL_COLLECTION_TTL_HOURS:-24}
 
   # Paper Search (optional - requires SERPER_API_KEY)
   # Uncomment the block below and set SERPER_API_KEY to enable academic paper search.

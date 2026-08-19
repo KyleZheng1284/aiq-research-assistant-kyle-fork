@@ -15,6 +15,7 @@ for shared Knowledge API behavior.
   - [Install and start](#install-and-start-the-local-backend)
   - [Local configuration](#local-configuration)
   - [Local operating model](#local-operating-model)
+- [Upload format and batch contract](#upload-format-and-batch-contract)
 - [Deployed REST backend](#deployed-rest-backend)
   - [Service compatibility](#service-compatibility)
   - [Service configuration](#service-configuration)
@@ -56,6 +57,21 @@ AI-Q process -> NeMo Retriever operators -> embedded LanceDB
 Direct Knowledge API ingestion and retrieval do not require a generative LLM.
 The complete research workflow still requires an OpenAI-compatible agent LLM.
 
+The embedded adapter is orchestration over Retriever's public library
+contracts, not a parallel VectorDB implementation:
+
+| AI-Q owns | NeMo Retriever owns |
+|---|---|
+| Temporary staging, AI-Q job/status models, bounded work admission, adapter lifecycle, and universal-schema normalization | Extraction planning and graph construction, inference helpers, canonical schemas, `CollectionWriteContext`, collection catalog, chunk identity, recovery, deletion, physical table selection, VDB writes, retrieval, ranking, and distance |
+
+AI-Q constructs LanceDB with the same non-overwriting, service-collection
+configuration used by Retriever's VectorDB service, then calls
+`IngestVdbOperator`, `RetrieveVdbOperator`, and Retriever collection APIs. It
+does not issue direct LanceDB searches, reproduce Retriever schemas, or expose
+physical table identifiers. A public embedded collection facade and a public
+embedding-default resolver remain upstream promotion follow-ups; neither is
+required for this pinned experimental integration.
+
 ### Choose an extraction profile
 
 AI-Q exposes the two extraction profiles supported by the pinned Retriever
@@ -94,7 +110,11 @@ uv run --project environments/nemo_retriever_local --frozen \
 
 This starts the backend at `http://localhost:8000`. The direct query route is
 `POST /v1/knowledge/query`; the web UI creates session collection names
-automatically.
+automatically. This deployment-scoped route is intended for headless retrieval
+and operational validation; the chat workflow calls the registered retriever
+directly. It does not provide per-user collection authorization. Enable AI-Q
+authentication and network controls before exposing it outside a trusted local
+environment.
 
 ### Local configuration
 
@@ -106,17 +126,17 @@ NeMo Retriever environment variable exposed by the embedded AI-Q backend.
 
 | YAML field | Environment variable | Default | Purpose |
 |---|---|---:|---|
-| `nrl_scope` | `NRL_SCOPE` | `local` | Logical collection scope |
-| `nrl_local_data_dir` | `NRL_LOCAL_DATA_DIR` | `.aiq-data/nemo_retriever` | LanceDB, catalog, recovery, and staging root |
-| `nrl_local_profile` | `NRL_LOCAL_PROFILE` | `auto` | `auto` or `fast-text` extraction profile |
-| `nrl_inference_api_key` | `NRL_INFERENCE_API_KEY` | Retriever key fallback | Shared credential for extraction plus document/query embedding |
-| `nrl_page_elements_invoke_url` | `NRL_PAGE_ELEMENTS_INVOKE_URL` | Retriever default | Optional Page Elements endpoint override |
-| `nrl_ocr_invoke_url` | `NRL_OCR_INVOKE_URL` | Retriever default | Optional OCR endpoint override |
-| `nrl_table_structure_invoke_url` | `NRL_TABLE_STRUCTURE_INVOKE_URL` | unset | Enables and overrides Table Structure when configured |
-| `nrl_embed_invoke_url` | `NRL_EMBED_INVOKE_URL` | Retriever default | Optional embedding endpoint override |
-| `nrl_embed_model_name` | `NRL_EMBED_MODEL_NAME` | Retriever default | Optional embedding model override |
-| `nrl_embed_model_provider_prefix` | `NRL_EMBED_MODEL_PROVIDER_PREFIX` | Retriever default | Optional model provider-prefix override |
-| `nrl_collection_ttl_hours` | `NRL_COLLECTION_TTL_HOURS` | `24` | Expiration applied to new collections |
+| `backend_config.scope` | `NRL_SCOPE` | `local` | Logical collection scope |
+| `backend_config.data_dir` | `NRL_LOCAL_DATA_DIR` | `.aiq-data/nemo_retriever` | LanceDB, catalog, recovery, and staging root |
+| `backend_config.profile` | `NRL_LOCAL_PROFILE` | `auto` | `auto` or `fast-text` extraction profile |
+| `backend_config.inference_api_key` | `NRL_INFERENCE_API_KEY` | Retriever key fallback | Shared credential for extraction plus document/query embedding |
+| `backend_config.page_elements_invoke_url` | `NRL_PAGE_ELEMENTS_INVOKE_URL` | Retriever default | Optional Page Elements endpoint override |
+| `backend_config.ocr_invoke_url` | `NRL_OCR_INVOKE_URL` | Retriever default | Optional OCR endpoint override |
+| `backend_config.table_structure_invoke_url` | `NRL_TABLE_STRUCTURE_INVOKE_URL` | unset | Enables and overrides Table Structure when configured |
+| `backend_config.embed_invoke_url` | `NRL_EMBED_INVOKE_URL` | Retriever default | Optional embedding endpoint override |
+| `backend_config.embed_model_name` | `NRL_EMBED_MODEL_NAME` | Retriever default | Optional embedding model override |
+| `backend_config.embed_model_provider_prefix` | `NRL_EMBED_MODEL_PROVIDER_PREFIX` | Retriever default | Optional model provider-prefix override |
+| `backend_config.collection_ttl_hours` | `NRL_COLLECTION_TTL_HOURS` | `24` | Expiration applied to new collections |
 
 If `NRL_INFERENCE_API_KEY` is unset, the pinned Retriever revision falls back
 to `NVIDIA_API_KEY` and then `NGC_API_KEY`. All configured Retriever inference
@@ -129,6 +149,10 @@ separate key for each endpoint.
   AI-Q restart; v1 job history is process-local.
 - A process-lifetime file lock permits one AI-Q process per canonical data
   directory. Use separate directories for parallel processes.
+- Document ingestion remains asynchronous, while the shipped profile runs full
+  deep research inline on threaded Dask workers so the active Retriever runtime
+  and LanceDB lock remain in one process. Detached, durable async research jobs
+  require the deployed service backend.
 - Interrupted work before a document write is not resumed as a job. Collection
   reconciliation repairs committed collection state at startup and periodically.
 - Physical LanceDB table names and paths are not exposed through the Knowledge
@@ -166,6 +190,27 @@ how long a collection sat idle. The deadline used is the one NRL last reported,
 recorded when AIQ creates or updates a collection and refreshed by startup
 reconciliation.
 
+## Upload format and batch contract
+
+AI-Q keeps its global upload allowlist at the common backend subset. To enable
+PowerPoint for either NeMo Retriever backend, set this value in the shared
+application environment—normally the ignored `deploy/.env`—so the UI and
+backend apply the same policy:
+
+```dotenv
+FILE_UPLOAD_ACCEPTED_TYPES=.pdf,.docx,.pptx,.txt,.md
+```
+
+At the pinned local-library revision, Retriever plans `.pptx` through its
+document/PDF extraction branch for both `auto` and `fast-text`. DOCX and PPTX
+conversion requires `libreoffice` on `PATH`; deployed-service support also
+depends on the dependencies installed in the service image.
+
+AI-Q validates each upload request atomically before creating a job. One
+disallowed or malformed file rejects the entire request with HTTP 415 and no
+files are submitted. After a job is accepted, upload or extraction failures
+remain visible per file and the job can complete with partial success.
+
 ## Deployed REST backend
 
 The `nemo_retriever` backend connects AIQ to an independently deployed NeMo
@@ -184,9 +229,11 @@ the AIQ universal schemas.
 
 ### Service compatibility
 
-This adapter targets the collection-management contract validated with NeMo
-Retriever commit `edfed55da` plus the TXT/HTML tokenizer landing patch, or a
-merged successor containing both. The service must expose the job-scoped
+This adapter targets the collection-management contract validated with the
+immutable NeMo Retriever integration head
+[`f3a0b418b7250fa8823ec44dea569b07e2b008cb`](https://github.com/NVIDIA/NeMo-Retriever/commit/f3a0b418b7250fa8823ec44dea569b07e2b008cb),
+which contains the collection-management fixes and TXT/HTML service-mode
+tokenizer support. The service must expose the job-scoped
 ingestion routes under `/v1/ingest/job`. A 404 or 410 from version-probing job
 creation or immediate document-upload routes is reported as an actionable
 API-version mismatch. The same status from job polling remains an ordinary
@@ -212,16 +259,17 @@ export NRL_API_TOKEN='replace-with-a-secret'  # omit only for an auth-disabled d
 
 | YAML field | Environment variable | Default | Purpose |
 |---|---|---:|---|
-| `nrl_base_url` | `NRL_BASE_URL` | `http://127.0.0.1:7670` | Public NRL gateway, not a worker or VectorDB pod |
-| `nrl_api_token` | `NRL_API_TOKEN` | unset | Optional bearer token stored as a secret |
-| `nrl_scope` | `NRL_SCOPE` | required | Logical workspace scope sent on every request |
-| `nrl_connect_timeout_s` | `NRL_CONNECT_TIMEOUT_S` | `30` | TCP/TLS connection timeout |
-| `nrl_request_timeout_s` | `NRL_REQUEST_TIMEOUT_S` | `300` | Request timeout, including uploads |
-| `nrl_max_retries` | `NRL_MAX_RETRIES` | `5` | Retries for reads and explicitly idempotent writes on transport errors, 429, and retryable 5xx |
-| `nrl_max_concurrency` | `NRL_MAX_CONCURRENCY` | `8` | Maximum concurrent multipart uploads |
-| `nrl_verify_ssl` | `NRL_VERIFY_SSL` | `true` | Verify gateway certificates |
-| `nrl_ca_bundle` | `NRL_CA_BUNDLE` | unset | Optional enterprise CA bundle |
-| `nrl_collection_ttl_hours` | `NRL_COLLECTION_TTL_HOURS` | `24` | Expiration applied to new NRL collections |
+| `backend_config.base_url` | `NRL_BASE_URL` | `http://127.0.0.1:7670` | Public NRL gateway, not a worker or VectorDB pod |
+| `backend_config.api_token` | `NRL_API_TOKEN` | unset | Optional bearer token stored as a secret |
+| `backend_config.scope` | `NRL_SCOPE` | required | Logical workspace scope sent on every request |
+| `backend_config.connect_timeout_s` | `NRL_CONNECT_TIMEOUT_S` | `30` | TCP/TLS connection timeout |
+| `backend_config.request_timeout_s` | `NRL_REQUEST_TIMEOUT_S` | `300` | Request timeout, including uploads |
+| `backend_config.max_retries` | `NRL_MAX_RETRIES` | `5` | Retries for reads and explicitly idempotent writes on transport errors, 429, and retryable 5xx |
+| `backend_config.max_concurrency` | `NRL_MAX_CONCURRENCY` | `8` | Maximum concurrent multipart uploads |
+| `backend_config.max_queued_uploads` | `NRL_MAX_QUEUED_UPLOADS` | `128` | Maximum admitted uploads waiting behind active multipart work; `0` disables queuing |
+| `backend_config.verify_ssl` | `NRL_VERIFY_SSL` | `true` | Verify gateway certificates |
+| `backend_config.ca_bundle` | `NRL_CA_BUNDLE` | unset | Optional enterprise CA bundle |
+| `backend_config.collection_ttl_hours` | `NRL_COLLECTION_TTL_HOURS` | `24` | Expiration applied to new NRL collections |
 
 One token and scope are used per AIQ deployment. Per-user NRL credential
 forwarding is not supported. Tokens are never logged and physical NRL storage
@@ -280,15 +328,24 @@ uv run python .agents/skills/aiq-configure-workflow/scripts/validate_config.py \
 
 ./scripts/start_e2e.sh \
   --config_file configs/config_web_nemo_retriever.yml \
-  2>&1 | tee /private/tmp/aiq-nrl-e2e.log
+  2>&1 | tee aiq-nrl-e2e.log
 ```
 
 The existing AIQ collection APIs create scoped NRL collections, upload files,
-return the real NRL job ID, poll aggregate status, list stable document IDs,
-and delete documents or collections. Upload retries reuse deterministic job
-and manifest identifiers, preventing duplicate processing after a lost
+return the real NRL job ID immediately after job creation, poll aggregate
+status, list stable document IDs, and delete documents or collections.
+Multipart uploads continue on a bounded background worker; upload failures are
+reported through the same job-status API. Upload retries reuse deterministic
+job and manifest identifiers, preventing duplicate processing after a lost
 response. `attempt_id` is retained only in diagnostic job/file metadata;
-`document_id` remains the stable AIQ file identity.
+pending status entries use manifest IDs, and `document_id` becomes the stable
+AIQ file identity after NRL accepts a file.
+
+The adapter admits at most `max_concurrency + max_queued_uploads` files at a
+time. It reserves complete batches before NRL job creation: an individually
+oversized batch returns HTTP 413, while temporary saturation returns HTTP 503
+without `Retry-After`. Accepted requests retain the same REST calls, ordering,
+retry behavior, and multipart concurrency.
 
 Query results preserve the order returned by NeMo Retriever and expose its native
 vector distance as `Chunk.distance`. Lower values are closer; AIQ does not
@@ -313,5 +370,5 @@ uv run pytest tests/knowledge_layer_tests/test_nemo_retriever_adapter.py
 | Job creation/upload 404/410 | AIQ and the NRL service expose incompatible collection-management API versions; upgrade the NRL chart/image. A polling 404/410 instead means that job is missing or expired. |
 | HTTP 409 | An idempotency key or manifest entry was reused with different content, or the resource already exists. |
 | Empty retrieval | Confirm ingestion completed, the configured collection matches the upload collection, and NRL returned indexed documents. |
-| TXT/HTML ingestion failure | Use the tokenizer landing patch or a merged successor, then rebuild/redeploy the NRL service image. |
+| TXT/HTML ingestion failure | Deploy the documented compatible NRL revision or a released successor containing its service-mode tokenizer support. |
 | TLS failure | Keep verification enabled and configure `NRL_CA_BUNDLE` for an enterprise CA. |

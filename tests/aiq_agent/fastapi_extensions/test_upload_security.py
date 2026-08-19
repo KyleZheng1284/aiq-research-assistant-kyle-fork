@@ -32,6 +32,8 @@ from aiq_agent.fastapi_extensions.upload_security import get_upload_limits
 from aiq_agent.fastapi_extensions.upload_security import save_validated_upload
 from aiq_agent.fastapi_extensions.upload_security import submit_validated_upload_batch
 from aiq_agent.fastapi_extensions.upload_security import validate_upload_count
+from aiq_agent.knowledge.base import IngestionBatchTooLargeError
+from aiq_agent.knowledge.base import IngestionCapacityError
 from aiq_api.routes.documents import add_document_routes as add_unified_document_routes
 
 _DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -232,6 +234,16 @@ class _SuccessfulIngestor:
         return SimpleNamespace(file_details=[])
 
 
+class _AdmissionFailingIngestor(_SuccessfulIngestor):
+    def __init__(self, error_type: type[Exception]) -> None:
+        super().__init__()
+        self.error_type = error_type
+
+    def submit_job(self, paths, *args, **kwargs) -> str:
+        self.submitted_paths = list(paths)
+        raise self.error_type()
+
+
 class _BlockingIngestor(_SuccessfulIngestor):
     def __init__(self) -> None:
         super().__init__()
@@ -253,13 +265,13 @@ class _JobStatusError(RuntimeError):
 
 
 def test_loads_existing_shared_upload_environment_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FILE_UPLOAD_ACCEPTED_TYPES", "pdf, .DOCX, .txt")
+    monkeypatch.setenv("FILE_UPLOAD_ACCEPTED_TYPES", "pdf, .DOCX, .pptx, .txt")
     monkeypatch.setenv("FILE_UPLOAD_MAX_SIZE_MB", "1.5")
     monkeypatch.setenv("FILE_UPLOAD_MAX_FILE_COUNT", "7")
 
     limits = get_upload_limits()
 
-    assert limits.accepted_extensions == frozenset({".pdf", ".docx", ".txt"})
+    assert limits.accepted_extensions == frozenset({".pdf", ".docx", ".pptx", ".txt"})
     assert limits.max_file_bytes == int(1.5 * 1024 * 1024)
     assert limits.max_total_bytes == limits.max_file_bytes
     assert limits.max_files == 7
@@ -640,8 +652,84 @@ def test_upload_route_documents_security_error_responses(
     responses = route.responses
 
     assert route.description == UPLOAD_ENDPOINT_DESCRIPTION
-    assert responses[413]["description"] == "Upload size or file-count limit exceeded"
+    assert responses[413]["description"] == "Upload size, file-count, or ingestion-capacity limit exceeded"
     assert responses[415]["description"] == "Unsupported, malformed, or mismatched file content"
+    assert responses[503]["description"] == "Document ingestion is temporarily at capacity"
+
+
+@pytest.mark.parametrize("register_routes", [add_legacy_document_routes, add_unified_document_routes])
+@pytest.mark.parametrize(
+    ("error_type", "status_code", "detail"),
+    [
+        (IngestionBatchTooLargeError, 413, "Upload batch exceeds the configured ingestion capacity"),
+        (IngestionCapacityError, 503, "Document ingestion is temporarily at capacity; retry later"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_upload_route_maps_admission_errors_and_cleans_request_files(
+    register_routes: Callable[[APIRouter], None],
+    error_type: type[Exception],
+    status_code: int,
+    detail: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FILE_UPLOAD_ACCEPTED_TYPES", ".txt")
+    endpoint = _upload_endpoint(register_routes)
+    ingestor = _AdmissionFailingIngestor(error_type)
+
+    with pytest.raises(HTTPException) as exc:
+        await endpoint(
+            collection_name="private",
+            files=[_upload("report.txt", b"research", "text/plain")],
+            ingestor=ingestor,
+        )
+
+    assert exc.value.status_code == status_code
+    assert exc.value.detail == detail
+    assert "Retry-After" not in (exc.value.headers or {})
+    assert ingestor.submitted_paths
+    assert all(not Path(path).exists() for path in ingestor.submitted_paths)
+
+
+@pytest.mark.parametrize("register_routes", [add_legacy_document_routes, add_unified_document_routes])
+@pytest.mark.asyncio
+async def test_mixed_disallowed_upload_batch_is_atomic_and_cleans_saved_files(
+    register_routes: Callable[[APIRouter], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FILE_UPLOAD_ACCEPTED_TYPES", ".txt")
+    created_paths: list[str] = []
+    real_save = upload_security_module.save_validated_upload
+
+    async def capture_saved_path(*args, on_temp_path_created, **kwargs):
+        def capture(path: str) -> None:
+            created_paths.append(path)
+            on_temp_path_created(path)
+
+        return await real_save(*args, on_temp_path_created=capture, **kwargs)
+
+    monkeypatch.setattr(upload_security_module, "save_validated_upload", capture_saved_path)
+    endpoint = _upload_endpoint(register_routes)
+    ingestor = _SuccessfulIngestor()
+
+    with pytest.raises(HTTPException) as exc:
+        await endpoint(
+            collection_name="private",
+            files=[
+                _upload("report.txt", b"research", "text/plain"),
+                _upload(
+                    "slides.pptx",
+                    _office_document(required_member="ppt/presentation.xml"),
+                    _PPTX_CONTENT_TYPE,
+                ),
+            ],
+            ingestor=ingestor,
+        )
+
+    assert exc.value.status_code == 415
+    assert ingestor.submitted_paths == []
+    assert created_paths
+    assert all(not Path(path).exists() for path in created_paths)
 
 
 @pytest.mark.parametrize("register_routes", [add_legacy_document_routes, add_unified_document_routes])
@@ -749,8 +837,14 @@ async def test_upload_route_submission_does_not_block_event_loop(
 
     monkeypatch.setattr(upload_security_module, "save_validated_upload", save_upload)
     ingestor = _BlockingIngestor()
-    safety_release = threading.Timer(1, ingestor.release_submission.set)
-    safety_release.start()
+    safety_fired = threading.Event()
+
+    def release_submission_on_timeout() -> None:
+        safety_fired.set()
+        ingestor.release_submission.set()
+
+    safety_timer = threading.Timer(10, release_submission_on_timeout)
+    safety_timer.start()
     request_task = asyncio.create_task(
         endpoint(
             collection_name="private",
@@ -761,16 +855,19 @@ async def test_upload_route_submission_does_not_block_event_loop(
     try:
         assert await asyncio.to_thread(ingestor.submission_started.wait, 1)
         await asyncio.sleep(0)
+        assert not safety_fired.is_set(), "submit_job blocked the event loop until the deadlock fuse fired"
         assert not ingestor.release_submission.is_set(), "submit_job blocked the event loop"
         ingestor.release_submission.set()
         response = await asyncio.wait_for(request_task, 1)
     finally:
-        safety_release.cancel()
+        safety_timer.cancel()
+        safety_timer.join()
         ingestor.release_submission.set()
         if not request_task.done():
             await asyncio.gather(request_task, return_exceptions=True)
         submitted_path.unlink(missing_ok=True)
 
+    assert not safety_fired.is_set()
     assert response.job_id == "ingestion-job"
 
 

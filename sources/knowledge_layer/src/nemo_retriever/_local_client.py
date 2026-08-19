@@ -7,19 +7,21 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import queue
 import re
 import shutil
 import threading
 import uuid
 from dataclasses import dataclass
-from dataclasses import field
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+
+from pydantic import SecretStr
 
 from aiq_agent.knowledge import FileProgress
 from aiq_agent.knowledge import IngestionJobStatus
@@ -43,6 +45,21 @@ _WORK_QUEUE_SIZE = 128
 _DEFAULT_TABLE_NAME = "nemo_retriever"
 _TERMINAL_FILE_STATUSES = frozenset({FileStatus.SUCCESS, FileStatus.FAILED})
 _PHYSICAL_TABLE_PATTERN = re.compile(r"\bnrl_[0-9a-f]{40}\b")
+_LOCAL_CONFIG_KEYS = frozenset(
+    {
+        "data_dir",
+        "scope",
+        "profile",
+        "page_elements_invoke_url",
+        "ocr_invoke_url",
+        "table_structure_invoke_url",
+        "embed_invoke_url",
+        "embed_model_name",
+        "embed_model_provider_prefix",
+        "inference_api_key",
+        "collection_ttl_hours",
+    }
+)
 
 
 class NemoRetrieverLocalError(RuntimeError):
@@ -74,41 +91,51 @@ class LocalSettings:
     embed_invoke_url: str | None
     embed_model_name: str | None
     embed_model_provider_prefix: str | None
-    inference_api_key: str | None = field(repr=False)
+    inference_api_key: SecretStr | None
     collection_ttl_hours: float = 24.0
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> LocalSettings:
-        raw_dir = str(config.get("data_dir") or ".aiq-data/nemo_retriever").strip()
+        raw_dir = str(_config_value(config, "data_dir", "NRL_LOCAL_DATA_DIR", ".aiq-data/nemo_retriever")).strip()
         if not raw_dir:
             raise ValueError("nrl_local_data_dir must not be empty")
-        scope = str(config.get("scope") or "local").strip()
+        scope = str(_config_value(config, "scope", "NRL_SCOPE", "local")).strip()
         if not scope:
             raise ValueError("nemo_retriever_local requires an explicit nrl_scope")
-        profile = str(config.get("profile") or "auto").strip().lower()
+        profile = str(_config_value(config, "profile", "NRL_LOCAL_PROFILE", "auto")).strip().lower()
         if profile not in {"auto", "fast-text"}:
             raise ValueError("nrl_local_profile must be either 'auto' or 'fast-text'")
-        collection_ttl_hours = float(config.get("collection_ttl_hours", 24.0))
+        collection_ttl_hours = float(_config_value(config, "collection_ttl_hours", "NRL_COLLECTION_TTL_HOURS", 24.0))
         if collection_ttl_hours <= 0:
             raise ValueError("nrl_collection_ttl_hours must be greater than zero")
         return cls(
             data_dir=Path(raw_dir).expanduser().resolve(),
             scope=scope,
             profile=profile,
-            page_elements_invoke_url=_optional_text(config.get("page_elements_invoke_url")),
-            ocr_invoke_url=_optional_text(config.get("ocr_invoke_url")),
-            table_structure_invoke_url=_optional_text(config.get("table_structure_invoke_url")),
-            embed_invoke_url=_optional_text(config.get("embed_invoke_url")),
-            embed_model_name=_optional_text(config.get("embed_model_name")),
-            embed_model_provider_prefix=_optional_text(config.get("embed_model_provider_prefix")),
-            inference_api_key=_secret_value(config.get("inference_api_key")),
+            page_elements_invoke_url=_optional_text(
+                _config_value(config, "page_elements_invoke_url", "NRL_PAGE_ELEMENTS_INVOKE_URL")
+            ),
+            ocr_invoke_url=_optional_text(_config_value(config, "ocr_invoke_url", "NRL_OCR_INVOKE_URL")),
+            table_structure_invoke_url=_optional_text(
+                _config_value(config, "table_structure_invoke_url", "NRL_TABLE_STRUCTURE_INVOKE_URL")
+            ),
+            embed_invoke_url=_optional_text(_config_value(config, "embed_invoke_url", "NRL_EMBED_INVOKE_URL")),
+            embed_model_name=_optional_text(_config_value(config, "embed_model_name", "NRL_EMBED_MODEL_NAME")),
+            embed_model_provider_prefix=_optional_text(
+                _config_value(config, "embed_model_provider_prefix", "NRL_EMBED_MODEL_PROVIDER_PREFIX")
+            ),
+            inference_api_key=(
+                SecretStr(api_key)
+                if (api_key := _secret_value(_config_value(config, "inference_api_key", "NRL_INFERENCE_API_KEY")))
+                else None
+            ),
             collection_ttl_hours=collection_ttl_hours,
         )
 
     @property
     def compatibility_key(self) -> tuple[Any, ...]:
         """Values that must agree for callers sharing one runtime."""
-        secret_fingerprint = hashlib.sha256((self.inference_api_key or "").encode()).hexdigest()
+        secret_fingerprint = hashlib.sha256((_secret_value(self.inference_api_key) or "").encode()).hexdigest()
         return (
             self.scope,
             self.profile,
@@ -121,6 +148,26 @@ class LocalSettings:
             secret_fingerprint,
             self.collection_ttl_hours,
         )
+
+
+def normalize_backend_config(config: dict[str, object]) -> dict[str, object]:
+    """Validate public local options and retain inference credentials as ``SecretStr``."""
+    if unsupported := sorted(set(config).difference(_LOCAL_CONFIG_KEYS)):
+        raise ValueError(f"Unsupported nemo_retriever_local backend_config option(s): {', '.join(unsupported)}")
+    settings = LocalSettings.from_config(config)
+    return {
+        "data_dir": str(settings.data_dir),
+        "scope": settings.scope,
+        "profile": settings.profile,
+        "page_elements_invoke_url": settings.page_elements_invoke_url,
+        "ocr_invoke_url": settings.ocr_invoke_url,
+        "table_structure_invoke_url": settings.table_structure_invoke_url,
+        "embed_invoke_url": settings.embed_invoke_url,
+        "embed_model_name": settings.embed_model_name,
+        "embed_model_provider_prefix": settings.embed_model_provider_prefix,
+        "inference_api_key": settings.inference_api_key,
+        "collection_ttl_hours": settings.collection_ttl_hours,
+    }
 
 
 @dataclass(frozen=True)
@@ -214,6 +261,14 @@ def _load_nrl_bindings() -> _NRLBindings:
             "nemo_retriever_local requires the isolated Python 3.12 environment. "
             "Start AI-Q with `uv run --project environments/nemo_retriever_local nat serve ...`."
         ) from error
+    try:
+        default_embed_endpoint = _BatchEmbedCPUActor.DEFAULT_EMBED_INVOKE_URL
+    except AttributeError as error:
+        raise NemoRetrieverLocalDependencyError(
+            "nemo_retriever_local requires the pinned NeMo Retriever revision. "
+            "Recreate the isolated environment with "
+            "`uv sync --project environments/nemo_retriever_local --frozen`."
+        ) from error
     return _NRLBindings(
         create_ingestor=create_ingestor,
         LanceDB=LanceDB,
@@ -236,7 +291,7 @@ def _load_nrl_bindings() -> _NRLBindings:
         infer_microservice=infer_microservice,
         # NRL does not yet expose its remote embedding default through a public
         # resolver. Keep this compatibility import isolated at the pinned SHA.
-        default_embed_endpoint=_BatchEmbedCPUActor.DEFAULT_EMBED_INVOKE_URL,
+        default_embed_endpoint=default_embed_endpoint,
         to_client_vdb_records=to_client_vdb_records,
         apply_sidecar_metadata_to_client_batches=apply_sidecar_metadata_to_client_batches,
         pandas=pd,
@@ -250,6 +305,14 @@ def _optional_text(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _config_value(config: dict[str, Any], key: str, env_name: str, default: Any = None) -> Any:
+    """Resolve a local-adapter option while keeping its environment contract local."""
+    if key in config and config[key] not in (None, ""):
+        return config[key]
+    value = os.environ.get(env_name)
+    return value if value not in (None, "") else default
 
 
 def _secret_value(value: Any) -> str | None:
@@ -329,7 +392,8 @@ class LocalRuntime:
             _safe_mkdir(self._staging_root)
             self._embedding_model = str(self.bindings.resolve_embed_model(settings.embed_model_name))
             self._embedding_endpoint = settings.embed_invoke_url or self.bindings.default_embed_endpoint
-            self._inference_api_key = self.bindings.resolve_remote_api_key(settings.inference_api_key)
+            resolved_api_key = self.bindings.resolve_remote_api_key(_secret_value(settings.inference_api_key))
+            self._inference_api_key = SecretStr(resolved_api_key) if resolved_api_key else None
             self.vdb = self.bindings.LanceDB(
                 uri=str(settings.data_dir / "lancedb"),
                 table_name=_DEFAULT_TABLE_NAME,
@@ -687,19 +751,47 @@ class LocalRuntime:
             try:
                 if work is None:
                     return
-                self._process_file(work)
+                try:
+                    self._process_file(work)
+                except Exception as error:
+                    # One corrupt process-local item must not stop the sole
+                    # consumer and leave every later job pending forever.
+                    logger.warning(
+                        "Embedded NeMo Retriever worker discarded an invalid item (error_type=%s)",
+                        type(error).__name__,
+                    )
+                    try:
+                        self._release_work_item(work)
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            "Embedded NeMo Retriever worker cleanup failed (error_type=%s)",
+                            type(cleanup_error).__name__,
+                        )
             finally:
                 self._queue.task_done()
 
     def _process_file(self, work: _WorkItem) -> None:
+        job: _Job | None = None
+        progress: FileProgress | None = None
         now = datetime.now(UTC)
-        with self._state_lock:
-            job = self._jobs[work.job_id]
-            job.started_at = job.started_at or now
-            progress = next(item for item in job.files if item.file_id == work.staged.document_id)
-            progress.status = FileStatus.INGESTING
-            progress.progress_percent = 10.0
         try:
+            with self._state_lock:
+                job = self._jobs.get(work.job_id)
+                if job is None:
+                    logger.warning("Discarding stale embedded NeMo Retriever work for an unknown job")
+                    return
+                progress = next(
+                    (item for item in job.files if item.file_id == work.staged.document_id),
+                    None,
+                )
+                if progress is None:
+                    # Submission records progress and queues work atomically;
+                    # preserve any other entries because they own valid items.
+                    logger.warning("Discarding embedded NeMo Retriever work with no matching file progress")
+                    return
+                job.started_at = job.started_at or now
+                progress.status = FileStatus.INGESTING
+                progress.progress_percent = 10.0
             dataframe = self._extract_and_embed(work.staged)
             ingest_data = self._apply_file_metadata(dataframe, work.staged)
             result = self.ingest_operator.run(
@@ -731,20 +823,27 @@ class LocalRuntime:
                 self.public_error(error),
             )
             with self._state_lock:
-                progress.status = FileStatus.FAILED
-                progress.progress_percent = 100.0
-                progress.error_message = self.public_error(error)
+                if progress is not None:
+                    progress.status = FileStatus.FAILED
+                    progress.progress_percent = 100.0
+                    progress.error_message = self.public_error(error)
         finally:
-            try:
-                work.staged.path.unlink(missing_ok=True)
-                work.staged.path.parent.rmdir()
-            except OSError:
-                logger.debug("Staging directory still contains queued work for job %s", work.job_id)
-            with self._state_lock:
+            self._release_work_item(work, job)
+
+    def _release_work_item(self, work: _WorkItem, job: _Job | None = None) -> None:
+        """Release private staging and active-write state for one queued file."""
+        try:
+            work.staged.path.unlink(missing_ok=True)
+            work.staged.path.parent.rmdir()
+        except OSError:
+            logger.debug("Staging directory still contains queued work for job %s", work.job_id)
+        with self._state_lock:
+            if job is not None:
                 self._finalize_job_if_terminal(job)
-                self._active_writes.discard((work.collection_name, work.staged.document_id))
+            self._active_writes.discard((work.collection_name, work.staged.document_id))
 
     def _extract_and_embed(self, staged: _StagedFile) -> Any:
+        inference_api_key = _secret_value(self._inference_api_key)
         plan = self.bindings.resolve_ingest_plan(
             self.bindings.IngestPlanRequest(
                 source=self.bindings.IngestSourceOptions(
@@ -757,13 +856,13 @@ class LocalRuntime:
                     page_elements_invoke_url=self.settings.page_elements_invoke_url,
                     ocr_invoke_url=self.settings.ocr_invoke_url,
                     table_structure_invoke_url=self.settings.table_structure_invoke_url,
-                    extract_api_key=self._inference_api_key,
+                    extract_api_key=inference_api_key,
                 ),
                 embed=self.bindings.IngestEmbedOptions(
                     embed_invoke_url=self._embedding_endpoint,
                     embed_model_name=self._embedding_model,
                     embed_model_provider_prefix=self.settings.embed_model_provider_prefix,
-                    embed_api_key=self._inference_api_key,
+                    embed_api_key=inference_api_key,
                 ),
             )
         )
@@ -799,7 +898,7 @@ class LocalRuntime:
         """Return a bounded error without credentials or NRL storage selectors."""
         message = str(error).strip() or type(error).__name__
         sensitive_values = (
-            self._inference_api_key,
+            _secret_value(self._inference_api_key),
             str(self.settings.data_dir),
             self._embedding_endpoint,
             self.settings.embed_invoke_url,
@@ -984,7 +1083,7 @@ class LocalRuntime:
             [query],
             model_name=self._embedding_model,
             embedding_endpoint=self._embedding_endpoint,
-            nvidia_api_key=self._inference_api_key,
+            nvidia_api_key=_secret_value(self._inference_api_key),
             input_type="query",
             model_provider_prefix=self.settings.embed_model_provider_prefix,
             grpc=False,
@@ -1024,6 +1123,7 @@ class _RuntimeEntry:
 
 
 _RUNTIMES: dict[Path, _RuntimeEntry] = {}
+_RUNTIMES_CLOSING: dict[Path, threading.Event] = {}
 _RUNTIMES_LOCK = threading.Lock()
 
 
@@ -1034,22 +1134,34 @@ class LocalRuntimeHandle:
         self._key = key
         self.runtime = runtime
         self._closed = False
+        self._close_lock = threading.Lock()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        runtime: LocalRuntime | None = None
-        with _RUNTIMES_LOCK:
-            entry = _RUNTIMES.get(self._key)
-            if entry is None:
+        with self._close_lock:
+            if self._closed:
                 return
-            entry.references -= 1
-            if entry.references == 0:
-                runtime = entry.runtime
-                del _RUNTIMES[self._key]
-        if runtime is not None:
-            runtime.close()
+            self._closed = True
+            runtime: LocalRuntime | None = None
+            closing: threading.Event | None = None
+            with _RUNTIMES_LOCK:
+                entry = _RUNTIMES.get(self._key)
+                if entry is None:
+                    return
+                entry.references -= 1
+                if entry.references == 0:
+                    runtime = entry.runtime
+                    del _RUNTIMES[self._key]
+                    closing = threading.Event()
+                    _RUNTIMES_CLOSING[self._key] = closing
+            if runtime is not None:
+                assert closing is not None
+                try:
+                    runtime.close()
+                finally:
+                    with _RUNTIMES_LOCK:
+                        if _RUNTIMES_CLOSING.get(self._key) is closing:
+                            del _RUNTIMES_CLOSING[self._key]
+                        closing.set()
 
 
 def acquire_local_runtime(config: dict[str, Any]) -> LocalRuntimeHandle:
@@ -1057,18 +1169,24 @@ def acquire_local_runtime(config: dict[str, Any]) -> LocalRuntimeHandle:
     settings = LocalSettings.from_config(config)
     key = settings.data_dir
     bindings = config.get("_bindings")
-    with _RUNTIMES_LOCK:
-        entry = _RUNTIMES.get(key)
-        if entry is None:
-            runtime = LocalRuntime(settings, bindings=bindings)
-            entry = _RuntimeEntry(runtime=runtime, compatibility_key=settings.compatibility_key)
-            _RUNTIMES[key] = entry
-        elif entry.compatibility_key != settings.compatibility_key:
-            raise NemoRetrieverLocalError(
-                f"The NeMo Retriever local data directory {key} is already open with different settings"
-            )
-        entry.references += 1
-        return LocalRuntimeHandle(key, entry.runtime)
+    while True:
+        with _RUNTIMES_LOCK:
+            closing = _RUNTIMES_CLOSING.get(key)
+            if closing is None:
+                entry = _RUNTIMES.get(key)
+                if entry is None:
+                    runtime = LocalRuntime(settings, bindings=bindings)
+                    entry = _RuntimeEntry(runtime=runtime, compatibility_key=settings.compatibility_key)
+                    _RUNTIMES[key] = entry
+                elif entry.compatibility_key != settings.compatibility_key:
+                    raise NemoRetrieverLocalError(
+                        f"The NeMo Retriever local data directory {key} is already open with different settings"
+                    )
+                entry.references += 1
+                return LocalRuntimeHandle(key, entry.runtime)
+        # The previous runtime still owns the process file lock. Wait without
+        # blocking acquisitions for unrelated data directories, then retry.
+        closing.wait()
 
 
 __all__ = [

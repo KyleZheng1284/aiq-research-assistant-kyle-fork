@@ -9,10 +9,14 @@ import json
 import threading
 from datetime import UTC
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
+from unittest.mock import Mock
 
 import httpx
 import knowledge_layer.nemo_retriever._transport as transport_module
+import knowledge_layer.nemo_retriever.adapter as adapter_module
 import pytest
 from knowledge_layer.nemo_retriever._transport import NemoRetrieverCompatibilityError
 from knowledge_layer.nemo_retriever._transport import NemoRetrieverError
@@ -32,6 +36,8 @@ from aiq_agent.knowledge import BaseRetriever
 from aiq_agent.knowledge import Chunk
 from aiq_agent.knowledge import ContentType
 from aiq_agent.knowledge import JobState
+from aiq_agent.knowledge.base import IngestionBatchTooLargeError
+from aiq_agent.knowledge.base import IngestionCapacityError
 from aiq_agent.knowledge.factory import is_ingestor_registered
 from aiq_agent.knowledge.factory import is_retriever_registered
 from aiq_agent.knowledge.schema import FileStatus
@@ -128,9 +134,10 @@ class FakeNRL:
             with self._lock:
                 self.create_job_bodies.append(body)
                 self.manifest = body["document_manifest"]
+                status_code = 201 if len(self.create_job_bodies) == 1 else 200
             return _response(
                 request,
-                201 if len(self.create_job_bodies) == 1 else 200,
+                status_code,
                 {
                     "job_id": "job-1",
                     "expected_documents": body["expected_documents"],
@@ -142,31 +149,32 @@ class FakeNRL:
             )
         if path == "/v1/ingest/job/job-1/document" and method == "POST":
             body = request.content.decode(errors="replace")
-            entry = next(item for item in self.manifest if item["manifest_entry_id"] in body)
-            position = self.manifest.index(entry)
-            stable_id = f"stable-doc-{position}"
-            accepted = {
-                "document_id": stable_id,
-                "attempt_id": f"attempt-{position}",
-                "job_id": "job-1",
-                "content_sha256": entry["content_sha256"],
-                "status": "pending",
-                "created_at": NOW,
-            }
-            self.documents[stable_id] = {
-                "document_id": stable_id,
-                "attempt_id": f"attempt-{position}",
-                "job_id": "job-1",
-                "status": "completed",
-                "submitted_at": NOW,
-                "started_at": NOW,
-                "completed_at": NOW,
-                "filename": entry["filename"],
-                "result_rows": position + 2,
-                "error": None,
-                "collection_name": "test",
-                "content_sha256": entry["content_sha256"],
-            }
+            with self._lock:
+                entry = next(item for item in self.manifest if item["manifest_entry_id"] in body)
+                position = self.manifest.index(entry)
+                stable_id = f"stable-doc-{position}"
+                accepted = {
+                    "document_id": stable_id,
+                    "attempt_id": f"attempt-{position}",
+                    "job_id": "job-1",
+                    "content_sha256": entry["content_sha256"],
+                    "status": "pending",
+                    "created_at": NOW,
+                }
+                self.documents[stable_id] = {
+                    "document_id": stable_id,
+                    "attempt_id": f"attempt-{position}",
+                    "job_id": "job-1",
+                    "status": "completed",
+                    "submitted_at": NOW,
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "filename": entry["filename"],
+                    "result_rows": position + 2,
+                    "error": None,
+                    "collection_name": "test",
+                    "content_sha256": entry["content_sha256"],
+                }
             return _response(request, 202, accepted)
         if path == "/v1/ingest/job/job-1" and method == "GET":
             return _response(
@@ -282,9 +290,16 @@ def _adapter_config(handler: Any, *, token: str = "super-secret", retries: int =
         "api_token": SecretStr(token),
         "max_retries": retries,
         "max_concurrency": 2,
+        "max_queued_uploads": 128,
         "_transport": transport,
         "warm_start": False,
     }
+
+
+def _wait_for_uploads(ingestor: NemoRetrieverIngestor, job_id: str) -> None:
+    with ingestor._tracking_lock:
+        batch = ingestor._upload_batches[job_id]
+    assert batch.done.wait(timeout=2), "background NRL uploads did not finish"
 
 
 def test_backend_registration_config_validation_and_secret_redaction():
@@ -293,20 +308,82 @@ def test_backend_registration_config_validation_and_secret_redaction():
     assert issubclass(NemoRetrieverRetriever, BaseRetriever)
     assert issubclass(NemoRetrieverIngestor, BaseIngestor)
 
-    with pytest.raises(ValidationError, match="explicit nrl_scope"):
-        KnowledgeRetrievalConfig(backend="nemo_retriever", nrl_scope="")
+    with pytest.raises(ValueError, match="explicit nrl_scope"):
+        KnowledgeRetrievalConfig(backend="nemo_retriever", backend_config={"scope": ""})
+    with pytest.raises(ValueError, match="Unsupported nemo_retriever backend_config option.*typo"):
+        KnowledgeRetrievalConfig(backend="nemo_retriever", backend_config={"scope": "scope", "typo": True})
 
     secret = "must-not-appear"  # pragma: allowlist secret
     config = KnowledgeRetrievalConfig(
         backend="nemo_retriever",
-        nrl_scope="workspace-123",
-        nrl_api_token=SecretStr(secret),
+        backend_config={"scope": "workspace-123", "api_token": secret},
     )
     assert secret not in repr(config)
+    assert isinstance(config.backend_config["api_token"], SecretStr)
     backend, backend_config = _setup_backend(config)
     assert backend == "nemo_retriever"
     assert isinstance(backend_config["api_token"], SecretStr)
     assert secret not in repr(backend_config)
+
+
+def test_service_environment_and_explicit_backend_config_are_equivalent(monkeypatch):
+    values = {
+        "NRL_BASE_URL": "https://nrl.example.test/",
+        "NRL_API_TOKEN": "environment-secret",
+        "NRL_SCOPE": "workspace-123",
+        "NRL_CONNECT_TIMEOUT_S": "12",
+        "NRL_REQUEST_TIMEOUT_S": "34",
+        "NRL_MAX_RETRIES": "2",
+        "NRL_MAX_CONCURRENCY": "3",
+        "NRL_MAX_QUEUED_UPLOADS": "4",
+        "NRL_VERIFY_SSL": "false",
+        "NRL_COLLECTION_TTL_HOURS": "48",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+    from_environment = adapter_module._settings({})
+    explicit = adapter_module._settings(
+        {
+            "base_url": values["NRL_BASE_URL"],
+            "api_token": SecretStr(values["NRL_API_TOKEN"]),
+            "scope": values["NRL_SCOPE"],
+            "connect_timeout_s": values["NRL_CONNECT_TIMEOUT_S"],
+            "request_timeout_s": values["NRL_REQUEST_TIMEOUT_S"],
+            "max_retries": values["NRL_MAX_RETRIES"],
+            "max_concurrency": values["NRL_MAX_CONCURRENCY"],
+            "max_queued_uploads": values["NRL_MAX_QUEUED_UPLOADS"],
+            "verify_ssl": values["NRL_VERIFY_SSL"],
+            "collection_ttl_hours": values["NRL_COLLECTION_TTL_HOURS"],
+        }
+    )
+    public_config = KnowledgeRetrievalConfig(backend="nemo_retriever")
+
+    assert from_environment == explicit
+    assert adapter_module._settings(public_config.backend_config) == from_environment
+    assert values["NRL_API_TOKEN"] not in repr(public_config)
+    assert "environment-secret" not in repr(from_environment)
+
+
+def test_service_upload_queue_bound_accepts_zero_and_rejects_negative() -> None:
+    settings = adapter_module._settings(
+        {
+            "base_url": "https://nrl.example.test",
+            "scope": "workspace-123",
+            "max_concurrency": 1,
+            "max_queued_uploads": 0,
+        }
+    )
+    assert settings.max_queued_uploads == 0
+
+    with pytest.raises(ValueError, match="nrl_max_queued_uploads must be zero or greater"):
+        adapter_module._settings(
+            {
+                "base_url": "https://nrl.example.test",
+                "scope": "workspace-123",
+                "max_queued_uploads": -1,
+            }
+        )
 
 
 def test_headers_collection_and_document_pagination(tmp_path):
@@ -322,7 +399,8 @@ def test_headers_collection_and_document_pagination(tmp_path):
     second = tmp_path / "two.html"
     first.write_text("alpha", encoding="utf-8")
     second.write_text("<p>beta</p>", encoding="utf-8")
-    ingestor.submit_job([str(first), str(second)], "test")
+    job_id = ingestor.submit_job([str(first), str(second)], "test")
+    _wait_for_uploads(ingestor, job_id)
     files = ingestor.list_files("test")
     ingestor.get_job_status("job-1")
     assert {item.file_id for item in files} == {"stable-doc-0", "stable-doc-1"}
@@ -361,6 +439,7 @@ def test_deterministic_manifest_idempotency_and_status_mapping(tmp_path):
         "test",
         {"original_filenames": ["report.txt", "page.html"]},
     )
+    _wait_for_uploads(ingestor, replay_id)
 
     assert job_id == replay_id == "job-1"
     assert fake.create_job_bodies[0]["idempotency_key"] == fake.create_job_bodies[1]["idempotency_key"]
@@ -379,6 +458,273 @@ def test_deterministic_manifest_idempotency_and_status_mapping(tmp_path):
         "stable-doc-1": "attempt-1",
     }
     assert all(item.status == FileStatus.SUCCESS for item in status.file_details)
+
+
+def test_default_idempotency_changes_only_when_public_metadata_changes(tmp_path):
+    fake = FakeNRL()
+    ingestor = NemoRetrieverIngestor(_adapter_config(fake))
+    upload = tmp_path / "report.txt"
+    upload.write_text("same content", encoding="utf-8")
+
+    first = ingestor.submit_job([str(upload)], "test", {"metadata": {"department": "finance"}})
+    _wait_for_uploads(ingestor, first)
+    replay = ingestor.submit_job([str(upload)], "test", {"metadata": {"department": "finance"}})
+    _wait_for_uploads(ingestor, replay)
+    changed = ingestor.submit_job([str(upload)], "test", {"metadata": {"department": "legal"}})
+    _wait_for_uploads(ingestor, changed)
+
+    keys = [body["idempotency_key"] for body in fake.create_job_bodies]
+    assert keys[0] == keys[1]
+    assert keys[2] != keys[0]
+
+
+def test_submit_job_returns_before_multipart_upload_and_reports_pending(tmp_path):
+    fake = FakeNRL()
+    upload_started = threading.Event()
+    release_upload = threading.Event()
+
+    def delayed(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/document"):
+            upload_started.set()
+            assert release_upload.wait(timeout=2)
+        return fake(request)
+
+    ingestor = NemoRetrieverIngestor(_adapter_config(delayed))
+    upload = tmp_path / "report.txt"
+    upload.write_text("content", encoding="utf-8")
+
+    try:
+        job_id = ingestor.submit_job([str(upload)], "test")
+        assert job_id == "job-1"
+        assert upload_started.wait(timeout=1)
+        pending = ingestor.get_job_status(job_id)
+        assert pending.status == JobState.PENDING
+        assert pending.completed_at is None
+        assert len(pending.file_details) == 1
+        assert pending.file_details[0].file_name == "report.txt"
+        assert pending.file_details[0].status == FileStatus.UPLOADING
+        assert pending.file_details[0].file_id == fake.manifest[0]["manifest_entry_id"]
+    finally:
+        release_upload.set()
+
+    _wait_for_uploads(ingestor, job_id)
+    assert ingestor.get_job_status(job_id).status == JobState.COMPLETED
+
+
+def test_service_upload_admission_is_atomic_and_capacity_returns_after_completion(tmp_path, caplog):
+    fake = FakeNRL()
+    upload_started = threading.Event()
+    release_upload = threading.Event()
+
+    def delayed(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/document"):
+            upload_started.set()
+            assert release_upload.wait(timeout=2)
+        return fake(request)
+
+    config = _adapter_config(delayed)
+    config.update({"max_concurrency": 1, "max_queued_uploads": 1})
+    ingestor = NemoRetrieverIngestor(config)
+    files = [tmp_path / f"report-{index}.txt" for index in range(3)]
+    for path in files:
+        path.write_text("content", encoding="utf-8")
+
+    try:
+        job_id = ingestor.submit_job([str(files[0]), str(files[1])], "test")
+        assert upload_started.wait(timeout=1)
+        with pytest.raises(IngestionCapacityError, match="temporarily at capacity"):
+            ingestor.submit_job([str(files[2])], "test")
+
+        assert len(fake.create_job_bodies) == 1
+        assert ingestor._outstanding_uploads == 2
+        assert "requested=1, outstanding=2, limit=2" in caplog.text
+        assert str(tmp_path) not in caplog.text
+
+        release_upload.set()
+        _wait_for_uploads(ingestor, job_id)
+        assert ingestor._outstanding_uploads == 0
+
+        retry_id = ingestor.submit_job([str(files[2])], "test")
+        _wait_for_uploads(ingestor, retry_id)
+        assert len(fake.create_job_bodies) == 2
+        assert ingestor._outstanding_uploads == 0
+    finally:
+        release_upload.set()
+        ingestor.close()
+
+
+def test_service_upload_admission_rejects_oversized_batch_before_job_creation(tmp_path):
+    fake = FakeNRL()
+    config = _adapter_config(fake)
+    config.update({"max_concurrency": 1, "max_queued_uploads": 1})
+    ingestor = NemoRetrieverIngestor(config)
+    files = [tmp_path / f"report-{index}.txt" for index in range(3)]
+    for path in files:
+        path.write_text("content", encoding="utf-8")
+
+    try:
+        with pytest.raises(IngestionBatchTooLargeError, match="exceeds the configured ingestion capacity"):
+            ingestor.submit_job([str(path) for path in files], "test")
+        assert fake.create_job_bodies == []
+        assert ingestor._outstanding_uploads == 0
+    finally:
+        ingestor.close()
+
+
+def test_service_upload_job_creation_and_scheduling_failures_release_capacity(tmp_path, monkeypatch):
+    fake = FakeNRL()
+    fail_job_creation = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal fail_job_creation
+        if fail_job_creation and request.method == "POST" and request.url.path == "/v1/ingest/job":
+            fail_job_creation = False
+            return _response(request, 503, {"detail": "unavailable"})
+        return fake(request)
+
+    config = _adapter_config(handler)
+    config.update({"max_concurrency": 1, "max_queued_uploads": 0})
+    ingestor = NemoRetrieverIngestor(config)
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    third = tmp_path / "third.txt"
+    for path in (first, second, third):
+        path.write_text("content", encoding="utf-8")
+
+    try:
+        with pytest.raises(NemoRetrieverHTTPError):
+            ingestor.submit_job([str(first)], "test")
+        assert ingestor._outstanding_uploads == 0
+
+        original_submit = ingestor._upload_executor.submit
+        monkeypatch.setattr(ingestor._upload_executor, "submit", Mock(side_effect=RuntimeError("closed")))
+        job_id = ingestor.submit_job([str(second)], "test", {"cleanup_files": True})
+        _wait_for_uploads(ingestor, job_id)
+        assert ingestor._outstanding_uploads == 0
+        assert not second.exists()
+
+        monkeypatch.setattr(ingestor._upload_executor, "submit", original_submit)
+        retry_id = ingestor.submit_job([str(third)], "test")
+        _wait_for_uploads(ingestor, retry_id)
+        assert ingestor._outstanding_uploads == 0
+    finally:
+        ingestor.close()
+
+
+def test_service_upload_executor_preserves_configured_concurrency(tmp_path):
+    fake = FakeNRL()
+    state_lock = threading.Lock()
+    two_active = threading.Event()
+    release_uploads = threading.Event()
+    active = 0
+    maximum_active = 0
+
+    def measured(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        if request.method != "POST" or not request.url.path.endswith("/document"):
+            return fake(request)
+        with state_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            if active == 2:
+                two_active.set()
+        try:
+            assert release_uploads.wait(timeout=2)
+            return fake(request)
+        finally:
+            with state_lock:
+                active -= 1
+
+    config = _adapter_config(measured)
+    config.update({"max_concurrency": 2, "max_queued_uploads": 2})
+    ingestor = NemoRetrieverIngestor(config)
+    files = [tmp_path / f"report-{index}.txt" for index in range(4)]
+    for path in files:
+        path.write_text("content", encoding="utf-8")
+
+    try:
+        job_id = ingestor.submit_job([str(path) for path in files], "test")
+        assert two_active.wait(timeout=1)
+        assert maximum_active == 2
+        release_uploads.set()
+        _wait_for_uploads(ingestor, job_id)
+        assert maximum_active == 2
+        assert ingestor._outstanding_uploads == 0
+    finally:
+        release_uploads.set()
+        ingestor.close()
+
+
+def test_service_shutdown_waits_for_submission_before_closing_executor(tmp_path):
+    fake = FakeNRL()
+    job_creation_started = threading.Event()
+    release_job_creation = threading.Event()
+
+    def delayed_job_creation(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/ingest/job":
+            job_creation_started.set()
+            assert release_job_creation.wait(timeout=2)
+        return fake(request)
+
+    config = _adapter_config(delayed_job_creation)
+    config.update({"max_concurrency": 1, "max_queued_uploads": 0})
+    ingestor = NemoRetrieverIngestor(config)
+    upload = tmp_path / "report.txt"
+    upload.write_text("content", encoding="utf-8")
+    submitted_jobs: list[str] = []
+    submission_errors: list[Exception] = []
+
+    def submit() -> None:
+        try:
+            submitted_jobs.append(ingestor.submit_job([str(upload)], "test"))
+        except Exception as error:  # pragma: no cover - asserted below
+            submission_errors.append(error)
+
+    submit_thread = threading.Thread(target=submit)
+    close_thread = threading.Thread(target=ingestor.close)
+    submit_thread.start()
+    assert job_creation_started.wait(timeout=1)
+    close_thread.start()
+    with ingestor._submission_condition:
+        assert ingestor._submission_condition.wait_for(lambda: ingestor._closed, timeout=1)
+        assert ingestor._active_submissions == 1
+
+    release_job_creation.set()
+    submit_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert not submit_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert submission_errors == []
+    assert submitted_jobs == ["job-1"]
+    assert ingestor._outstanding_uploads == 0
+
+
+def test_background_upload_failure_is_terminal_and_secret_safe(tmp_path):
+    fake = FakeNRL()
+    private_path = str(tmp_path / "private")
+
+    def rejected(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/document"):
+            raise httpx.ConnectError(
+                f"Bearer super-secret failed at {private_path}",
+                request=request,
+            )
+        return fake(request)
+
+    ingestor = NemoRetrieverIngestor(_adapter_config(rejected))
+    upload = tmp_path / "report.txt"
+    upload.write_text("content", encoding="utf-8")
+    job_id = ingestor.submit_job([str(upload)], "test", {"cleanup_files": True})
+    _wait_for_uploads(ingestor, job_id)
+
+    status = ingestor.get_job_status(job_id)
+    assert status.status == JobState.FAILED
+    assert status.file_details[0].status == FileStatus.FAILED
+    assert status.file_details[0].error_message == "NeMo Retriever document ingestion failed"
+    assert "super-secret" not in repr(status)
+    assert private_path not in repr(status)
+    assert not upload.exists()
 
 
 def test_query_mapping_citations_content_types_and_image_safety():
@@ -488,8 +834,8 @@ def test_query_mapping_citations_content_types_and_image_safety():
     assert "Relevance Score:" not in formatted
 
 
-@pytest.mark.parametrize("distance", [float("nan"), float("inf"), float("-inf")])
-def test_nonfinite_query_distances_are_rejected(distance):
+@pytest.mark.parametrize("distance", [-0.1, float("nan"), float("inf"), float("-inf")])
+def test_invalid_query_distances_are_rejected(distance):
     with pytest.raises(ValidationError):
         Chunk(
             chunk_id="chunk-1",
@@ -545,6 +891,31 @@ def test_async_operations_are_safe_across_event_loops():
     assert second.success
 
 
+def test_rest_retrievers_do_not_close_the_process_shared_transport(monkeypatch):
+    shared_transport = SimpleNamespace(
+        arequest_json=AsyncMock(return_value={"status": "ok"}),
+        close=Mock(),
+    )
+    constructor = Mock(return_value=shared_transport)
+    monkeypatch.setattr(adapter_module, "_NRLTransport", constructor)
+    adapter_module._SHARED_TRANSPORTS.clear()
+    try:
+        config = {"base_url": "https://nrl.example.test", "scope": "workspace-123"}
+        first = NemoRetrieverRetriever(config)
+        second = NemoRetrieverRetriever(config)
+
+        cleanup = getattr(first, "close", None)
+        if callable(cleanup):
+            cleanup()
+
+        assert first._transport is second._transport
+        assert asyncio.run(second.health_check()) is True
+        assert constructor.call_count == 1
+        shared_transport.close.assert_not_called()
+    finally:
+        adapter_module._SHARED_TRANSPORTS.clear()
+
+
 def test_injected_client_and_request_headers_are_not_mutated():
     requests: list[httpx.Request] = []
 
@@ -593,7 +964,7 @@ def test_retry_after_is_bounded(monkeypatch: pytest.MonkeyPatch, retry_after: st
             return _response(request, 429, headers={"Retry-After": retry_after})
         return _response(request, 200, {"status": "ok"})
 
-    monkeypatch.setattr(transport_module.time, "sleep", delays.append)
+    monkeypatch.setattr(transport_module, "time", SimpleNamespace(sleep=delays.append))
     transport = _adapter_config(handler, retries=1)["_transport"]
 
     transport.request_json("GET", "/v1/health", operation="health check")
@@ -613,7 +984,7 @@ def test_writes_retry_only_when_explicitly_safe(monkeypatch: pytest.MonkeyPatch)
             return _response(request, 503, {"detail": "retry"}, headers={"Retry-After": "0"})
         return _response(request, 200, {"status": "ok"})
 
-    monkeypatch.setattr(transport_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(transport_module, "time", SimpleNamespace(sleep=lambda _: None))
     transport = _adapter_config(handler, retries=1)["_transport"]
 
     with pytest.raises(NemoRetrieverHTTPError) as error:
@@ -770,7 +1141,8 @@ def test_worker_errors_are_contained_in_every_public_document_model(tmp_path):
     ingestor = NemoRetrieverIngestor(_adapter_config(handler))
     upload = tmp_path / "report.txt"
     upload.write_text("content", encoding="utf-8")
-    ingestor.submit_job([str(upload)], "test")
+    job_id = ingestor.submit_job([str(upload)], "test")
+    _wait_for_uploads(ingestor, job_id)
 
     raw_error = (
         "Bearer super-secret failed at https://nrl.example.test/v1 "

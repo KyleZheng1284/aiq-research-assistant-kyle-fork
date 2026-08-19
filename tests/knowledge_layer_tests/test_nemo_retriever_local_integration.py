@@ -10,7 +10,6 @@ import json
 import math
 import os
 import re
-import socket
 import subprocess
 import sys
 import threading
@@ -37,15 +36,18 @@ from aiq_agent.knowledge import JobState
 from aiq_agent.knowledge.schema import ContentType
 
 _PHYSICAL_TABLE_PATTERN = re.compile(r"\bnrl_[0-9a-f]{40}\b")
+_UVICORN_PORT_PATTERN = re.compile(r"Uvicorn running on http://127\.0\.0\.1:(\d+)")
 
 
 class _EmbeddingHandler(BaseHTTPRequestHandler):
     calls: list[dict[str, Any]] = []
+    authorization_headers: list[str | None] = []
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         length = int(self.headers.get("Content-Length", "0"))
         request = json.loads(self.rfile.read(length))
         self.calls.append(request)
+        self.authorization_headers.append(self.headers.get("Authorization"))
         inputs = request.get("input", [])
         payload = {
             "object": "list",
@@ -204,10 +206,20 @@ def _wait_for_job(ingestor: NemoRetrieverLocalIngestor, job_id: str) -> Any:
     raise AssertionError("embedded NeMo Retriever ingestion did not finish")
 
 
-def _free_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
+def _wait_for_server_port(process: subprocess.Popen[str], log_path: Path) -> int:
+    deadline = time.monotonic() + 90
+    log = ""
+    while time.monotonic() < deadline:
+        if log_path.exists():
+            log = log_path.read_text(encoding="utf-8", errors="replace")
+            match = _UVICORN_PORT_PATTERN.search(log)
+            if match is not None:
+                return int(match.group(1))
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+    log = _PHYSICAL_TABLE_PATTERN.sub("[redacted-table]", log[-6000:])
+    raise RuntimeError(f"nat serve did not publish its assigned port (exit={process.poll()}):\n{log}")
 
 
 def _wait_until_ready(client: httpx.Client, process: subprocess.Popen[str], log_path: Path) -> None:
@@ -291,6 +303,7 @@ def test_embedded_lancedb_lifecycle_survives_restart_without_ray_or_physical_id_
     ray = pytest.importorskip("ray")
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     monkeypatch.delenv("NGC_API_KEY", raising=False)
+    monkeypatch.delenv("NRL_INFERENCE_API_KEY", raising=False)
     assert ray.is_initialized() is False
 
     state = _RemoteFakeState()
@@ -422,9 +435,11 @@ def test_real_fast_text_pipeline_uses_only_local_process_and_embedding_endpoint(
     pytest.importorskip("nemo_retriever")
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     monkeypatch.delenv("NGC_API_KEY", raising=False)
+    monkeypatch.delenv("NRL_INFERENCE_API_KEY", raising=False)
     assert ray.is_initialized() is False
 
     _EmbeddingHandler.calls = []
+    _EmbeddingHandler.authorization_headers = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _EmbeddingHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -454,6 +469,7 @@ def test_real_fast_text_pipeline_uses_only_local_process_and_embedding_endpoint(
         assert all(chunk.score == 0 for chunk in result.chunks)
         assert all(chunk.distance is not None and math.isfinite(chunk.distance) for chunk in result.chunks)
         assert {call["input_type"] for call in _EmbeddingHandler.calls} == {"passage", "query"}
+        assert set(_EmbeddingHandler.authorization_headers) == {None}
         assert ray.is_initialized() is False
     finally:
         retriever.close()
@@ -472,6 +488,7 @@ def test_native_nat_serve_ingest_query_and_delete_without_retriever_service(tmp_
     assert nat_executable.is_file(), f"NAT executable is missing from the isolated environment: {nat_executable}"
 
     _EmbeddingHandler.calls = []
+    _EmbeddingHandler.authorization_headers = []
     embedding_server = ThreadingHTTPServer(("127.0.0.1", 0), _EmbeddingHandler)
     embedding_thread = threading.Thread(target=embedding_server.serve_forever, daemon=True)
     embedding_thread.start()
@@ -480,8 +497,9 @@ def test_native_nat_serve_ingest_query_and_delete_without_retriever_service(tmp_
         source = tmp_path / "real-fast-text.pdf"
         log_path = tmp_path / "nat-serve.log"
         _write_text_pdf(source)
-        port = _free_port()
         env = dict(os.environ)
+        for credential_name in ("NVIDIA_API_KEY", "NGC_API_KEY", "NRL_INFERENCE_API_KEY"):
+            env.pop(credential_name, None)
         env.update(
             {
                 "AIQ_AGENT_LLM_API_KEY": "local",  # pragma: allowlist secret
@@ -509,7 +527,7 @@ def test_native_nat_serve_ingest_query_and_delete_without_retriever_service(tmp_
                     "--host",
                     "127.0.0.1",
                     "--port",
-                    str(port),
+                    "0",
                 ],
                 cwd=project_root,
                 env=env,
@@ -518,6 +536,7 @@ def test_native_nat_serve_ingest_query_and_delete_without_retriever_service(tmp_
                 text=True,
             )
             try:
+                port = _wait_for_server_port(process, log_path)
                 with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=30, trust_env=False) as client:
                     _wait_until_ready(client, process, log_path)
                     created = client.post("/v1/collections", json={"name": "reports"})
@@ -558,6 +577,8 @@ def test_native_nat_serve_ingest_query_and_delete_without_retriever_service(tmp_
                 # Windows cannot remove SQLite/LanceDB files while NAT has them open.
                 _stop_process(process)
         assert {call["input_type"] for call in _EmbeddingHandler.calls} == {"passage", "query"}
+        assert set(_EmbeddingHandler.authorization_headers) == {None}
+        assert "NemoRetrieverLocalLockError" not in log_path.read_text(encoding="utf-8")
     finally:
         _stop_process(process)
         embedding_server.shutdown()
