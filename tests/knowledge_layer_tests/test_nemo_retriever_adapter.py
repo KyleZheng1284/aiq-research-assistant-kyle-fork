@@ -833,8 +833,8 @@ def test_query_mapping_citations_content_types_and_image_safety():
     assert "Relevance Score:" not in formatted
 
 
-@pytest.mark.parametrize("distance", [float("nan"), float("inf"), float("-inf")])
-def test_nonfinite_query_distances_are_rejected(distance):
+@pytest.mark.parametrize("distance", [-0.1, float("nan"), float("inf"), float("-inf")])
+def test_invalid_query_distances_are_rejected(distance):
     with pytest.raises(ValidationError):
         Chunk(
             chunk_id="chunk-1",
