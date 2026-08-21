@@ -67,11 +67,10 @@ class Chunk(BaseModel):
     score: float = Field(0.0, ge=0.0, le=1.0, description="Similarity score (0.0 to 1.0).")
     distance: float | None = Field(
         None,
-        ge=0.0,
         allow_inf_nan=False,
         description=(
-            "Optional non-negative backend-native vector distance; lower values are closer, there is no fixed "
-            "upper bound, and values are not necessarily comparable across backends or metrics."
+            "Optional finite backend-native vector distance; lower values are closer, there is no fixed range, and "
+            "values are not necessarily comparable across backends or metrics."
         ),
     )
 

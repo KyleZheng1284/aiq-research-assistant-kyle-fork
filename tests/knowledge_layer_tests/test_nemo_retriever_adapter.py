@@ -734,7 +734,7 @@ def test_query_mapping_citations_content_types_and_image_safety():
             "chunk_id": "text-1",
             "document_id": "doc-1",
             "text": "Text body",
-            "distance": 0.1,
+            "distance": -0.1,
             "filename": "report.pdf",
             "page_number": 2,
             "content_type": "text",
@@ -809,7 +809,7 @@ def test_query_mapping_citations_content_types_and_image_safety():
         "image-2",
         "unknown-1",
     ]
-    assert [chunk.distance for chunk in result.chunks] == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    assert [chunk.distance for chunk in result.chunks] == pytest.approx([-0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
     assert all(chunk.score == 0.0 for chunk in result.chunks)
     assert [chunk.content_type for chunk in result.chunks] == [
         ContentType.TEXT,
@@ -830,11 +830,11 @@ def test_query_mapping_citations_content_types_and_image_safety():
     assert result.chunks[4].image_url == "https://images.example.test/signed.png"
     assert result.chunks[5].metadata["source"] == {"label": "logical source"}
     formatted = _format_results(result, "findings")
-    assert "Vector Distance: 0.1 (lower is closer)" in formatted
+    assert "Vector Distance: -0.1 (lower is closer)" in formatted
     assert "Relevance Score:" not in formatted
 
 
-@pytest.mark.parametrize("distance", [-0.1, float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("distance", [float("nan"), float("inf"), float("-inf")])
 def test_invalid_query_distances_are_rejected(distance):
     with pytest.raises(ValidationError):
         Chunk(

@@ -277,8 +277,7 @@ functions:
 ### `knowledge_retrieval`
 
 Semantic search over ingested documents. Supports LlamaIndex (local ChromaDB), Foundational RAG
-(hosted NVIDIA RAG Blueprint), OpenSearch (self-hosted OpenSearch or Amazon OpenSearch Serverless), Azure AI Search,
-and an independently deployed NeMo Retriever service through its public REST API.
+(hosted NVIDIA RAG Blueprint), OpenSearch (self-hosted OpenSearch or Amazon OpenSearch Serverless), and Azure AI Search.
 
 ```yaml
 functions:
@@ -338,25 +337,9 @@ functions:
     embed_model: ${AIQ_EMBED_MODEL:-nvidia/nemotron-3-embed-1b}
 ```
 
-```yaml
-functions:
-  # NeMo Retriever REST backend
-  knowledge_search:
-    _type: knowledge_retrieval
-    backend: nemo_retriever
-    collection_name: ${COLLECTION_NAME:-aiq-nrl}
-    top_k: 5
-    generate_summary: false
-    nrl_base_url: ${NRL_BASE_URL:-http://127.0.0.1:7670}
-    nrl_api_token: ${NRL_API_TOKEN:-}
-    nrl_scope: ${NRL_SCOPE}
-    nrl_verify_ssl: ${NRL_VERIFY_SSL:-true}
-    nrl_collection_ttl_hours: ${NRL_COLLECTION_TTL_HOURS:-24}
-```
-
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `backend` | `str` | `llamaindex` | Backend type: `llamaindex`, `opensearch`, `foundational_rag`, `azure_ai_search`, or `nemo_retriever`. |
+| `backend` | `str` | `llamaindex` | Backend type: `llamaindex`, `opensearch`, `foundational_rag`, or `azure_ai_search`. |
 | `collection_name` | `str` | `default` | Fallback retrieval collection when no conversation or session context is present. Request context takes precedence; ingestion selects its collection explicitly. |
 | `top_k` | `int` | `5` | Number of results to return per query. |
 | `generate_summary` | `bool` | `false` | Generate one-sentence summaries for ingested documents. |
@@ -386,16 +369,6 @@ functions:
 | `opensearch_dask_file_transfer` | `str` | `bytes` | Send uploads to Dask workers as `bytes` or shared filesystem `paths`. |
 | `embed_model` | `str` | `nvidia/nemotron-3-embed-1b` | Embedding model for OpenSearch and Azure AI Search ingestion and retrieval. |
 | `embed_base_url` | `str` | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible embeddings endpoint for OpenSearch and Azure AI Search. |
-| `nrl_base_url` | `str` | `http://127.0.0.1:7670` | Public NeMo Retriever gateway URL. |
-| `nrl_api_token` | `SecretStr` | `NRL_API_TOKEN` or `None` | Optional bearer token. |
-| `nrl_scope` | `str` | **required** | Workspace scope sent as `X-NRL-Scope` on every request. |
-| `nrl_connect_timeout_s` | `float` | `30` | Gateway connection timeout in seconds. |
-| `nrl_request_timeout_s` | `float` | `300` | Request timeout in seconds, including uploads. |
-| `nrl_max_retries` | `int` | `5` | Bounded retries for transport failures, 429, and retryable 5xx responses. |
-| `nrl_max_concurrency` | `int` | `8` | Maximum concurrent multipart document uploads. |
-| `nrl_verify_ssl` | `bool` | `true` | Verify the NRL gateway TLS certificate. |
-| `nrl_ca_bundle` | `str` | `None` | Optional enterprise CA bundle path. |
-| `nrl_collection_ttl_hours` | `float` | `24` | Expiration applied when AI-Q creates an NRL collection. |
 
 Refer to [Knowledge Layer](./knowledge-layer.md) for backend selection and the
 [Amazon OpenSearch Serverless](../deployment/aws-opensearch-serverless.md) guide for SigV4, IAM, and AOSS setup.
@@ -760,7 +733,7 @@ workflow:
 
 ## Provided Config Files
 
-The repository includes twelve top-level workflow configurations. They are focused reference profiles, not cumulative
+The repository includes eleven top-level workflow configurations. They are focused reference profiles, not cumulative
 layers, and no single profile enables every capability. Start from the profile closest to the deployment and merge
 only the additional sections you need.
 
@@ -773,7 +746,6 @@ only the additional sections you need.
 | `configs/config_web_opensearch.yml` | Web API | Built-in OpenSearch knowledge backend plus Tavily. Supports unauthenticated or basic self-hosted OpenSearch and SigV4 (`es` or `aoss`); infrastructure and credentials are deployment opt-ins. |
 | `configs/config_frontier_models.yml` | Web API | Shipped LlamaIndex frontier profile: GPT-5.6 Luna for intent/shallow/source routing/research, GPT-5.6 Sol for clarification/orchestration/planning/writing, and Gemma 4 for summaries. Requires `NVIDIA_API_KEY`, `OPENAI_API_KEY`, and `TAVILY_API_KEY` for the enabled Tavily tools; the commented paper-search opt-in requires `SERPER_API_KEY` when enabled. Validate the complete workflow against the configured provider endpoints before deployment. |
 | `configs/config_web_default_guardrails.yml` | Web API | LlamaIndex with workflow Guardrails attached explicitly, shallow-agent Guardrails dynamically attached through `workflow_functions`, and async deep-agent Guardrails applied by the AI-Q runner from the same target configuration. |
-| `configs/config_web_nemo_retriever.yml` | Web API | Independently deployed NeMo Retriever knowledge backend plus Tavily. Requires the NRL gateway URL, workspace scope, and optional bearer token. |
 | `configs/config_web_frag_mcp_auth.yml` | Web API | Foundational RAG plus a protected per-user OAuth MCP source example. Requires a real protected MCP endpoint and shared token-store configuration; it is not a zero-config default. |
 | `configs/config_domain_routing_and_skills.yml` | Direct deep-research workflow | Automatic domain routing, Tavily, DuckDuckGo news, Polymarket, LlamaIndex, enabled Serper paper search, built-in skills, and a Modal sandbox. Requires the corresponding service credentials and Modal setup. |
 | `configs/config_openshell.yml` | Web API, experimental | Skills and artifact capture over one policy-bound OpenShell sandbox per deep-research job, with fail-closed policy attestation and terminal deletion. |

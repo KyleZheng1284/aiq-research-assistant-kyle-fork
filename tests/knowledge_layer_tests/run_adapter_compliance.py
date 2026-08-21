@@ -21,8 +21,6 @@ Usage:
     python tests/knowledge_layer_tests/run_adapter_compliance.py --backend opensearch --quick
     python tests/knowledge_layer_tests/run_adapter_compliance.py --backend azure_ai_search --quick \
       --config '{"endpoint":"https://example.search.windows.net","start_ttl_cleanup":false}'
-    python tests/knowledge_layer_tests/run_adapter_compliance.py --backend nemo_retriever --quick \
-      --config '{"base_url":"http://127.0.0.1:7670","scope":"workspace-123"}'
 
     # Full mode - complete ingestion + retrieval test
     python tests/knowledge_layer_tests/run_adapter_compliance.py --backend llamaindex
@@ -34,10 +32,6 @@ Usage:
     export AIQ_AZURE_SEARCH_INDEX_PREFIX="aiq-${USER}"
     python tests/knowledge_layer_tests/run_adapter_compliance.py --backend azure_ai_search \
       --config '{"start_ttl_cleanup":false}'
-
-    python tests/knowledge_layer_tests/run_adapter_compliance.py --backend nemo_retriever \
-      --config '{"base_url":"http://127.0.0.1:7670","api_token":"...",\
-                 "scope":"workspace-123"}'
 
     # For managed identity, omit AZURE_SEARCH_API_KEY. Set AZURE_CLIENT_ID for a
     # user-assigned identity. NVIDIA_API_KEY remains required for embeddings.
@@ -113,7 +107,6 @@ class AdapterComplianceTest:
             "foundational_rag": "knowledge_layer.foundational_rag",
             "opensearch": "knowledge_layer.opensearch",
             "azure_ai_search": "knowledge_layer.azure_ai_search",
-            "nemo_retriever": "knowledge_layer.nemo_retriever",
         }
 
         module_name = backend_imports.get(self.backend.lower())
@@ -478,7 +471,7 @@ def main():
         "--backend",
         "-b",
         required=True,
-        help=("Backend name (e.g., llamaindex, foundational_rag, opensearch, azure_ai_search, nemo_retriever)"),
+        help="Backend name (e.g., llamaindex, foundational_rag, opensearch, azure_ai_search)",
     )
 
     parser.add_argument("--config", "-c", default="{}", help="Backend config as JSON string (default: {})")

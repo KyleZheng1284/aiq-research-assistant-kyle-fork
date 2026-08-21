@@ -177,14 +177,12 @@ functions:
   intent_classifier:
     _type: intent_classifier
     llm: nemotron_lightning_intent_llm
-    verbose: true
 
   clarifier_agent:
     _type: clarifier_agent
     llm: nemotron_ultra_llm
     max_turns: 3
     log_response_max_chars: 2000
-    verbose: true
 
   shallow_research_agent:
     _type: shallow_research_agent
@@ -205,11 +203,9 @@ functions:
     writer_llm: nemotron_ultra_writer_llm
     exclude_tools:
       - web_search_tool
-    verbose: true
 
 workflow:
   _type: chat_deepresearcher_agent
-  verbose: true
   enable_escalation: true
   enable_clarifier: true
   use_async_deep_research: true

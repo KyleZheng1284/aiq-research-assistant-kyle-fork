@@ -48,7 +48,7 @@ def _result(*, success: bool = True) -> RetrievalResult:
                 chunk_id="chunk-1",
                 content="Revenue increased.",
                 score=0.0,
-                distance=0.125,
+                distance=-0.125,
                 file_name="report.pdf",
                 display_citation="report.pdf, p.1",
                 page_number=1,
@@ -81,7 +81,7 @@ def test_direct_query_preserves_native_distance_and_closes_retriever(monkeypatch
     result = asyncio.run(endpoint(request=_request(filters={"team": "finance"}), ingestor=ingestor))
 
     assert result.chunks[0].score == 0.0
-    assert result.chunks[0].distance == 0.125
+    assert result.chunks[0].distance == -0.125
     retriever.retrieve.assert_awaited_once_with(
         query="What was revenue?",
         collection_name="reports",
@@ -177,5 +177,5 @@ def test_direct_query_http_contract_and_validation(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["chunks"][0]["score"] == 0.0
-    assert response.json()["chunks"][0]["distance"] == 0.125
+    assert response.json()["chunks"][0]["distance"] == -0.125
     assert blank_response.status_code == 422

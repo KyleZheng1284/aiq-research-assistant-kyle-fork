@@ -1,5 +1,6 @@
-# Experimental zero-deployment NeMo Retriever profile.
-# AI-Q and LanceDB run in one Python 3.12 process; inference endpoints may be remote.
+# Experimental zero-deployment NeMo Retriever Web configuration.
+# AI-Q, NeMo Retriever, and LanceDB run in one Python 3.12 process. The
+# standard web-search tools and configured inference endpoints may be remote.
 
 general:
   # uvloop is unavailable on Windows. Keep this profile platform-neutral.
@@ -43,14 +44,31 @@ llms:
     num_retries: 3
 
 functions:
+  # Agents inherit tools from this registry and requests can select sources.
   data_sources:
     _type: data_source_registry
     sources:
+      - id: web_search
+        name: "Web Search"
+        description: "Search the web for real-time information."
+        tools:
+          - web_search_tool
+          - advanced_web_search_tool
       - id: knowledge_layer
         name: "Knowledge Base"
         description: "Search documents stored by embedded NeMo Retriever."
         tools:
           - knowledge_search
+
+  web_search_tool:
+    _type: tavily_web_search
+    max_results: 5
+    max_content_length: 1000
+
+  advanced_web_search_tool:
+    _type: tavily_web_search
+    max_results: 2
+    advanced_search: true
 
   knowledge_search:
     _type: knowledge_retrieval
@@ -71,21 +89,27 @@ functions:
       inference_api_key: ${NRL_INFERENCE_API_KEY:-}
       collection_ttl_hours: ${NRL_COLLECTION_TTL_HOURS:-24}
 
+  # Paper Search (optional - requires SERPER_API_KEY).
+  # paper_search_tool:
+  #   _type: paper_search
+  #   max_results: 5
+  #   serper_api_key: ${SERPER_API_KEY}
+
   intent_classifier:
     _type: intent_classifier
     llm: agent_llm
-    verbose: true
 
   clarifier_agent:
     _type: clarifier_agent
     llm: agent_llm
     max_turns: 3
     log_response_max_chars: 2000
-    verbose: true
 
   shallow_research_agent:
     _type: shallow_research_agent
     llm: agent_llm
+    exclude_tools:
+      - advanced_web_search_tool
     verbose: true
     max_llm_turns: 10
     max_tool_iterations: 5
@@ -98,11 +122,11 @@ functions:
     researcher_llm: agent_llm
     planner_llm: agent_llm
     writer_llm: agent_llm
-    verbose: true
+    exclude_tools:
+      - web_search_tool
 
 workflow:
   _type: chat_deepresearcher_agent
-  verbose: true
   enable_escalation: true
   enable_clarifier: true
   # Keep full research in this process; detached process jobs require service mode.

@@ -506,6 +506,21 @@ def test_local_profile_selects_embedded_backend_and_upstream_auto_defaults() -> 
     assert config["general"]["use_uvloop"] is False
     assert config["general"]["front_end"]["dask_workers"] == "threads"
     assert config["workflow"]["use_async_deep_research"] is False
+    sources = {source["id"]: source for source in functions["data_sources"]["sources"]}
+    assert sources["web_search"]["tools"] == ["web_search_tool", "advanced_web_search_tool"]
+    assert sources["knowledge_layer"]["tools"] == ["knowledge_search"]
+    assert functions["web_search_tool"] == {
+        "_type": "tavily_web_search",
+        "max_results": 5,
+        "max_content_length": 1000,
+    }
+    assert functions["advanced_web_search_tool"] == {
+        "_type": "tavily_web_search",
+        "max_results": 2,
+        "advanced_search": True,
+    }
+    assert functions["shallow_research_agent"]["exclude_tools"] == ["advanced_web_search_tool"]
+    assert functions["deep_research_agent"]["exclude_tools"] == ["web_search_tool"]
     assert local_llm["_type"] == "openai"
     assert local_llm["model_name"] == "${AIQ_AGENT_LLM_MODEL:-openai/local-tool-model}"
     assert local_llm["base_url"] == "${AIQ_AGENT_LLM_BASE_URL:-http://127.0.0.1:1234/v1}"
@@ -529,6 +544,18 @@ def test_local_profile_selects_embedded_backend_and_upstream_auto_defaults() -> 
     assert knowledge["backend_config"]["data_dir"] == "${NRL_LOCAL_DATA_DIR:-.aiq-data/nemo_retriever}"
     assert knowledge["backend_config"]["profile"] == "${NRL_LOCAL_PROFILE:-auto}"
     assert knowledge["generate_summary"] is False
+
+
+def test_nemo_retriever_profiles_only_keep_supported_verbose_setting() -> None:
+    for filename in ("config_web_nemo_retriever.yml", "config_web_nemo_retriever_local.yml"):
+        config = yaml.safe_load((PROJECT_ROOT / "configs" / filename).read_text(encoding="utf-8"))
+        functions = config["functions"]
+
+        assert "verbose" not in functions["intent_classifier"]
+        assert "verbose" not in functions["clarifier_agent"]
+        assert functions["shallow_research_agent"]["verbose"] is True
+        assert "verbose" not in functions["deep_research_agent"]
+        assert "verbose" not in config["workflow"]
 
 
 def test_pdf_image_extraction_supports_pdfium_4_and_5(tmp_path) -> None:
@@ -1340,7 +1367,7 @@ def test_query_preserves_distance_rejects_filters_and_uses_upstream_defaults(tmp
             "chunk_id": "chunk-1",
             "document_id": "doc-1",
             "text": "answer",
-            "distance": 1.75,
+            "distance": -1.75,
             "filename": "report.pdf",
             "page_number": 2,
             "content_type": "text",
@@ -1349,7 +1376,7 @@ def test_query_preserves_distance_rejects_filters_and_uses_upstream_defaults(tmp
     ]
     result = asyncio.run(retriever.retrieve("question", "reports", top_k=3))
     assert result.success
-    assert result.chunks[0].distance == 1.75
+    assert result.chunks[0].distance == -1.75
     assert result.chunks[0].score == 0
     assert "physical_table" not in result.chunks[0].metadata
     query_kwargs = state.query_calls[0][1]

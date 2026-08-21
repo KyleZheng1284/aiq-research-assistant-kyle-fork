@@ -102,6 +102,10 @@ Set `NRL_INFERENCE_API_KEY` in the ignored `deploy/.env` when using Retriever's
 default hosted extraction and embedding endpoints. Keep `NVIDIA_API_KEY`
 separate when the AI-Q agent LLM uses a different credential.
 
+Set `TAVILY_API_KEY` to enable the standard web-search tools. Without it, the
+server and direct Knowledge API remain available, while web-search calls return
+the existing missing-key response.
+
 ```bash
 uv run --project environments/nemo_retriever_local --frozen \
   dotenv -f deploy/.env run \
@@ -318,6 +322,11 @@ time. It reserves complete batches before NRL job creation: an individually
 oversized batch returns HTTP 413, while temporary saturation returns HTTP 503
 without `Retry-After`. Accepted requests retain the same REST calls, ordering,
 retry behavior, and multipart concurrency.
+
+AI-Q forwards caller-supplied file metadata in the upload request, but the pinned
+service baseline does not propagate that field into persisted chunk metadata.
+Do not rely on service-mode file metadata for retrieval until NRL exposes that
+capability; metadata filters remain unsupported by both adapters.
 
 Query results preserve the order returned by NeMo Retriever and expose its native
 vector distance as `Chunk.distance`. Lower values are closer; AIQ does not
