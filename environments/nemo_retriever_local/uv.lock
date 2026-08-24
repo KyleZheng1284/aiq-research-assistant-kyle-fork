@@ -14,9 +14,6 @@ required-markers = [
 [options]
 prerelease-mode = "allow"
 
-[manifest]
-overrides = [{ name = "cryptography", specifier = ">=46.0.6,<47" }]
-
 [[package]]
 name = "aiobotocore"
 version = "3.9.0"

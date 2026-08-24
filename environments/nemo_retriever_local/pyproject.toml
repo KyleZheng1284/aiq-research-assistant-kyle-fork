@@ -24,13 +24,6 @@ required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
     "sys_platform == 'win32' and platform_machine == 'AMD64'",
 ]
-# Keep the NAT-compatible cryptography policy isolated from NeMo Retriever's
-# development-repository uv policy. Neither override changes published wheel
-# metadata.
-override-dependencies = [
-    "cryptography>=46.0.6,<47",
-]
-
 [tool.uv.sources]
 aiq-agent = { path = "../..", editable = true }
 aiq-api = { path = "../../frontends/aiq_api", editable = true }
