@@ -369,14 +369,15 @@ shipped profile defaults to scope `local`, data directory `.aiq-data/nemo_retrie
 profile. This is zero deployment for Retriever and vector storage; extraction and embedding may still call remote
 inference endpoints.
 
-When using NRL's default hosted endpoints, set `NRL_INFERENCE_API_KEY` in `deploy/.env`. AI-Q passes this one credential
-to NRL's extraction, document-embedding, and query-embedding calls. This keeps it separate from `NVIDIA_API_KEY`, which
-can continue to authenticate the AI-Q agent LLM. If `NRL_INFERENCE_API_KEY` is unset, pinned NRL falls back to
-`NVIDIA_API_KEY` and then `NGC_API_KEY`.
+When using NRL's default hosted endpoints, authenticate with an NVIDIA Build `nvapi-...` key. `NRL_INFERENCE_API_KEY`
+is an optional explicit Retriever credential, not a separate key type: it can use the same value as `NVIDIA_API_KEY`.
+AI-Q passes the resolved credential to NRL's extraction, document-embedding, and query-embedding calls. Set a distinct
+value only when Retriever and the AI-Q agent LLM need different credentials. If `NRL_INFERENCE_API_KEY` is unset,
+pinned NRL falls back to `NVIDIA_API_KEY` and then `NGC_API_KEY`.
 
 The default URLs are supplied by NRL, so they do not need to be configured in AI-Q: Page Elements and OCR use the
 hosted `ai.api.nvidia.com` services, while embedding uses `integrate.api.nvidia.com/v1/embeddings`. Set the corresponding
-`NRL_*_INVOKE_URL` only to override a default. Table Structure stays disabled unless
+`NRL_*_INVOKE_URL` only for a compatible external or self-hosted NIM override. Table Structure stays disabled unless
 `NRL_TABLE_STRUCTURE_INVOKE_URL` is configured. All configured NRL inference endpoints share the resolved
 `NRL_INFERENCE_API_KEY`; AI-Q does not define separate keys per endpoint.
 
@@ -729,7 +730,7 @@ Configuration values are resolved in the following order (highest to lowest prio
 | `NRL_LOCAL_DATA_DIR`, `NRL_LOCAL_PROFILE` | nemo_retriever_local | Embedded data directory and NRL `auto` or `fast-text` profile |
 | `NRL_PAGE_ELEMENTS_INVOKE_URL`, `NRL_OCR_INVOKE_URL`, `NRL_TABLE_STRUCTURE_INVOKE_URL` | nemo_retriever_local | Optional extraction endpoint overrides |
 | `NRL_EMBED_INVOKE_URL`, `NRL_EMBED_MODEL_NAME`, `NRL_EMBED_MODEL_PROVIDER_PREFIX` | nemo_retriever_local | Embedding endpoint and model overrides |
-| `NRL_INFERENCE_API_KEY` | nemo_retriever_local | Credential for extraction and document/query embedding; required for NRL's default hosted endpoints unless `NVIDIA_API_KEY` or `NGC_API_KEY` supplies the fallback |
+| `NRL_INFERENCE_API_KEY` | nemo_retriever_local | Optional explicit NVIDIA Build credential for extraction and document/query embedding; it may match `NVIDIA_API_KEY`, which is the first fallback when this variable is unset |
 | `NRL_COLLECTION_TTL_HOURS` | nemo_retriever, nemo_retriever_local | Expiration applied to new NRL collections |
 | `COLLECTION_NAME` | All | Default retrieval collection when no conversation or session context is present |
 
@@ -750,7 +751,7 @@ Configuration values are resolved in the following order (highest to lowest prio
 | NRL `401` or `403` | Missing/invalid token or unauthorized scope | Verify `NRL_API_TOKEN` and its authorization for `NRL_SCOPE` |
 | NRL job creation/upload `404` or `410` | AI-Q and NRL use incompatible collection-management APIs | Upgrade the NRL chart/image to the validated API version; polling `404`/`410` instead means the job is missing or expired |
 | NRL TXT/HTML failure | Service image predates the validated integration baseline | Deploy the documented compatible NRL revision or a released successor |
-| Embedded NRL inference `401` | Hosted extraction or embedding rejected its credential | Set `NRL_INFERENCE_API_KEY` in `deploy/.env`; use `NVIDIA_API_KEY` separately for the AI-Q agent LLM when the endpoints require different credentials |
+| Embedded NRL inference `401` | Hosted extraction or embedding rejected its credential | Set a valid NVIDIA Build key in `NRL_INFERENCE_API_KEY`; it may match `NVIDIA_API_KEY`, or use a distinct value when Retriever and agent endpoints require different credentials |
 | Embedded NRL collection ownership mismatch | The data directory was created with a different scope, profile, embedding model, or provider prefix | Restore the original settings or select a new `NRL_LOCAL_DATA_DIR` and re-ingest |
 | Embedded NRL data-directory lock | Another AI-Q process already owns the directory | Stop the other process or select a different `NRL_LOCAL_DATA_DIR`; sharing one directory across processes is unsupported |
 | Backend registered twice | Module imported multiple times | Normal - factory logs warning but works fine |

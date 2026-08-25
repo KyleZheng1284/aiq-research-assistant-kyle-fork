@@ -98,9 +98,11 @@ out of the normal `knowledge-layer[all]` installation.
 uv sync --project environments/nemo_retriever_local --frozen
 ```
 
-Set `NRL_INFERENCE_API_KEY` in the ignored `deploy/.env` when using Retriever's
-default hosted extraction and embedding endpoints. Keep `NVIDIA_API_KEY`
-separate when the AI-Q agent LLM uses a different credential.
+Retriever's default hosted extraction and embedding endpoints accept an NVIDIA
+Build `nvapi-...` key. `NRL_INFERENCE_API_KEY` may use the same value as
+`NVIDIA_API_KEY`; set a distinct value only when Retriever and the AI-Q agent
+LLM need different credentials. When unset, Retriever reuses `NVIDIA_API_KEY`
+and then `NGC_API_KEY`.
 
 Set `TAVILY_API_KEY` to enable the standard web-search tools. Without it, the
 server and direct Knowledge API remain available, while web-search calls return
@@ -125,15 +127,16 @@ environment.
 Start from
 [`configs/config_web_nemo_retriever_local.yml`](../../../../configs/config_web_nemo_retriever_local.yml).
 Retriever supplies its default hosted endpoint URLs, so configure individual
-invoke URLs only when overriding those defaults. The table below lists every
-NeMo Retriever environment variable exposed by the embedded AI-Q backend.
+invoke URLs only for compatible external or self-hosted NIM overrides. The
+table below lists every NeMo Retriever environment variable exposed by the
+embedded AI-Q backend.
 
 | YAML field | Environment variable | Default | Purpose |
 |---|---|---:|---|
 | `backend_config.scope` | `NRL_SCOPE` | `local` | Logical collection scope |
 | `backend_config.data_dir` | `NRL_LOCAL_DATA_DIR` | `.aiq-data/nemo_retriever` | LanceDB, catalog, recovery, and staging root |
 | `backend_config.profile` | `NRL_LOCAL_PROFILE` | `auto` | `auto` or `fast-text` extraction profile |
-| `backend_config.inference_api_key` | `NRL_INFERENCE_API_KEY` | Retriever key fallback | Shared credential for extraction plus document/query embedding |
+| `backend_config.inference_api_key` | `NRL_INFERENCE_API_KEY` | `NVIDIA_API_KEY`, then `NGC_API_KEY` | Optional explicit NVIDIA Build credential for extraction plus document/query embedding; it may match `NVIDIA_API_KEY` |
 | `backend_config.page_elements_invoke_url` | `NRL_PAGE_ELEMENTS_INVOKE_URL` | Retriever default | Optional Page Elements endpoint override |
 | `backend_config.ocr_invoke_url` | `NRL_OCR_INVOKE_URL` | Retriever default | Optional OCR endpoint override |
 | `backend_config.table_structure_invoke_url` | `NRL_TABLE_STRUCTURE_INVOKE_URL` | unset | Enables and overrides Table Structure when configured |
