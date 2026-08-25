@@ -479,8 +479,8 @@ def test_real_fast_text_pipeline_uses_only_local_process_and_embedding_endpoint(
         server_thread.join()
 
 
-def test_native_nat_serve_ingest_query_and_delete_without_retriever_service(tmp_path):
-    """Exercise the public Knowledge API through a native zero-deployment server."""
+def test_native_nat_serve_ingest_and_delete_without_retriever_service(tmp_path):
+    """Exercise collection and document APIs through a native zero-deployment server."""
     pytest.importorskip("nemo_retriever", reason="native local E2E runs in the isolated Python 3.12 environment")
     project_root = Path(__file__).resolve().parents[2]
     executable_name = "nat.exe" if os.name == "nt" else "nat"
@@ -551,20 +551,6 @@ def test_native_nat_serve_ingest_query_and_delete_without_retriever_service(tmp_
                     assert status["status"] == "completed", status
                     assert status["file_details"][0]["chunks_created"] > 0
 
-                    queried = client.post(
-                        "/v1/knowledge/query",
-                        json={"query": "revenue", "collection_name": "reports", "top_k": 3},
-                    )
-                    queried.raise_for_status()
-                    result = queried.json()
-                    assert result["success"] is True
-                    assert result["chunks"]
-                    assert "revenue" in result["chunks"][0]["content"].lower()
-                    assert all(chunk["score"] == 0 for chunk in result["chunks"])
-                    serialized = json.dumps(result, sort_keys=True)
-                    assert _PHYSICAL_TABLE_PATTERN.search(serialized) is None
-                    assert str(tmp_path / "nemo-retriever") not in serialized
-
                     deleted = client.request(
                         "DELETE",
                         "/v1/collections/reports/documents",
@@ -576,7 +562,7 @@ def test_native_nat_serve_ingest_query_and_delete_without_retriever_service(tmp_
             finally:
                 # Windows cannot remove SQLite/LanceDB files while NAT has them open.
                 _stop_process(process)
-        assert {call["input_type"] for call in _EmbeddingHandler.calls} == {"passage", "query"}
+        assert {call["input_type"] for call in _EmbeddingHandler.calls} == {"passage"}
         assert set(_EmbeddingHandler.authorization_headers) == {None}
         assert "NemoRetrieverLocalLockError" not in log_path.read_text(encoding="utf-8")
     finally:

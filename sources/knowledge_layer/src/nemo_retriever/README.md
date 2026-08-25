@@ -54,8 +54,9 @@ AI-Q process -> NeMo Retriever operators -> embedded LanceDB
                        +-> configured extraction and embedding endpoints
 ```
 
-Direct Knowledge API ingestion and retrieval do not require a generative LLM.
-The complete research workflow still requires an OpenAI-compatible agent LLM.
+Document ingestion does not require a generative LLM. Normal research invokes
+the registered `knowledge_search` tool and requires an OpenAI-compatible agent
+LLM.
 
 The embedded adapter is orchestration over Retriever's public library
 contracts, not a parallel VectorDB implementation:
@@ -105,8 +106,8 @@ LLM need different credentials. When unset, Retriever reuses `NVIDIA_API_KEY`
 and then `NGC_API_KEY`.
 
 Set `TAVILY_API_KEY` to enable the standard web-search tools. Without it, the
-server and direct Knowledge API remain available, while web-search calls return
-the existing missing-key response.
+server and collection/document APIs remain available, while web-search calls
+return the existing missing-key response.
 
 ```bash
 uv run --project environments/nemo_retriever_local --frozen \
@@ -114,13 +115,9 @@ uv run --project environments/nemo_retriever_local --frozen \
   nat serve --config_file configs/config_web_nemo_retriever_local.yml --port 8000
 ```
 
-This starts the backend at `http://localhost:8000`. The direct query route is
-`POST /v1/knowledge/query`; the web UI creates session collection names
-automatically. This deployment-scoped route is intended for headless retrieval
-and operational validation; the chat workflow calls the registered retriever
-directly. It does not provide per-user collection authorization. Enable AI-Q
-authentication and network controls before exposing it outside a trusted local
-environment.
+This starts the backend at `http://localhost:8000`. The web UI creates session
+collection names automatically, and normal research queries the selected
+collection through the registered `knowledge_search` tool.
 
 ### Local configuration
 

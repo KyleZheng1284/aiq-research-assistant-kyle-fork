@@ -32,8 +32,8 @@ general:
         - "*"
 
 llms:
-  # Direct Knowledge API ingestion/query does not call this model. Full chat
-  # requires an OpenAI-compatible endpoint whose model supports tool calling.
+  # Document ingestion does not call this model. Full chat requires an
+  # OpenAI-compatible endpoint whose model supports tool calling.
   agent_llm:
     _type: openai
     model_name: ${AIQ_AGENT_LLM_MODEL:-openai/local-tool-model}

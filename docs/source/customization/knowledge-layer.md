@@ -400,13 +400,8 @@ uv run --project environments/nemo_retriever_local --frozen \
   nat serve --config_file configs/config_web_nemo_retriever_local.yml --port 8000
 ```
 
-Direct retrieval requires no generative LLM:
-
-```bash
-curl -X POST http://127.0.0.1:8000/v1/knowledge/query \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"revenue","collection_name":"<collection-name>","top_k":5}'
-```
+Document ingestion does not require a generative LLM. Normal research invokes the registered `knowledge_search` tool
+and requires the configured agent LLM.
 
 The web UI creates session collection names automatically. Use the collection returned by the collection API rather
 than setting `COLLECTION_NAME` for normal UI operation.
@@ -586,14 +581,7 @@ Open `http://localhost:3000` in your browser.
 | `GET` | `/v1/collections/{name}/documents` | List documents in collection |
 | `DELETE` | `/v1/collections/{name}/documents` | Delete files |
 | `GET` | `/v1/documents/{job_id}/status` | Poll ingestion status |
-| `POST` | `/v1/knowledge/query` | Retrieve chunks directly without a generative LLM |
 | `GET` | `/v1/knowledge/health` | Check knowledge backend health |
-
-`/v1/knowledge/query` is a deployment-scoped endpoint for headless retrieval
-and operational validation; the chat workflow invokes the registered retriever
-directly. It does not implement per-user collection ownership. Enable AI-Q
-authentication and network controls before exposing it outside a trusted local
-environment.
 
 ### Session Collections
 
