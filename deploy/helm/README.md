@@ -314,9 +314,14 @@ aiq:
         # Use the ClusterIP DNS name reported by the Retriever Helm release.
         # Do not append /v1; the AI-Q adapter adds API paths.
         # Use <release>-nemo-retriever in standalone mode (default), or <release>-nemo-retriever-gateway in split mode.
+        # This HTTP example is only for trusted, authentication-disabled in-cluster traffic.
         NRL_BASE_URL: http://<retriever-service>.<retriever-namespace>.svc.cluster.local:7670
         NRL_SCOPE: <workspace-scope>
-      # Enable only when the Retriever gateway or ingress requires a bearer token.
+        # For authenticated connections, use an HTTPS Service or ingress URL.
+        # Keep TLS verification enabled and configure a mounted enterprise CA when required.
+        # NRL_VERIFY_SSL: "true"
+        # NRL_CA_BUNDLE: /etc/ssl/certs/enterprise-ca.pem
+      # Enable only when the HTTPS Retriever endpoint requires a bearer token.
       # The aiq-credentials Secret must contain the referenced key.
       # secretEnv:
       #   NRL_API_TOKEN: NRL_API_TOKEN
