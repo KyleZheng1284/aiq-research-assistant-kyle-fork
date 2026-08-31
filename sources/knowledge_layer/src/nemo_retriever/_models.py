@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from typing import Literal
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
@@ -150,6 +151,9 @@ class QueryHitWire(_WireModel):
     bbox: Any = None
     bbox_xyxy_norm: Any = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    doc_id: str | None = None
+    rank: int | None = Field(default=None, ge=1)
+    result_source: str | None = None
 
     @field_validator("page_number", mode="before")
     @classmethod
@@ -165,3 +169,4 @@ class QueryResultWire(_WireModel):
 
 class QueryResponseWire(_WireModel):
     results: list[QueryResultWire]
+    query_mode: Literal["classic", "agentic"] = "classic"

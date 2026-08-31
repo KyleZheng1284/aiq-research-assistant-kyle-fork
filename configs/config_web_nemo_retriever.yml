@@ -155,6 +155,7 @@ functions:
       base_url: ${NRL_BASE_URL:-http://127.0.0.1:7670}
       api_token: ${NRL_API_TOKEN:-}
       scope: ${NRL_SCOPE}
+      agentic: ${NRL_AGENTIC:-false}
       max_concurrency: ${NRL_MAX_CONCURRENCY:-8}
       max_queued_uploads: ${NRL_MAX_QUEUED_UPLOADS:-128}
       verify_ssl: ${NRL_VERIFY_SSL:-true}

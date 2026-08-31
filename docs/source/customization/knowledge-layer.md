@@ -320,6 +320,7 @@ functions:
       base_url: ${NRL_BASE_URL:-http://127.0.0.1:7670}
       api_token: ${NRL_API_TOKEN:-}
       scope: ${NRL_SCOPE}
+      agentic: ${NRL_AGENTIC:-false}
       max_concurrency: ${NRL_MAX_CONCURRENCY:-8}
       max_queued_uploads: ${NRL_MAX_QUEUED_UPLOADS:-128}
       verify_ssl: ${NRL_VERIFY_SSL:-true}
@@ -347,6 +348,14 @@ Automatic transport retries are limited to reads and explicitly idempotent
 writes. A 404/410 from version-probing job creation or immediate upload means
 the service contract is incompatible; a later polling 404/410 means the job is
 missing or expired.
+
+Set `NRL_AGENTIC=true` only for a service that supports collection-bound
+agentic queries. AI-Q then requires `query_mode: agentic` and citation-ready
+rank/source annotations, preserves the service result order, and does not
+retry or silently downgrade the query. Classic retrieval remains the default,
+and `nemo_retriever_local` does not expose this option. The tested service
+baseline below covers the classic collection contract; agentic mode also
+requires the collection-bound agentic query extension.
 
 `nrl_collection_ttl_hours` is sent as an absolute expiration when AI-Q creates a
 collection, and NRL deletes the expired collection itself. TTL cleanup clears the
@@ -712,6 +721,7 @@ Configuration values are resolved in the following order (highest to lowest prio
 | `AIQ_EMBED_MODEL`, `AIQ_EMBED_BASE_URL` | llamaindex, opensearch, azure_ai_search | Embedding model and endpoint |
 | `NRL_BASE_URL` | nemo_retriever | Public NeMo Retriever gateway URL |
 | `NRL_API_TOKEN`, `NRL_SCOPE` | nemo_retriever | Deployment bearer token and required workspace scope |
+| `NRL_AGENTIC` | nemo_retriever | Enable collection-bound agentic retrieval against a compatible service; default is `false` |
 | `NRL_CONNECT_TIMEOUT_S`, `NRL_REQUEST_TIMEOUT_S` | nemo_retriever | Connection and request timeout seconds |
 | `NRL_MAX_RETRIES`, `NRL_MAX_CONCURRENCY`, `NRL_MAX_QUEUED_UPLOADS` | nemo_retriever | Transient retry, active multipart, and queued-upload bounds |
 | `NRL_VERIFY_SSL`, `NRL_CA_BUNDLE` | nemo_retriever | TLS verification and optional enterprise CA bundle |

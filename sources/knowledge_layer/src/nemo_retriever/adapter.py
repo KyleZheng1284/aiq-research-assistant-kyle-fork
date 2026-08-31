@@ -75,11 +75,14 @@ _BACKEND_NAME = "nemo_retriever"
 _RESOURCE_PAGE_SIZE = 100
 _JOB_PAGE_SIZE = 1000
 _PUBLIC_DOCUMENT_ERROR = "NeMo Retriever document ingestion failed"
+_NRL_ANNOTATION_METADATA_KEYS = frozenset({"nrl_query_mode", "nrl_doc_id", "nrl_rank", "nrl_result_source"})
+_AGENTIC_WIRE_METADATA_KEYS = frozenset({"rank", "result_source"})
 _SERVICE_CONFIG_KEYS = frozenset(
     {
         "base_url",
         "api_token",
         "scope",
+        "agentic",
         "connect_timeout_s",
         "request_timeout_s",
         "max_retries",
@@ -102,6 +105,7 @@ class _Settings:
     base_url: str
     api_token: SecretStr | None
     scope: str
+    agentic: bool
     connect_timeout_s: float
     request_timeout_s: float
     max_retries: int
@@ -188,6 +192,10 @@ def _settings(config: dict[str, Any]) -> _Settings:
             else None
         ),
         scope=scope,
+        agentic=strict_bool(
+            _config_value(config, "agentic", "NRL_AGENTIC", False),
+            name="nrl_agentic" if "agentic" in config else "NRL_AGENTIC",
+        ),
         connect_timeout_s=connect_timeout_s,
         request_timeout_s=request_timeout_s,
         max_retries=max_retries,
@@ -213,6 +221,7 @@ def normalize_backend_config(config: dict[str, object]) -> dict[str, object]:
         "base_url": settings.base_url,
         "api_token": settings.api_token,
         "scope": settings.scope,
+        "agentic": settings.agentic,
         "connect_timeout_s": settings.connect_timeout_s,
         "request_timeout_s": settings.request_timeout_s,
         "max_retries": settings.max_retries,
@@ -409,14 +418,26 @@ class NemoRetrieverRetriever(BaseRetriever):
                 error_message=UNSUPPORTED_FILTERS_ERROR,
             )
         try:
+            request_body: dict[str, Any] = {
+                "query": query,
+                "collection_name": collection_name,
+                "top_k": top_k,
+            }
+            if self._settings.agentic:
+                request_body["agentic"] = True
             payload = await self._transport.arequest_json(
                 "POST",
                 "/v1/query",
                 operation="query",
-                retryable=True,
-                json={"query": query, "collection_name": collection_name, "top_k": top_k},
+                retryable=not self._settings.agentic,
+                json=request_body,
             )
             response = _wire(QueryResponseWire, payload, "query")
+            expected_mode = "agentic" if self._settings.agentic else "classic"
+            if response.query_mode != expected_mode:
+                raise NemoRetrieverError(
+                    f"NeMo Retriever query returned {response.query_mode!r} mode for a {expected_mode!r} request"
+                )
             if len(response.results) != 1:
                 raise NemoRetrieverError("NeMo Retriever query returned an unexpected number of result sets")
             chunks = [self.normalize(hit) for hit in response.results[0].hits]
@@ -439,7 +460,28 @@ class NemoRetrieverRetriever(BaseRetriever):
 
     def normalize(self, raw_result: Any) -> Chunk:
         hit = raw_result if isinstance(raw_result, QueryHitWire) else _wire(QueryHitWire, raw_result, "query hit")
-        return normalize_query_hit(hit)
+        if self._settings.agentic:
+            required_text = (hit.chunk_id, hit.document_id, hit.text, hit.filename, hit.doc_id, hit.result_source)
+            if any(not value or not value.strip() for value in required_text) or hit.rank is None:
+                raise NemoRetrieverError("NeMo Retriever agentic query returned a hit that was not citation-ready")
+            if hit.doc_id != hit.chunk_id:
+                raise NemoRetrieverError("NeMo Retriever agentic query returned an inconsistent selection ID")
+
+        chunk = normalize_query_hit(hit)
+        for key in _NRL_ANNOTATION_METADATA_KEYS:
+            chunk.metadata.pop(key, None)
+        if self._settings.agentic:
+            for key in _AGENTIC_WIRE_METADATA_KEYS:
+                chunk.metadata.pop(key, None)
+            chunk.metadata.update(
+                {
+                    "nrl_query_mode": "agentic",
+                    "nrl_doc_id": hit.doc_id,
+                    "nrl_rank": hit.rank,
+                    "nrl_result_source": hit.result_source,
+                }
+            )
+        return chunk
 
     async def health_check(self) -> bool:
         try:

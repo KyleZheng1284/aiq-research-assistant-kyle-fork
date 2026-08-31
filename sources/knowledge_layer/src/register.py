@@ -543,7 +543,10 @@ def _format_results(retrieval_result, query: str) -> str:
             lines.append(f"Page: {chunk.page_number}")
         lines.append(f"Citation: {citation}")
         lines.append(f"Content Type: {chunk.content_type.value}")
-        if chunk.distance is not None:
+        if retrieval_result.backend == "nemo_retriever" and chunk.metadata.get("nrl_query_mode") == "agentic":
+            lines.append(f"Agentic Rank: {chunk.metadata.get('nrl_rank')}")
+            lines.append(f"Selection Source: {chunk.metadata.get('nrl_result_source')}")
+        elif chunk.distance is not None:
             lines.append(f"Vector Distance: {chunk.distance:.4g} (lower is closer)")
         else:
             lines.append(f"Relevance Score: {chunk.score:.2f}")

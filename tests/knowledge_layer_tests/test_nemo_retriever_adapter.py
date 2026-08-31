@@ -9,6 +9,7 @@ import json
 import threading
 from datetime import UTC
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -18,6 +19,7 @@ import httpx
 import knowledge_layer.nemo_retriever._transport as transport_module
 import knowledge_layer.nemo_retriever.adapter as adapter_module
 import pytest
+import yaml
 from knowledge_layer.nemo_retriever._transport import NemoRetrieverCompatibilityError
 from knowledge_layer.nemo_retriever._transport import NemoRetrieverError
 from knowledge_layer.nemo_retriever._transport import NemoRetrieverHTTPError
@@ -43,6 +45,7 @@ from aiq_agent.knowledge.factory import is_retriever_registered
 from aiq_agent.knowledge.schema import FileStatus
 
 NOW = "2026-07-17T12:00:00+00:00"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _response(request: httpx.Request, status: int, payload: Any = None, **kwargs: Any) -> httpx.Response:
@@ -271,7 +274,13 @@ class FakeNRL:
         return _response(request, 404, {"detail": f"unhandled {method} {path}"})
 
 
-def _adapter_config(handler: Any, *, token: str = "super-secret", retries: int = 0) -> dict[str, Any]:
+def _adapter_config(
+    handler: Any,
+    *,
+    token: str = "super-secret",
+    retries: int = 0,
+    agentic: bool = False,
+) -> dict[str, Any]:
     mock_transport = httpx.MockTransport(handler)
     transport = _NRLTransport(
         base_url="https://nrl.example.test",
@@ -288,12 +297,36 @@ def _adapter_config(handler: Any, *, token: str = "super-secret", retries: int =
         "base_url": "https://nrl.example.test",
         "scope": "workspace-123",
         "api_token": SecretStr(token),
+        "agentic": agentic,
         "max_retries": retries,
         "max_concurrency": 2,
         "max_queued_uploads": 128,
         "_transport": transport,
         "warm_start": False,
     }
+
+
+def _agentic_hit(**overrides: Any) -> dict[str, Any]:
+    hit = {
+        "chunk_id": "chunk-1",
+        "document_id": "doc-1",
+        "text": "Project Orion follows the Redwood retention policy.",
+        "distance": 0.125,
+        "filename": "retention.txt",
+        "page_number": None,
+        "content_type": "text",
+        "metadata": {
+            "section": "retention",
+            "rank": 99,
+            "result_source": "untrusted-copy",
+            "nrl_rank": 99,
+        },
+        "doc_id": "chunk-1",
+        "rank": 1,
+        "result_source": "rrf",
+    }
+    hit.update(overrides)
+    return hit
 
 
 def _wait_for_uploads(ingestor: NemoRetrieverIngestor, job_id: str) -> None:
@@ -331,6 +364,7 @@ def test_service_environment_and_explicit_backend_config_are_equivalent(monkeypa
         "NRL_BASE_URL": "https://nrl.example.test/",
         "NRL_API_TOKEN": "environment-secret",
         "NRL_SCOPE": "workspace-123",
+        "NRL_AGENTIC": "true",
         "NRL_CONNECT_TIMEOUT_S": "12",
         "NRL_REQUEST_TIMEOUT_S": "34",
         "NRL_MAX_RETRIES": "2",
@@ -348,6 +382,7 @@ def test_service_environment_and_explicit_backend_config_are_equivalent(monkeypa
             "base_url": values["NRL_BASE_URL"],
             "api_token": SecretStr(values["NRL_API_TOKEN"]),
             "scope": values["NRL_SCOPE"],
+            "agentic": values["NRL_AGENTIC"],
             "connect_timeout_s": values["NRL_CONNECT_TIMEOUT_S"],
             "request_timeout_s": values["NRL_REQUEST_TIMEOUT_S"],
             "max_retries": values["NRL_MAX_RETRIES"],
@@ -363,6 +398,15 @@ def test_service_environment_and_explicit_backend_config_are_equivalent(monkeypa
     assert adapter_module._settings(public_config.backend_config) == from_environment
     assert values["NRL_API_TOKEN"] not in repr(public_config)
     assert "environment-secret" not in repr(from_environment)
+
+
+def test_service_profile_exposes_disabled_by_default_agentic_opt_in() -> None:
+    config_path = PROJECT_ROOT / "configs" / "config_web_nemo_retriever.yml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    knowledge = config["functions"]["knowledge_search"]
+    assert knowledge["backend"] == "nemo_retriever"
+    assert knowledge["backend_config"]["agentic"] == "${NRL_AGENTIC:-false}"
 
 
 def test_service_upload_queue_bound_accepts_zero_and_rejects_negative() -> None:
@@ -741,7 +785,12 @@ def test_query_mapping_citations_content_types_and_image_safety():
             "source": "report.pdf",
             "source_id": "source-1",
             "bbox_xyxy_norm": [0.1, 0.2, 0.3, 0.4],
-            "metadata": {"table_name": "hidden", "section": "intro"},
+            "metadata": {
+                "table_name": "hidden",
+                "section": "intro",
+                "nrl_query_mode": "agentic",
+                "nrl_rank": 99,
+            },
         },
         {
             "chunk_id": "table-1",
@@ -801,6 +850,8 @@ def test_query_mapping_citations_content_types_and_image_safety():
     result = asyncio.run(retriever.retrieve("findings", "test", top_k=6))
 
     assert result.success
+    query_request = next(request for request in fake.requests if request.url.path == "/v1/query")
+    assert json.loads(query_request.content) == {"query": "findings", "collection_name": "test", "top_k": 6}
     assert [chunk.chunk_id for chunk in result.chunks] == [
         "text-1",
         "table-1",
@@ -823,6 +874,8 @@ def test_query_mapping_citations_content_types_and_image_safety():
     assert result.chunks[0].metadata["document_id"] == "doc-1"
     assert result.chunks[0].metadata["bounding_box"] == [0.1, 0.2, 0.3, 0.4]
     assert "table_name" not in result.chunks[0].metadata
+    assert "nrl_query_mode" not in result.chunks[0].metadata
+    assert "nrl_rank" not in result.chunks[0].metadata
     assert result.chunks[1].structured_data == '{"columns": ["a"]}'
     assert result.chunks[3].image_storage_uri == "s3://private-bucket/image.png"
     assert result.chunks[3].image_url is None
@@ -832,6 +885,144 @@ def test_query_mapping_citations_content_types_and_image_safety():
     formatted = _format_results(result, "findings")
     assert "Vector Distance: -0.1 (lower is closer)" in formatted
     assert "Relevance Score:" not in formatted
+
+
+def test_agentic_query_preserves_service_order_citations_annotations_and_ranking() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _response(
+            request,
+            200,
+            {
+                "results": [
+                    {
+                        "hits": [
+                            _agentic_hit(chunk_id="chunk-2", doc_id="chunk-2", rank=2),
+                            _agentic_hit(chunk_id="chunk-1", doc_id="chunk-1", rank=1),
+                        ]
+                    }
+                ],
+                "query_mode": "agentic",
+            },
+        )
+
+    result = asyncio.run(
+        NemoRetrieverRetriever(_adapter_config(handler, agentic=True)).retrieve("retention", "s_session", top_k=5)
+    )
+
+    assert result.success
+    assert len(requests) == 1
+    assert requests[0].headers["X-NRL-Scope"] == "workspace-123"
+    assert json.loads(requests[0].content) == {
+        "query": "retention",
+        "collection_name": "s_session",
+        "top_k": 5,
+        "agentic": True,
+    }
+    assert [chunk.chunk_id for chunk in result.chunks] == ["chunk-2", "chunk-1"]
+    assert [chunk.distance for chunk in result.chunks] == pytest.approx([0.125, 0.125])
+    assert [chunk.metadata["nrl_rank"] for chunk in result.chunks] == [2, 1]
+    first = result.chunks[0]
+    assert first.display_citation == "retention.txt"
+    assert first.metadata == {
+        "section": "retention",
+        "document_id": "doc-1",
+        "source": None,
+        "source_id": None,
+        "bounding_box": None,
+        "nrl_query_mode": "agentic",
+        "nrl_doc_id": "chunk-2",
+        "nrl_rank": 2,
+        "nrl_result_source": "rrf",
+    }
+
+    formatted = _format_results(result, "retention")
+    assert "Agentic Rank: 2" in formatted
+    assert "Selection Source: rrf" in formatted
+    assert "Vector Distance:" not in formatted
+    assert "Relevance Score:" not in formatted
+
+
+@pytest.mark.parametrize(
+    ("configured_agentic", "reported_mode"),
+    [(True, None), (False, "agentic")],
+)
+def test_query_mode_must_match_the_configured_mode(configured_agentic: bool, reported_mode: str | None) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, Any] = {"results": [{"hits": []}]}
+        if reported_mode is not None:
+            payload["query_mode"] = reported_mode
+        return _response(request, 200, payload)
+
+    result = asyncio.run(
+        NemoRetrieverRetriever(_adapter_config(handler, agentic=configured_agentic)).retrieve("query", "s_session")
+    )
+
+    assert not result.success
+    assert "mode" in (result.error_message or "")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_text"),
+    [
+        ("text", "", "citation-ready"),
+        ("doc_id", None, "citation-ready"),
+        ("doc_id", "another-chunk", "inconsistent selection ID"),
+        ("rank", None, "citation-ready"),
+        ("rank", 0, "public API contract"),
+        ("result_source", " ", "citation-ready"),
+    ],
+)
+def test_agentic_query_fails_closed_for_unresolved_hits(field: str, value: Any, error_text: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _response(
+            request,
+            200,
+            {"results": [{"hits": [_agentic_hit(**{field: value})]}], "query_mode": "agentic"},
+        )
+
+    result = asyncio.run(NemoRetrieverRetriever(_adapter_config(handler, agentic=True)).retrieve("query", "s_session"))
+
+    assert not result.success
+    assert result.chunks == []
+    assert error_text in (result.error_message or "")
+
+
+@pytest.mark.parametrize("failure", ["timeout", 429, 500, 502, 503, 504])
+def test_agentic_queries_do_not_retry_transient_failures(failure: str | int) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if failure == "timeout":
+            raise httpx.ReadTimeout("timed out", request=request)
+        return _response(request, int(failure), {"detail": "retry"}, headers={"Retry-After": "0"})
+
+    result = asyncio.run(
+        NemoRetrieverRetriever(_adapter_config(handler, retries=1, agentic=True)).retrieve("query", "s_session")
+    )
+
+    assert calls == 1
+    assert not result.success
+
+
+def test_classic_queries_retain_transient_retries() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _response(request, 503, {"detail": "retry"}, headers={"Retry-After": "0"})
+        return _response(request, 200, {"results": [{"hits": []}], "query_mode": "classic"})
+
+    result = asyncio.run(NemoRetrieverRetriever(_adapter_config(handler, retries=1)).retrieve("query", "s_session"))
+
+    assert calls == 2
+    assert result.success
 
 
 @pytest.mark.parametrize("distance", [float("nan"), float("inf"), float("-inf")])
@@ -1003,7 +1194,23 @@ def test_writes_retry_only_when_explicitly_safe(monkeypatch: pytest.MonkeyPatch)
     assert calls == 3
 
 
-def test_adapter_boolean_settings_are_strict():
+def test_adapter_boolean_settings_are_strict(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("NRL_AGENTIC", raising=False)
+    assert adapter_module._settings({"scope": "workspace-123"}).agentic is False
+
+    agentic_config = _adapter_config(FakeNRL())
+    agentic_config["agentic"] = "true"
+    assert NemoRetrieverRetriever(agentic_config)._settings.agentic is True
+
+    invalid_agentic_config = _adapter_config(FakeNRL())
+    invalid_agentic_config["agentic"] = "sometimes"
+    with pytest.raises(ValueError, match="nrl_agentic must be a boolean"):
+        NemoRetrieverRetriever(invalid_agentic_config)
+
+    monkeypatch.setenv("NRL_AGENTIC", "sometimes")
+    with pytest.raises(ValueError, match="NRL_AGENTIC must be a boolean"):
+        adapter_module._settings({"scope": "workspace-123"})
+
     false_config = _adapter_config(FakeNRL())
     false_config["verify_ssl"] = "false"
     ingestor = NemoRetrieverIngestor(false_config)

@@ -231,6 +231,8 @@ adapter.
 export NRL_BASE_URL=http://127.0.0.1:7670
 export NRL_SCOPE=workspace-123
 export NRL_API_TOKEN='replace-with-a-secret'  # omit only for an auth-disabled dev deployment
+# Optional: enable only when the deployed service supports agentic collection queries.
+export NRL_AGENTIC=true
 ```
 
 | YAML field | Environment variable | Default | Purpose |
@@ -238,6 +240,7 @@ export NRL_API_TOKEN='replace-with-a-secret'  # omit only for an auth-disabled d
 | `backend_config.base_url` | `NRL_BASE_URL` | `http://127.0.0.1:7670` | Public NRL gateway, not a worker or VectorDB pod |
 | `backend_config.api_token` | `NRL_API_TOKEN` | unset | Optional bearer token stored as a secret |
 | `backend_config.scope` | `NRL_SCOPE` | required | Logical workspace scope sent on every request |
+| `backend_config.agentic` | `NRL_AGENTIC` | `false` | Request collection-bound agentic retrieval from a compatible NRL service |
 | `backend_config.connect_timeout_s` | `NRL_CONNECT_TIMEOUT_S` | `30` | TCP/TLS connection timeout |
 | `backend_config.request_timeout_s` | `NRL_REQUEST_TIMEOUT_S` | `300` | Request timeout, including uploads |
 | `backend_config.max_retries` | `NRL_MAX_RETRIES` | `5` | Retries for reads and explicitly idempotent writes on transport errors, 429, and retryable 5xx |
@@ -246,6 +249,16 @@ export NRL_API_TOKEN='replace-with-a-secret'  # omit only for an auth-disabled d
 | `backend_config.verify_ssl` | `NRL_VERIFY_SSL` | `true` | Verify gateway certificates |
 | `backend_config.ca_bundle` | `NRL_CA_BUNDLE` | unset | Optional enterprise CA bundle |
 | `backend_config.collection_ttl_hours` | `NRL_COLLECTION_TTL_HOURS` | `24` | Expiration applied to new NRL collections |
+
+Agentic retrieval is an explicit service-mode opt-in. The compatibility head
+above covers the classic collection contract; the deployed service must also
+include the collection-bound agentic query extension. AIQ requires
+`query_mode: agentic` and citation-ready `doc_id`, rank, and result-source
+annotations; it does not silently fall back to classic retrieval. Because the
+request may have already invoked an LLM, AIQ does not transparently retry an
+agentic query after a timeout, rate limit, or server error. Ingestion and
+classic query retry behavior are unchanged. The embedded
+`nemo_retriever_local` backend does not expose this option.
 
 One token and scope are used per AIQ deployment. Per-user NRL credential
 forwarding is not supported. Tokens are never logged and physical NRL storage
